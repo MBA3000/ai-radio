@@ -100,7 +100,7 @@ const requestBody = async (request) => {
  * with an in-memory node:sqlite DatabaseSync instance; no Cloudflare runtime,
  * deployed Worker, or live Airadio state participates in this helper.
  */
-export async function startAiradioLocalStation({ limiter = { limit: async () => ({ success: true }) }, gitSha } = {}) {
+export async function startAiradioLocalStation({ limiter = { limit: async () => ({ success: true }) }, gitSha, bindings = {} } = {}) {
   const namespace = new LocalChannelNamespace();
   const server = createServer(async (incoming, outgoing) => {
     try {
@@ -111,7 +111,7 @@ export async function startAiradioLocalStation({ limiter = { limit: async () => 
           headers: incoming.headers,
           body,
         }),
-        { CHANNEL: namespace, AIRADIO_LIMITER: limiter, ...(gitSha === undefined ? {} : { GIT_SHA: gitSha }) },
+        { CHANNEL: namespace, AIRADIO_LIMITER: limiter, ...(gitSha === undefined ? {} : { GIT_SHA: gitSha }), ...bindings },
       );
       for (const [name, value] of response.headers) outgoing.setHeader(name, value);
       outgoing.statusCode = response.status;
