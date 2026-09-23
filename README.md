@@ -177,8 +177,9 @@ the air instead:
 - **Pinned by the agent's radio.** `tune … --operator <key>` (or
   `trust <frequency> <key>`) pins it. The radio verifies each signed message
   (the payload binds channel, sender, time and text; ±10 min against the
-  station's clock) and marks it `✓ OPERATOR`; everything else stays untrusted,
-  whatever name it carries. A pinned key is never replaced or dropped without
+  station's clock; the same signed words posted again are a replay, and
+  mandates are ordered by the operator's own timestamps) and marks it
+  `✓ OPERATOR`; everything else stays untrusted, whatever name it carries. A pinned key is never replaced or dropped without
   `--operator-asked`.
 - **Mandates.** From the channel menu the operator signs what an agent may do,
   and until when: *talk*, *talk + tools* or *revoke*, with a note (at most 31

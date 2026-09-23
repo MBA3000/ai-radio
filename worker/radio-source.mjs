@@ -678,12 +678,15 @@ export function verifySigned(message, frequency, operatorKey) {
   if (!Number.isSafeInteger(sig.ts) || !Number.isFinite(at) || Math.abs(sig.ts - at) > SIGNATURE_WINDOW_MS) return { ok: false, reason: "stale or replayed" };
   const publicKey = operatorPublicKey(sig.key);
   if (!publicKey) return { ok: false, reason: "bad key" };
+  let payload = null;
   let good = false;
   try {
-    const payload = signedPayload({ frequency, from: String(message.from), ts: sig.ts, mandate: sig.mandate, text: String(message.text) });
-    good = verifySignature("sha256", Buffer.from(payload, "utf8"), { key: publicKey, dsaEncoding: "ieee-p1363" }, Buffer.from(String(sig.sig), "base64url"));
+    payload = Buffer.from(signedPayload({ frequency, from: String(message.from), ts: sig.ts, mandate: sig.mandate, text: String(message.text) }), "utf8");
+    good = verifySignature("sha256", payload, { key: publicKey, dsaEncoding: "ieee-p1363" }, Buffer.from(String(sig.sig), "base64url"));
   } catch {}
-  return good ? { ok: true } : { ok: false, reason: "bad signature" };
+  // The digest is of the signed words, not of the signature: an ECDSA signature
+  // has more than one valid form, the words it covers have exactly one.
+  return good ? { ok: true, digest: createHash("sha256").update(payload).digest("base64url") } : { ok: false, reason: "bad signature" };
 }
 
 /** A mandate as the radio keeps it, or null when it is malformed or unbounded. */
@@ -793,6 +796,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     heard: previous.heard && typeof previous.heard === "object" ? previous.heard : {},
     errors: {},
     agents: previous.agents && typeof previous.agents === "object" ? previous.agents : {},
+    signed: previous.signed && typeof previous.signed === "object" ? previous.signed : {},
   };
   const running = new Map();
   const children = new Set();
@@ -802,6 +806,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   const tuneOut = (frequency, reason) => {
     updateConfig(p, (config) => { delete config.channels[frequency]; });
     delete state.cursors[frequency];
+    delete state.signed[frequency];
     appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "tuned out of " + frequency + ": " + reason });
     log("tuned out of " + frequency + ": " + reason);
   };
@@ -838,9 +843,12 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const outcome = updateConfig(p, (latest) => {
       const target = latest.channels[frequency];
       if (!target) return null;
-      if (target.mandate && Number.isSafeInteger(target.mandate.seq) && target.mandate.seq >= message.seq) return null;
+      // Mandates are ordered by the operator's own clock: an older one posted again
+      // later (a replay by anyone holding the channel key) never overrides a newer one.
+      const held = target.mandate;
+      if (held && (Number.isSafeInteger(held.signedTs) ? held.signedTs >= message.sig.ts : Number.isSafeInteger(held.seq) && held.seq >= message.seq)) return null;
       if (mandate.scope === "revoke") {
-        target.mandate = { scope: "revoke", seq: message.seq, by: String(message.from), at: message.at };
+        target.mandate = { scope: "revoke", seq: message.seq, signedTs: message.sig.ts, by: String(message.from), at: message.at };
         // A signed revoke also releases a session the operator had not tied to mandates.
         if (target.agent && !target.agent.onMandate) {
           delete target.agent;
@@ -848,7 +856,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         }
         return "revoked the mandate: listen only";
       }
-      target.mandate = { ...mandate, seq: message.seq, by: String(message.from), grantedAt: message.at };
+      target.mandate = { ...mandate, seq: message.seq, signedTs: message.sig.ts, by: String(message.from), grantedAt: message.at };
       return "mandate from " + String(message.from) + ": " + describeMandate(mandate);
     });
     if (!outcome) return;
@@ -863,7 +871,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       if (!mandate || (mandate.scope !== "talk" && mandate.scope !== "tools") || Date.parse(mandate.until) > Date.now()) continue;
       updateConfig(p, (latest) => {
         const target = latest.channels[frequency];
-        if (target && target.mandate && target.mandate.seq === mandate.seq) target.mandate = { scope: "expired", seq: mandate.seq, until: mandate.until };
+        if (target && target.mandate && target.mandate.seq === mandate.seq) target.mandate = { scope: "expired", seq: mandate.seq, signedTs: mandate.signedTs, until: mandate.until };
       });
       if (state.agents[frequency]) state.agents[frequency].pending = [];
       appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "the mandate expired at " + mandate.until + ": listen only from now on" });
@@ -1025,6 +1033,19 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     }
   };
 
+  // A signature proves who wrote the words, once. Anyone holding the channel key
+  // can post the same signed words again within the time window: that is a
+  // replay, and it is neither the operator's voice nor a mandate.
+  const firstHearing = (frequency, message, digest) => {
+    const at = Date.parse(message.at);
+    const heard = (Array.isArray(state.signed[frequency]) ? state.signed[frequency] : [])
+      .filter((entry) => Array.isArray(entry) && entry[2] >= at - 3 * SIGNATURE_WINDOW_MS);
+    const earlier = heard.find((entry) => entry[0] === digest);
+    if (!earlier) heard.push([digest, message.seq, message.sig.ts]);
+    state.signed[frequency] = heard.slice(-256);
+    return earlier && earlier[1] !== message.seq ? { ok: false, reason: "replayed" } : { ok: true };
+  };
+
   const pollChannel = async (config, frequency, channel) => {
     const me = channel.as || config.as;
     let since = Number.isSafeInteger(state.cursors[frequency]) ? state.cursors[frequency] : 0;
@@ -1044,7 +1065,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         state.cursors[frequency] = since;
         if (message.from === me) continue;
         const history = Number.isSafeInteger(channel.baseline) && message.seq <= channel.baseline;
-        const signature = message.sig ? (channel.operator ? verifySigned(message, frequency, channel.operator.key) : { ok: false, reason: "another key", fingerprint: typeof message.sig.key === "string" ? keyFingerprint(message.sig.key) : null }) : null;
+        let signature = message.sig ? (channel.operator ? verifySigned(message, frequency, channel.operator.key) : { ok: false, reason: "another key", fingerprint: typeof message.sig.key === "string" ? keyFingerprint(message.sig.key) : null }) : null;
+        if (signature && signature.ok) signature = firstHearing(frequency, message, signature.digest);
         const operator = Boolean(signature && signature.ok);
         const mandate = operator && message.sig.mandate ? normalizeMandate(message.sig.mandate, message.sig.ts) : null;
         appendInbox(p, {

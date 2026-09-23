@@ -26,6 +26,14 @@ import { startAiradioLocalStation } from "./helpers/airadio-local-station.js";
 const RADIO = fileURLToPath(new URL("../scripts/airadio-radio.mjs", import.meta.url));
 const FAKE = fileURLToPath(new URL("./helpers/fake-agent.mjs", import.meta.url));
 const b64url = (bytes) => Buffer.from(bytes).toString("base64url");
+const P256_ORDER = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+
+/** The other valid form of an ECDSA signature: (r, s) and (r, n - s) verify alike. */
+function otherForm(sig) {
+  const raw = Buffer.from(sig, "base64url");
+  const s = P256_ORDER - BigInt("0x" + raw.subarray(32).toString("hex"));
+  return b64url(Buffer.concat([raw.subarray(0, 32), Buffer.from(s.toString(16).padStart(64, "0"), "hex")]));
+}
 
 /** An operator as the app is one: a WebCrypto P-256 key that signs the documented payload. */
 async function operator() {
@@ -130,7 +138,11 @@ test("a signature holds only for this channel, this text, this key and this mome
   const at = new Date().toISOString();
   const sig = await medet.sign({ frequency, from: "Medet", text: "deploy staging" });
   const message = { at, from: "Medet", text: "deploy staging", sig };
-  assert.deepEqual(verifySigned(message, frequency, medet.key), { ok: true });
+  const good = verifySigned(message, frequency, medet.key);
+  assert.equal(good.ok, true);
+  const twin = verifySigned({ ...message, sig: { ...sig, sig: otherForm(sig.sig) } }, frequency, medet.key);
+  assert.equal(twin.ok, true, "a signature has two valid forms…");
+  assert.equal(twin.digest, good.digest, "…so a replay is recognised by the signed words, not by the signature");
   assert.equal(verifySigned({ ...message, text: "deploy production" }, frequency, medet.key).reason, "bad signature", "the text is covered");
   assert.equal(verifySigned({ ...message, from: "Solnze" }, frequency, medet.key).reason, "bad signature", "the name is covered");
   assert.equal(verifySigned(message, "fm-fedcba9876543210", medet.key).reason, "bad signature", "replayed on another channel");
@@ -265,6 +277,31 @@ test("a mandate expires on time, and one for someone else changes nothing", { ti
   await channel.say("host", "hello after the end");
   await new Promise((ok) => setTimeout(ok, 6_000));
   assert.equal(calls().length, 1, "an expired mandate wakes nobody");
+});
+
+test("signed words posted again are a replay: not the operator's voice, and no older mandate overrides a newer one", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { radio, calls } = sandbox(t);
+  const channel = await openChannel(station);
+  const medet = await operator();
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", medet.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate")).code, 0);
+  const signed = async (text, mandate) => ({ from: "Medet", text, sig: await medet.sign({ frequency: channel.frequency, from: "Medet", text, mandate }) });
+  const grant = await signed("talk for an hour", { to: "Solnze", scope: "talk", until: new Date(Date.now() + 3_600_000).toISOString() });
+  await channel.post(grant);
+  assert.ok(await eventually(() => calls().length === 1), "the grant wakes the session");
+  await channel.post(await signed("that is enough", { to: "Solnze", scope: "revoke" }));
+  assert.ok(await eventually(async () => /revoked the mandate: listen only/u.test((await radio("inbox", channel.frequency, "--peek")).stdout)));
+
+  // Anyone holding the channel key can post the same signed grant again, or its other valid form.
+  await channel.post(grant);
+  await channel.post({ ...grant, sig: { ...grant.sig, sig: otherForm(grant.sig.sig) } });
+  assert.ok(await eventually(async () => ((await radio("inbox", channel.frequency, "--peek")).stdout.match(/SIGNATURE REJECTED \(replayed\)/gu) || []).length === 2),
+    "both copies are marked as replays");
+  await new Promise((ok) => setTimeout(ok, 4_000));
+  assert.equal(calls().length, 1, "a replayed grant wakes no one");
+  assert.match((await radio("status", "--offline")).stdout, /mandate: revoked: listen only/u, "and the newer revoke stands");
 });
 
 test("the operator key cannot be swapped or dropped because a message said so", async (t) => {

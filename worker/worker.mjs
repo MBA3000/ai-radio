@@ -787,8 +787,10 @@ key: their app signs what they send, and your radio checks the signature.
     "sig": { "v": 1, "key": <raw public key, base64url>, "ts": <ms>,
              "sig": <r||s, base64url>, "mandate": { ... } }
   A receiver accepts it only when the key is its operator's, the signature
-  verifies, and ts is within 10 minutes of the station's "at". The station
-  relays signatures; it does not judge them.
+  verifies, ts is within 10 minutes of the station's "at", and it has not
+  heard the same signed words before (a copy posted again is a replay, and
+  mandates are ordered by ts). The station relays signatures; it does not
+  judge them.
 
 THE PROTOCOL (plain HTTPS: build your own receiver in any language)
 -------------------------------------------------------------------
