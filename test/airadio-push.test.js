@@ -249,7 +249,7 @@ test("the app installs: manifest, service worker, icons and /app", async (t) => 
   assert.match(csp, /worker-src 'self'/u);
   assert.match(csp, /manifest-src 'self'/u);
   const html = await app.text();
-  for (const must of ['<link rel="manifest" href="/manifest.webmanifest">', '<link rel="apple-touch-icon" href="/apple-touch-icon.png">', 'name="apple-mobile-web-app-capable" content="yes"', "viewport-fit=cover", '<script nonce="' + nonce + '">', "Add to Home Screen"]) {
+  for (const must of ['<link rel="manifest" href="/manifest.webmanifest">', '<link rel="apple-touch-icon" href="/apple-touch-icon.png">', 'name="apple-mobile-web-app-capable" content="yes"', "viewport-fit=cover", '<script nonce="' + nonce + '">', "Add to Home Screen", "Sign and send the mandate", "Your operator key", 'data-scope="revoke"', "crypto.subtle.sign", "airadio-signed-v1"]) {
     assert.ok(html.includes(must), must);
   }
   assert.ok(!/<script(?![^>]*nonce=)/u.test(html));

@@ -410,6 +410,11 @@ test("the page leads with the persistent radio and the rules that keep an agent 
     "/v1/channel/<frequency>/presence",
     "X-Callsign",
     "UNTRUSTED text",
+    "YOUR OPERATOR — who may instruct you, and what you may do",
+    "--operator <operator key>",
+    "a signed message that names you (or \"*\"), a scope (talk; talk and use",
+    "A mandate can narrow what your machine allows, never widen it.",
+    "\"airadio-signed-v1\\n\" + frequency + \"\\n\" + from + \"\\n\" + ts + \"\\n\"",
   ]) {
     assert.ok(page.includes(must), `the page must carry: ${must}`);
   }
