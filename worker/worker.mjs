@@ -27,7 +27,10 @@
  * page stays the whole distribution, never a repository.
  */
 
+import { manifest, renderApp, SERVICE_WORKER } from "./app.mjs";
+import { ICON_PNGS } from "./icons.generated.mjs";
 import { renderPage } from "./page.mjs";
+import { generateVapidKeys, MAX_PUSH_PLAINTEXT, normalizeEndpoint, parseSubscription, sendWebPush, subscriptionKeyUsable } from "./push.mjs";
 import { RADIO_CODE } from "./radio-source.mjs";
 
 export { RADIO_CODE };
@@ -472,6 +475,11 @@ const MAX_LISTENERS = 32;
 // on the free plan rows written are the scarcest budget. A read refreshes the
 // idle clock at most every 10 minutes and a presence stamp at most every 15 s.
 const TOUCH_THROTTLE_MS = 10 * 60 * 1000;
+// Web Push: a few devices per channel, and at most one notification per
+// device every 10 s, so a chatty channel cannot flood a phone.
+const MAX_PUSH_SUBSCRIPTIONS = 16;
+const PUSH_THROTTLE_MS = 10_000;
+const VAPID_OBJECT = "push:vapid";
 const PRESENCE_WRITE_THROTTLE_MS = 15_000;
 
 const encoder = new TextEncoder();
@@ -851,8 +859,79 @@ export function instructions(origin) {
   return INSTRUCTIONS.replaceAll("<address>", origin);
 }
 
+/** The station's VAPID key pair lives in a Durable Object of its own; cached per isolate. */
+let vapidCache = null;
+async function vapidKeys(env) {
+  if (vapidCache) return vapidCache;
+  const stub = env.CHANNEL.get(env.CHANNEL.idFromName(VAPID_OBJECT));
+  const got = await stub.fetch("https://channel/vapid", { method: "POST" });
+  if (!got.ok) throw new Error("vapid keys unavailable");
+  vapidCache = await got.json();
+  return vapidCache;
+}
+
+/** Prebuilt icon PNGs, decoded once per isolate. */
+const iconBytes = new Map();
+function servedIcon(path) {
+  if (!iconBytes.has(path)) {
+    const binary = atob(ICON_PNGS[path]);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    iconBytes.set(path, bytes);
+  }
+  return iconBytes.get(path);
+}
+
+/**
+ * Notify phones about one message. Phones out of their quiet window are
+ * notified now; a phone notified less than 10 s ago gets this message when its
+ * window closes, unless a newer message has taken its place by then. So a
+ * burst costs one notification per window, and the last word always arrives.
+ */
+async function deliver(env, stub, subject, message, now, later) {
+  if (now.length > 0) await pushMessage(env, stub, subject, message, now);
+  if (later.length === 0) return;
+  const wait = Math.min(PUSH_THROTTLE_MS, Math.max(...later.map((entry) => Number(entry.waitMs) || 0))) + 250;
+  await new Promise((ok) => setTimeout(ok, wait));
+  const got = await stub.fetch("https://channel/flush", { method: "POST", body: JSON.stringify({ seq: message.seq, endpoints: later.map((entry) => entry.endpoint) }) });
+  if (!got.ok) return;
+  const { subscriptions } = await got.json();
+  if (Array.isArray(subscriptions) && subscriptions.length > 0) await pushMessage(env, stub, subject, message, subscriptions);
+}
+
+/**
+ * Encrypt and post one message to each phone (RFC 8291: only the phone can
+ * read it; the push service sees ciphertext). A phone the push service no
+ * longer knows (404/410), or whose key no longer imports, is forgotten.
+ */
+async function pushMessage(env, stub, subject, message, subscriptions) {
+  let vapid;
+  try {
+    vapid = await vapidKeys(env);
+  } catch {
+    return;
+  }
+  const fetchImpl = typeof env.AIRADIO_PUSH_FETCH === "function" ? env.AIRADIO_PUSH_FETCH : fetch;
+  let text = String(message.text);
+  while (encoder.encode(text).length > 600) text = text.slice(0, Math.floor(text.length * 0.8)) + "…";
+  const payload = { v: 1, frequency: message.frequency, from: message.from, text, seq: message.seq, at: new Date().toISOString() };
+  if (encoder.encode(JSON.stringify(payload)).length > MAX_PUSH_PLAINTEXT) payload.text = "New message on the air";
+  await Promise.all(subscriptions.map(async (subscription) => {
+    try {
+      const status = await sendWebPush(subscription, payload, { vapid, subject, fetchImpl, topic: message.frequency });
+      if (status === 404 || status === 410) {
+        await stub.fetch("https://channel/unsubscribe-gone", { method: "POST", body: JSON.stringify({ endpoint: subscription.endpoint }) });
+      }
+    } catch (error) {
+      if (error && (error.name === "DataError" || /invalid subscription keys/u.test(String(error.message)))) {
+        await stub.fetch("https://channel/unsubscribe-gone", { method: "POST", body: JSON.stringify({ endpoint: subscription.endpoint }) }).catch(() => {});
+      }
+    }
+  }));
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/u, "") || "/";
     // HEAD IS A GET WITHOUT A BODY, and refusing it costs a first contact:
@@ -873,7 +952,7 @@ export default {
         return new Response(renderPage({ origin: url.origin, instructions: text, nonce }), {
           headers: {
             "content-type": "text/html; charset=utf-8",
-            "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+            "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
             "referrer-policy": "no-referrer",
             "x-content-type-options": "nosniff",
             vary: "accept",
@@ -884,6 +963,32 @@ export default {
     }
     if (method === "GET" && path === "/health") {
       return json({ ok: true, service: "airadio", sha: typeof env.GIT_SHA === "string" ? env.GIT_SHA : null, at: new Date().toISOString() });
+    }
+
+    if (method === "GET" && path === "/app") {
+      const nonce = randomHex(16);
+      return new Response(renderApp({ nonce }), {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+          "referrer-policy": "no-referrer",
+          "x-content-type-options": "nosniff",
+          "cache-control": "no-cache",
+        },
+      });
+    }
+    if (method === "GET" && path === "/manifest.webmanifest") {
+      return new Response(JSON.stringify(manifest(), null, 1), { headers: { "content-type": "application/manifest+json; charset=utf-8", "cache-control": "public, max-age=3600" } });
+    }
+    if (method === "GET" && path === "/sw.js") {
+      return new Response(SERVICE_WORKER, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" } });
+    }
+    if (method === "GET" && /^\/(apple-touch-icon|icon-192|icon-512|icon-maskable-512)\.png$/u.test(path)) {
+      return new Response(servedIcon(path), { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
+    }
+    if (method === "GET" && path === "/v1/push/key") {
+      const vapid = await vapidKeys(env);
+      return json({ publicKey: vapid.publicKey }, 200, { "cache-control": "public, max-age=300" });
     }
 
     if (method === "GET" && path === "/radio.mjs") {
@@ -1035,7 +1140,7 @@ export default {
       }, 200, wave ? { "cache-control": "no-store" } : {});
     }
 
-    const match = /^\/v1\/channel\/(fm-[a-f0-9]{8,64})\/(send|messages|presence)$/u.exec(path);
+    const match = /^\/v1\/channel\/(fm-[a-f0-9]{8,64})\/(send|messages|presence|subscribe|unsubscribe)$/u.exec(path);
     if (match) {
       const [, frequency, action] = match;
       const wave = request.headers.get("X-Wave") ?? "";
@@ -1054,7 +1159,35 @@ export default {
           method: "POST",
           body: JSON.stringify({ wave, from, text }),
         });
-        return new Response(sent.body, { status: sent.status, headers: { "content-type": "application/json; charset=utf-8" } });
+        const body = await sent.json();
+        const notify = Array.isArray(body.notify) ? body.notify : [];
+        const later = Array.isArray(body.later) ? body.later : [];
+        delete body.notify;
+        delete body.later;
+        if (sent.ok && (notify.length > 0 || later.length > 0)) {
+          // The VAPID subject names this station over https whatever scheme the sender used.
+          const pushing = deliver(env, stub, "https://" + url.hostname, { frequency, from, text, seq: body.seq }, notify, later);
+          if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(pushing);
+          else await pushing;
+        }
+        return json(body, sent.status);
+      }
+      if ((action === "subscribe" || action === "unsubscribe") && method === "POST") {
+        const parsed = await readJsonObject(request);
+        if (parsed.error) return json({ error: parsed.error }, parsed.status);
+        let payload;
+        if (action === "subscribe") {
+          const subscription = parseSubscription(parsed.body);
+          if (subscription.error) return json({ error: subscription.error }, 400);
+          if (!(await subscriptionKeyUsable(subscription.keys.p256dh))) return json({ error: "keys.p256dh is not a point on the P-256 curve" }, 400);
+          const name = typeof parsed.body.name === "string" && LISTENER_SHAPE.test(parsed.body.name) ? parsed.body.name : null;
+          payload = { ...subscription, name };
+        } else {
+          if (typeof parsed.body.endpoint !== "string") return json({ error: "endpoint is required" }, 400);
+          payload = { endpoint: normalizeEndpoint(parsed.body.endpoint) };
+        }
+        const got = await stub.fetch(`https://channel/${action}`, { method: "POST", headers: { "X-Wave": wave }, body: JSON.stringify(payload) });
+        return new Response(got.body, { status: got.status, headers: { "content-type": "application/json; charset=utf-8" } });
       }
       if (action === "messages" && method === "GET") {
         const page = parsePageQuery(url.searchParams);
@@ -1085,7 +1218,8 @@ export class AiRadioChannel {
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);" +
         "CREATE TABLE IF NOT EXISTS msgs (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, sender TEXT, body TEXT);" +
-        "CREATE TABLE IF NOT EXISTS listeners (name TEXT PRIMARY KEY, lastSeen TEXT);",
+        "CREATE TABLE IF NOT EXISTS listeners (name TEXT PRIMARY KEY, lastSeen TEXT);" +
+        "CREATE TABLE IF NOT EXISTS subs (endpoint TEXT PRIMARY KEY, p256dh TEXT, auth TEXT, name TEXT, createdAt TEXT, lastPushAt TEXT, pendingSeq INTEGER);",
     );
   }
 
@@ -1154,6 +1288,30 @@ export class AiRadioChannel {
     return null;
   }
 
+  /**
+   * Phones to notify about message `seq` from `from`: never the sender's own;
+   * now if its last notification is 10 s old, otherwise later (the Worker asks
+   * again with /flush when the window closes, and only the newest message wins).
+   */
+  dueSubscriptions(from, seq) {
+    const now = this.now();
+    const notify = [];
+    const later = [];
+    for (const row of this.sql.exec("SELECT endpoint, p256dh, auth, name, lastPushAt FROM subs").toArray()) {
+      if (row.name === from) continue;
+      const subscription = { endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } };
+      const last = row.lastPushAt ? Date.parse(row.lastPushAt) : Number.NaN;
+      if (!Number.isFinite(last) || now - last >= PUSH_THROTTLE_MS) {
+        this.sql.exec("UPDATE subs SET lastPushAt = ?, pendingSeq = NULL WHERE endpoint = ?", new Date(now).toISOString(), row.endpoint);
+        notify.push(subscription);
+      } else {
+        this.sql.exec("UPDATE subs SET pendingSeq = ? WHERE endpoint = ?", seq, row.endpoint);
+        later.push({ ...subscription, waitMs: last + PUSH_THROTTLE_MS - now });
+      }
+    }
+    return { notify, later };
+  }
+
   noteListener(name) {
     if (typeof name !== "string" || !LISTENER_SHAPE.test(name) || this.meta("mode") === "mailbox") return;
     const now = this.now();
@@ -1215,7 +1373,8 @@ export class AiRadioChannel {
       const seq = this.sql.exec("SELECT MAX(seq) AS m FROM msgs").toArray()[0].m;
       this.sql.exec("DELETE FROM msgs WHERE seq <= ?", seq - KEEP_MESSAGES);
       await this.alive();
-      return json({ seq });
+      const due = open === true ? { notify: [], later: [] } : this.dueSubscriptions(from, seq);
+      return json({ seq, ...(due.notify.length > 0 ? { notify: due.notify } : {}), ...(due.later.length > 0 ? { later: due.later } : {}) });
     }
 
     if (url.pathname === "/messages") {
@@ -1258,6 +1417,57 @@ export class AiRadioChannel {
       const lastSeen = this.meta("lastSeen");
       const onAir = lastSeen !== null && this.now() - Date.parse(lastSeen) < ON_AIR_WINDOW_MS;
       return json({ registered: true, onAir, lastSeen });
+    }
+
+    if (url.pathname === "/subscribe" || url.pathname === "/unsubscribe") {
+      const refused = await this.verified(request.headers.get("X-Wave") ?? "");
+      if (refused) return json({ error: refused.error }, refused.status);
+      if (this.meta("mode") === "mailbox") return json({ error: "notifications are for channels" }, 404);
+      const body = await request.json();
+      if (url.pathname === "/unsubscribe") {
+        this.sql.exec("DELETE FROM subs WHERE endpoint = ?", body.endpoint);
+        return json({ ok: true, subscribed: false });
+      }
+      const known = this.sql.exec("SELECT endpoint FROM subs WHERE endpoint = ?", body.endpoint).toArray().length > 0;
+      const count = this.sql.exec("SELECT COUNT(*) AS n FROM subs").toArray()[0].n;
+      // A full channel refuses a new phone rather than silently dropping someone else's.
+      if (!known && count >= MAX_PUSH_SUBSCRIPTIONS) return json({ error: "this channel already notifies " + MAX_PUSH_SUBSCRIPTIONS + " devices" }, 409);
+      const now = new Date(this.now()).toISOString();
+      this.sql.exec(
+        "INSERT INTO subs (endpoint, p256dh, auth, name, createdAt, lastPushAt, pendingSeq) VALUES (?, ?, ?, ?, ?, NULL, NULL) "
+          + "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, name = excluded.name",
+        body.endpoint, body.keys.p256dh, body.keys.auth, body.name, now,
+      );
+      return json({ ok: true, subscribed: true });
+    }
+
+    if (url.pathname === "/flush") {
+      const { seq, endpoints } = await request.json();
+      const now = new Date(this.now()).toISOString();
+      const subscriptions = [];
+      for (const endpoint of Array.isArray(endpoints) ? endpoints.slice(0, MAX_PUSH_SUBSCRIPTIONS) : []) {
+        const row = this.sql.exec("SELECT endpoint, p256dh, auth FROM subs WHERE endpoint = ? AND pendingSeq = ?", endpoint, seq).toArray()[0];
+        if (!row) continue;
+        this.sql.exec("UPDATE subs SET lastPushAt = ?, pendingSeq = NULL WHERE endpoint = ?", now, endpoint);
+        subscriptions.push({ endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } });
+      }
+      return json({ subscriptions });
+    }
+
+    if (url.pathname === "/unsubscribe-gone") {
+      const { endpoint } = await request.json();
+      this.sql.exec("DELETE FROM subs WHERE endpoint = ?", endpoint);
+      return json({ ok: true });
+    }
+
+    if (url.pathname === "/vapid") {
+      let stored = this.meta("vapid");
+      if (stored === null) {
+        stored = JSON.stringify(await generateVapidKeys());
+        this.sql.exec("INSERT OR IGNORE INTO meta (k, v) VALUES ('vapid', ?)", stored);
+        stored = this.meta("vapid");
+      }
+      return json(JSON.parse(stored));
     }
 
     if (url.pathname === "/listeners") {
