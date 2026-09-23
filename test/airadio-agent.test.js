@@ -277,3 +277,14 @@ test("--session self outside Claude Code or Codex is refused with the reason", a
   assert.equal(refused.code, 1);
   assert.match(refused.stderr, /--session self works inside Claude Code \(CLAUDE_CODE_SESSION_ID\) and Codex \(CODEX_THREAD_ID\)/u);
 });
+
+test("a woken agent starts clean of the agent session that started the radio", async () => {
+  const { agentEnvironment } = await import("../scripts/airadio-radio.mjs");
+  const env = agentEnvironment({
+    PATH: "/bin", HOME: "/h", ANTHROPIC_API_KEY: "k",
+    CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "s", CLAUDE_CODE_CHILD_SESSION: "1", CLAUDE_CODE_MESSAGING_SOCKET: "/sock", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_PID: "9",
+    CLAUDE_CODE_USE_BEDROCK: "1", CLAUDE_CONFIG_DIR: "/c",
+    CODEX_THREAD_ID: "t", CODEX_SANDBOX_NETWORK_DISABLED: "1", CODEX_CI: "1", CODEX_HOME: "/x",
+  }, { AIRADIO_AS: "bot" });
+  assert.deepEqual(Object.keys(env).sort(), ["AIRADIO_AS", "ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME", "PATH"]);
+});

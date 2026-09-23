@@ -448,6 +448,23 @@ function presetFor(agent) {
   return agent ? AGENT_PRESETS[agent.run] || null : null;
 }
 
+/**
+ * The receiver is often started from inside an agent's own session and
+ * inherits that session's variables (its id, its IPC socket, "you are nested
+ * in Claude Code"). A woken CLI must start clean, so those never reach it;
+ * configuration such as CLAUDE_CONFIG_DIR, CODEX_HOME or API keys does.
+ */
+export function agentEnvironment(base, extra = {}) {
+  const env = {};
+  for (const [name, value] of Object.entries(base || {})) {
+    if (name === "CLAUDECODE" || name === "CLAUDE_PID" || name === "CLAUDE_JOB_DIR") continue;
+    if (/^CLAUDE_CODE_(SESSION|CHILD|ENTRYPOINT|MESSAGING|BRIDGE|EXECPATH|SSE_PORT)/.test(name)) continue;
+    if (/^CODEX_(THREAD_ID|SESSION_ID|CI|SANDBOX|MANAGED_BY_NPM|MANAGED_PACKAGE_ROOT|VERSION)/.test(name)) continue;
+    env[name] = value;
+  }
+  return { ...env, ...extra };
+}
+
 /** Run one agent CLI to completion, bounded in time and output; never throws. */
 export function runAgentProcess(binary, args, { cwd, input = "", timeoutMs = AGENT_TIMEOUT_MS, env = process.env } = {}) {
   return new Promise((done) => {
@@ -683,7 +700,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const result = await runAgentProcess(preset.binary, args, {
       cwd,
       input,
-      env: { ...process.env, AIRADIO_HOME: p.home, AIRADIO_FREQUENCY: frequency, AIRADIO_AS: me, AIRADIO_STATION: channel.station },
+      env: agentEnvironment(process.env, { AIRADIO_HOME: p.home, AIRADIO_FREQUENCY: frequency, AIRADIO_AS: me, AIRADIO_STATION: channel.station }),
     });
     let lastMessage = null;
     try { lastMessage = readFileSync(lastFile, "utf8"); } catch {}
