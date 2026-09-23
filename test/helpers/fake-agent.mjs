@@ -33,7 +33,7 @@ let prompt = "";
 let session = null;
 let resume = false;
 if (flavor === "claude") {
-  prompt = valueAfter("-p");
+  prompt = readStdin();
   resume = argv.includes("--resume");
   session = resume ? valueAfter("--resume") : valueAfter("--session-id");
 } else if (flavor === "codex") {
@@ -50,7 +50,10 @@ if (flavor === "claude") {
   prompt = (argv.find((word) => word.startsWith("-p=")) || "-p=").slice(3);
 }
 
-appendFileSync(join(dir, "calls.jsonl"), JSON.stringify({ flavor, argv, resume, session, prompt, cwd: process.cwd(), frequency: process.env.AIRADIO_FREQUENCY }) + "\n");
+appendFileSync(join(dir, "calls.jsonl"), JSON.stringify({
+  flavor, argv, resume, session, prompt, cwd: process.cwd(), frequency: process.env.AIRADIO_FREQUENCY,
+  opencodeConfig: process.env.OPENCODE_CONFIG_CONTENT || null, airadioHome: process.env.AIRADIO_HOME || null,
+}) + "\n");
 
 const file = join(dir, "session-" + String(session).replace(/[^A-Za-z0-9_-]/g, "_") + ".json");
 if (resume && !existsSync(file)) {

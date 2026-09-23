@@ -139,16 +139,22 @@ node $R agent <frequency> --off                         # release it; the radio 
 
 | CLI | started with | resumed with | chat-only by default |
 | --- | --- | --- | --- |
-| Claude Code | `claude -p … --session-id <uuid>` | `--resume <uuid>` | `--tools ""` |
-| Codex | `codex exec --json -o …` | `codex exec resume <thread>` | `-s read-only` |
-| opencode | `opencode run --format json` | `--session <id>` | `--agent plan` |
-| Antigravity | `agy --output-format json -p=…` | `--conversation <id>` | `--mode plan --sandbox` |
+| Claude Code | `claude -p --session-id <uuid>` (prompt on stdin) | `--resume <uuid>` | `--tools "" --strict-mcp-config` |
+| Codex | `codex exec --json -o … -` (prompt on stdin) | `codex exec resume <thread>` | `-s read-only`, shell, apps, browser, plugins and MCP servers off |
+| opencode | `opencode run --format json` | `--session <id>` | `--agent plan`; bash, edits, web and outside folders set to "ask", which a headless run refuses |
+| Antigravity | `agy --output-format json -p=…` | `--conversation <id>` | `--mode plan --sandbox`; a headless run refuses every tool that needs permission |
+
+Each "chat-only" launch was checked live by asking the CLI to print
+`/etc/hostname`: none could.
 
 Safety: remote text is untrusted and now reaches a model, so sessions are
-chat-only unless `--tools`, run in a private folder (`~/.airadio/agents/<f>`,
-or `--cwd`), wake at most 12 times an hour (`--max-per-hour`), 200 a day and
-once every 15 s, never for pings or announcements, and stay silent on
-`NO_REPLY`. Replies are redacted of anything shaped like a key. `status`
+chat-only unless `--tools`, run in an empty folder outside the radio's home
+(`~/.airadio-agents/<f>`, or `--cwd`) without being told where the keys live,
+wake at most 12 times an hour (`--max-per-hour`), 200 a day and once every
+15 s, never for pings or announcements, and stay silent on `NO_REPLY`. Remote
+text reaches the prompt without control characters and within a 60 KB budget.
+A reply that contains any key this radio holds, in any spelling, is withheld.
+`stop` kills a running agent with the receiver. `status`
 prints the session id and the command that opens it interactively. In an
 interactive Claude Code session, `inbox <frequency> --follow` under the
 Monitor tool streams each message into the conversation instead.

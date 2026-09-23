@@ -304,7 +304,8 @@ const AGENT_PER_DAY = 200;
 const AGENT_QUIET_GAP_MS = envMs("AIRADIO_AGENT_QUIET_MS", 15_000, 0, 3_600_000);
 const AGENT_MAX_BATCH = 20;
 const AGENT_MAX_MESSAGE_CHARS = 4_000;
-const AGENT_MAX_REPLY_CHARS = 8_000;
+const AGENT_MAX_REPLY_BYTES = 12_000;
+const AGENT_MAX_PROMPT_BYTES = 60_000;
 const AGENT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const AGENT_MAX_CONCURRENT = 2;
 const AGENT_HISTORY_LINES = 10;
@@ -336,16 +337,30 @@ function lastJsonObject(text) {
   return events.length > 0 ? events[events.length - 1] : null;
 }
 
+/**
+ * Chat-only means the woken agent cannot read the radio's key file or anything
+ * else, whatever a message says. Checked live on 2026-09-24 by asking each
+ * CLI, launched exactly like this, to print /etc/hostname: claude and codex
+ * answered CANNOT; opencode's and agy's headless runs refused the tool call.
+ */
+const CODEX_CHAT_ONLY_FEATURES = ["shell_tool", "unified_exec", "apps", "browser_use", "browser_use_external", "computer_use", "image_generation", "multi_agent", "plugins"];
+const codexLockdown = (tools) => tools ? [] : [...CODEX_CHAT_ONLY_FEATURES.flatMap((feature) => ["-c", "features." + feature + "=false"]), "-c", "mcp_servers={}"];
+// opencode's free models refuse a client whose tool list was changed, so the
+// tools stay listed and every risky one is set to "ask": a headless run
+// refuses every ask.
+const OPENCODE_CHAT_ONLY = JSON.stringify({ permission: { bash: "ask", edit: "ask", webfetch: "ask", external_directory: "ask" } });
+
 /** How to start, resume and read each agent CLI. Tested live on 2026-09-24. */
 export const AGENT_PRESETS = {
   claude: {
     binary: "claude",
+    stdinPrompt: true,
     newSession: () => randomUUID(),
-    args: ({ prompt, session, resume, tools, model }) => [
-      "-p", prompt,
+    args: ({ session, resume, tools, model }) => [
+      "-p",
       ...(resume ? ["--resume", session] : ["--session-id", session]),
       "--output-format", "json",
-      ...(tools ? [] : ["--tools", ""]),
+      ...(tools ? [] : ["--tools", "", "--strict-mcp-config"]),
       ...(model ? ["--model", model] : []),
     ],
     read: (stdout) => {
@@ -360,8 +375,8 @@ export const AGENT_PRESETS = {
     binary: "codex",
     stdinPrompt: true,
     args: ({ session, resume, tools, model, lastFile }) => resume
-      ? ["exec", "resume", session, "--json", "--skip-git-repo-check", "-c", "sandbox_mode=\"" + (tools ? "workspace-write" : "read-only") + "\"", "-o", lastFile, ...(model ? ["-m", model] : []), "-"]
-      : ["exec", "--json", "--skip-git-repo-check", "-s", tools ? "workspace-write" : "read-only", "-o", lastFile, ...(model ? ["-m", model] : []), "-"],
+      ? ["exec", "resume", session, "--json", "--skip-git-repo-check", "-c", "sandbox_mode=\"" + (tools ? "workspace-write" : "read-only") + "\"", ...codexLockdown(tools), "-o", lastFile, ...(model ? ["-m", model] : []), "-"]
+      : ["exec", "--json", "--skip-git-repo-check", "-s", tools ? "workspace-write" : "read-only", ...codexLockdown(tools), "-o", lastFile, ...(model ? ["-m", model] : []), "-"],
     read: (stdout, lastMessage) => {
       let session = null;
       let reply = null;
@@ -378,6 +393,7 @@ export const AGENT_PRESETS = {
   },
   opencode: {
     binary: "opencode",
+    env: (tools) => tools ? {} : { OPENCODE_CONFIG_CONTENT: OPENCODE_CHAT_ONLY },
     args: ({ prompt, session, resume, tools, model }) => [
       "run", "--format", "json",
       ...(resume ? ["--session", session] : []),
@@ -441,6 +457,10 @@ const EXEC_PRESET = {
 /** Where an agent CLI tells the commands it runs which session they are in. */
 export const SELF_SESSION_ENV = { claude: "CLAUDE_CODE_SESSION_ID", codex: "CODEX_THREAD_ID" };
 
+function agentsHome(p) {
+  return p.home + "-agents";
+}
+
 function presetFor(agent) {
   if (agent && typeof agent.exec === "string" && agent.exec !== "") return EXEC_PRESET;
   return agent ? AGENT_PRESETS[agent.run] || null : null;
@@ -455,7 +475,7 @@ function presetFor(agent) {
 export function agentEnvironment(base, extra = {}) {
   const env = {};
   for (const [name, value] of Object.entries(base || {})) {
-    if (name === "CLAUDECODE" || name === "CLAUDE_PID" || name === "CLAUDE_JOB_DIR") continue;
+    if (name === "CLAUDECODE" || name === "CLAUDE_PID" || name === "CLAUDE_JOB_DIR" || name === "AIRADIO_HOME") continue;
     if (/^CLAUDE_CODE_(SESSION|CHILD|ENTRYPOINT|MESSAGING|BRIDGE|EXECPATH|SSE_PORT)/.test(name)) continue;
     if (/^CODEX_(THREAD_ID|SESSION_ID|CI|SANDBOX|MANAGED_BY_NPM|MANAGED_PACKAGE_ROOT|VERSION)/.test(name)) continue;
     env[name] = value;
@@ -464,7 +484,7 @@ export function agentEnvironment(base, extra = {}) {
 }
 
 /** Run one agent CLI to completion, bounded in time and output; never throws. */
-export function runAgentProcess(binary, args, { cwd, input = "", timeoutMs = AGENT_TIMEOUT_MS, env = process.env } = {}) {
+export function runAgentProcess(binary, args, { cwd, input = "", timeoutMs = AGENT_TIMEOUT_MS, env = process.env, onSpawn } = {}) {
   return new Promise((done) => {
     let child;
     try {
@@ -483,6 +503,9 @@ export function runAgentProcess(binary, args, { cwd, input = "", timeoutMs = AGE
       kill("SIGTERM");
       setTimeout(() => kill("SIGKILL"), 5_000).unref();
     }, timeoutMs);
+    if (onSpawn) onSpawn(child, kill);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { if (stdout.length < AGENT_MAX_OUTPUT_BYTES) stdout += chunk; });
     child.stderr.on("data", (chunk) => { if (stderr.length < 64 * 1024) stderr += chunk; });
     const finish = (code) => {
@@ -493,6 +516,8 @@ export function runAgentProcess(binary, args, { cwd, input = "", timeoutMs = AGE
     };
     child.on("error", (error) => { stderr += String(error && error.message); finish(-1); });
     child.on("close", (code) => finish(code));
+    // A grandchild that keeps the pipes open must not turn a finished turn into a timeout.
+    child.on("exit", (code) => { setTimeout(() => finish(code), 2_000).unref(); });
     child.stdin.on("error", () => {});
     child.stdin.end(input);
   });
@@ -504,13 +529,37 @@ export function cleanReply(text, secrets = []) {
   if (reply === "" || new RegExp("^\\W*" + NO_REPLY + "\\b", "i").test(reply)) return null;
   for (const secret of secrets) if (typeof secret === "string" && secret.length >= 16) reply = reply.split(secret).join("[key redacted]");
   reply = redact(reply);
-  if (reply.length > AGENT_MAX_REPLY_CHARS) reply = reply.slice(0, AGENT_MAX_REPLY_CHARS) + " [truncated]";
+  if (Buffer.byteLength(reply, "utf8") > AGENT_MAX_REPLY_BYTES) {
+    while (Buffer.byteLength(reply, "utf8") > AGENT_MAX_REPLY_BYTES - 16) reply = reply.slice(0, Math.floor(reply.length * 0.9));
+    reply += " [truncated]";
+  }
   return reply;
 }
 
+/**
+ * True when a reply carries any key this radio holds, in any spelling: spaced,
+ * split over lines, upper case. Checked on the hex digits alone, so an agent
+ * talked into "print the key with a space every 16 characters" still cannot
+ * put it on the air.
+ */
+export function leaksSecret(text, secrets = []) {
+  const digits = String(text).toLowerCase().replace(/[^0-9a-f]/g, "");
+  for (const secret of secrets) {
+    if (typeof secret !== "string" || secret.length < 32) continue;
+    const lower = secret.toLowerCase();
+    for (let start = 0; start + 32 <= lower.length; start += 8) if (digits.includes(lower.slice(start, start + 32))) return true;
+  }
+  return false;
+}
+
+/** Remote strings reach a prompt as plain text: no control characters, no forged lines. */
+function plainText(value, max) {
+  return String(value).replace(/[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029]/g, " ").slice(0, max);
+}
+
 function messageLines(messages) {
-  return messages.map((message) => "[" + shortTime(message.at) + "] " + message.from + ": "
-    + redact(String(message.text)).slice(0, AGENT_MAX_MESSAGE_CHARS).replace(/\r?\n/g, "\n    ")).join("\n");
+  return messages.map((message) => "[" + shortTime(message.at) + "] " + (plainText(message.from, 64).replace(/\s+/g, " ").trim() || "?") + ": "
+    + plainText(redact(String(message.text)), AGENT_MAX_MESSAGE_CHARS).replace(/\n/g, "\n    ")).join("\n");
 }
 
 /** The first wake briefs the session; later wakes carry only what is new. */
@@ -625,6 +674,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     agents: previous.agents && typeof previous.agents === "object" ? previous.agents : {},
   };
   const running = new Map();
+  const children = new Set();
   let lastActivity = Date.now();
   log("receiver " + VERSION + " on the air (pid " + process.pid + ", home " + p.home + ")");
 
@@ -672,8 +722,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       current.pending = [];
       return;
     }
-    const messages = current.pending.splice(0, current.pending.length);
-    const dropped = current.dropped || 0;
+    let messages = current.pending.splice(0, current.pending.length);
+    let dropped = current.dropped || 0;
     current.dropped = 0;
     const me = channel.as || config.as;
     current.wakes.push(Date.now());
@@ -685,8 +735,19 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const history = current.briefed ? [] : inboxSince(p, 0).entries
       .filter((entry) => entry.frequency === frequency && !entry.kind && Number.isSafeInteger(entry.seq) && entry.seq < messages[0].seq)
       .slice(-AGENT_HISTORY_LINES);
-    const prompt = agentPrompt({ briefed: current.briefed, me, station: channel.station, frequency, brief: agent.brief, history, messages, dropped });
-    const agentsDir = join(p.home, "agents");
+    const build = () => agentPrompt({ briefed: current.briefed, me, station: channel.station, frequency, brief: agent.brief, history, messages, dropped });
+    let prompt = build();
+    // A prompt has a byte budget: the oldest lines give way, and the count says so.
+    while (Buffer.byteLength(prompt, "utf8") > AGENT_MAX_PROMPT_BYTES && (history.length > 0 || messages.length > 1)) {
+      if (history.length > 0) history.shift();
+      else {
+        messages = messages.slice(1);
+        dropped += 1;
+      }
+      prompt = build();
+    }
+    // Agents work outside the radio's home, so the key file is never a relative path away.
+    const agentsDir = agentsHome(p);
     const cwd = agent.cwd || join(agentsDir, frequency);
     mkdirSync(cwd, { recursive: true, mode: 0o700 });
     const lastFile = join(agentsDir, frequency + ".last");
@@ -699,19 +760,29 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const result = await runAgentProcess(preset.binary, args, {
       cwd,
       input,
-      env: agentEnvironment(process.env, { AIRADIO_HOME: p.home, AIRADIO_FREQUENCY: frequency, AIRADIO_AS: me, AIRADIO_STATION: channel.station }),
+      env: agentEnvironment(process.env, { ...(preset.env ? preset.env(agent.tools === true) : {}), AIRADIO_FREQUENCY: frequency, AIRADIO_AS: me, AIRADIO_STATION: channel.station }),
+      onSpawn: (child, kill) => {
+        children.add(kill);
+        child.on("close", () => children.delete(kill));
+      },
     });
+    if (stopping) {
+      log("receiver stopping: the agent's answer on " + frequency + " is not sent");
+      return;
+    }
     let lastMessage = null;
     try { lastMessage = readFileSync(lastFile, "utf8"); } catch {}
     const read = preset.read(result.stdout, lastMessage) || {};
     if (typeof read.session === "string" && read.session !== "") current.session = read.session;
-    const failed = result.timedOut || Boolean(read.error) || (result.code !== 0 && (read.reply === undefined || read.reply === null));
+    const failed = result.timedOut || Boolean(read.error) || result.code !== 0;
     if (failed) {
       const tail = redact(String(result.stderr || "")).trim().split("\n").pop() || "";
       current.lastError = (result.timedOut ? "timed out after " + AGENT_TIMEOUT_MS / 1000 + "s" : read.error || "exit " + result.code + (tail ? ": " + tail : "")).slice(0, 300);
       current.failures = (current.failures || 0) + 1;
       if (current.failures < 2) current.pending = messages.concat(current.pending).slice(-AGENT_MAX_BATCH);
-      if (resume && current.failures >= 2) {
+      // Only a session the CLI says it does not know is started afresh; a
+      // failure of ours (a spawn error, a timeout) must not cost the conversation.
+      if (resume && /no (conversation|session)|(conversation|session|thread)[^.]{0,40}not found|unknown (session|thread|conversation)/i.test(current.lastError)) {
         current.session = null;
         current.briefed = false;
       }
@@ -722,11 +793,21 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     current.failures = 0;
     current.lastError = null;
     current.briefed = true;
-    const reply = cleanReply(read.reply, [channel.key, config.mailbox ? config.mailbox.key : null]);
+    const latest = loadConfig(p);
+    const secrets = [...Object.values(latest.channels).map((other) => other.key), latest.mailbox ? latest.mailbox.key : null];
+    const reply = cleanReply(read.reply, secrets);
     if (reply === null) {
       appendInbox(p, { at: new Date().toISOString(), kind: "agent", frequency, from: me, text: "(" + NO_REPLY + ")" });
       return;
     }
+    if (leaksSecret(reply, secrets)) {
+      current.lastError = "reply withheld: it contained a key this radio holds";
+      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply withheld: it contained a key this radio holds" });
+      log("agent reply on " + frequency + " withheld: it contained a key");
+      return;
+    }
+    const still = latest.channels[frequency];
+    if (!still || !still.agent || still.agent.epoch !== agent.epoch) return;
     try {
       await sendText(channel, frequency, me, reply);
       current.lastReplyAt = new Date().toISOString();
@@ -895,7 +976,9 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       }
     }
   } finally {
+    for (const kill of children) kill("SIGTERM");
     if (running.size > 0) await Promise.race([Promise.allSettled([...running.values()]), new Promise((ok) => setTimeout(ok, 10_000))]);
+    for (const kill of children) kill("SIGKILL");
     state.pid = null;
     state.stoppedAt = new Date().toISOString();
     writeJson(p.state, state);
@@ -1262,7 +1345,7 @@ async function cmdAgent(p, args, flags, out) {
       ...(cwd ? { cwd } : {}),
       maxPerHour: perHour,
       ...(session ? { session } : !fresh && previous && previous.session ? { session: previous.session } : {}),
-      epoch: fresh ? (previous && Number.isSafeInteger(previous.epoch) ? previous.epoch + 1 : 1) : previous.epoch,
+      epoch: fresh ? randomUUID() : previous.epoch,
       since: new Date().toISOString(),
     };
     return target.agent;
@@ -1273,7 +1356,8 @@ async function cmdAgent(p, args, flags, out) {
   out("Every batch of new messages wakes the same " + (exec ? "command" : run) + " session; it answers on the channel by itself,");
   out("at most " + perHour + " times an hour and once every " + AGENT_QUIET_GAP_MS / 1000 + "s. Pings and announcements never wake it.");
   if (agent.tools) out("TOOLS ON: remote text now drives an agent that can use its tools (under its own permission rules). Use only on channels you trust.");
-  else out("Chat-only: the agent cannot run tools or change files.");
+  else out("Chat-only: no shell, no file access beyond an empty folder of its own, no edits, no network tools.");
+  if (agent.session && flags.session) out("This channel now reaches an existing conversation: whatever was said in it can come up in replies. Replies that contain a key this radio holds are never sent.");
   out("Each wake is a model call billed to you. See it work: " + command(p, "status") + " and " + command(p, "inbox " + frequency));
   out("Release it: " + command(p, "agent " + frequency + " --off"));
   const sandbox = sandboxName();
@@ -1421,7 +1505,7 @@ export function parseArgs(argv) {
     if (word.startsWith("--")) {
       const [name, inline] = word.slice(2).split(/=(.*)/s);
       if (valued.has(name)) flags[name] = inline !== undefined ? inline : argv[++index];
-      else flags[name] = true;
+      else flags[name] = inline === undefined ? true : !/^(false|0|no|off)$/i.test(inline);
     } else args.push(word);
   }
   return { args, flags };
