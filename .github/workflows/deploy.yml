@@ -59,6 +59,9 @@ jobs:
             echo "::error::no Cloudflare account is visible to this credential"
             exit 1
           fi
+          # Run logs of a public repository are public: mask the account id
+          # before it reaches GITHUB_ENV, which echoes it in every later step.
+          echo "::add-mask::$ACCOUNT_ID"
           echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
 
       - name: name the target environment
