@@ -1,0 +1,132 @@
+# Deploy AI RADIO to an isolated preview by default. Production remains an
+# explicit workflow_dispatch choice. Every deploy is stamped, read back, and
+# (for preview only) exercised through a disposable channel.
+#
+# Manual dispatch only for now: the same Cloudflare workers (airadio,
+# airadio-staging) were previously deployed from the teakofe repository. Add a
+# push trigger here only after that workflow is retired, so exactly one source
+# of truth deploys the station.
+#   gh workflow run deploy.yml -f environment=staging
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "staging (default) or production — production is never implicit"
+        required: false
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_GLOBAL_API_TOKEN }}
+      CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+      TARGET_ENV: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: verify the credential before touching anything
+        run: |
+          if [ -z "$CLOUDFLARE_API_KEY" ] || [ -z "$CLOUDFLARE_EMAIL" ]; then
+            echo "::error::CLOUDFLARE_GLOBAL_API_TOKEN and CLOUDFLARE_EMAIL must both be repository secrets. Nothing was deployed."
+            exit 1
+          fi
+          OK=$(curl -s -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
+            https://api.cloudflare.com/client/v4/user | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::Cloudflare refused the email+key pair. Nothing was deployed."
+            exit 1
+          fi
+
+      - name: refuse an unthrottled surface
+        run: npm run airadio:gate
+
+      - name: resolve the account
+        run: |
+          ACCOUNT_ID=$(curl -s -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
+            https://api.cloudflare.com/client/v4/accounts | jq -r '.result[0].id')
+          if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "null" ]; then
+            echo "::error::no Cloudflare account is visible to this credential"
+            exit 1
+          fi
+          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+
+      - name: name the target environment
+        run: |
+          if [ "$TARGET_ENV" = "production" ]; then
+            echo "WORKER_NAME=airadio" >> "$GITHUB_ENV"
+            echo "WRANGLER_ENV_ARGS=" >> "$GITHUB_ENV"
+          else
+            echo "WORKER_NAME=airadio-staging" >> "$GITHUB_ENV"
+            echo "WRANGLER_ENV_ARGS=--env staging" >> "$GITHUB_ENV"
+          fi
+
+      - name: deploy the worker
+        run: npx wrangler@4 deploy --config worker/wrangler.toml $WRANGLER_ENV_ARGS --var GIT_SHA:$GITHUB_SHA
+
+      - name: resolve the deployed workers.dev address
+        run: |
+          SUB=$(curl -s -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" | jq -r '.result.subdomain')
+          if [ -z "$SUB" ] || [ "$SUB" = "null" ]; then
+            echo "::error::could not resolve the workers.dev subdomain"
+            exit 1
+          fi
+          echo "AIRADIO_BASE=https://$WORKER_NAME.$SUB.workers.dev" >> "$GITHUB_ENV"
+
+      - name: read back the deployed build SHA
+        run: |
+          READBACK_OK=false
+          # Edge propagation can return an older successful response or a 5xx.
+          # Five bounded requests, at most 180 seconds including backoff.
+          for DELAY in 0 2 4 8 16; do
+            sleep "$DELAY"
+            if HEALTH=$(curl --fail --silent --show-error --max-time 30 "$AIRADIO_BASE/health"); then
+              if printf '%s' "$HEALTH" | jq -e --arg sha "$GITHUB_SHA" '.ok == true and .service == "airadio" and .sha == $sha' >/dev/null; then
+                READBACK_OK=true
+                break
+              fi
+            fi
+          done
+          if [ "$READBACK_OK" != true ]; then
+            echo "::error::$AIRADIO_BASE/health did not echo deployed SHA $GITHUB_SHA after five bounded attempts"
+            exit 1
+          fi
+          echo "health read-back: sha=$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: disposable preview channel canary
+        if: env.TARGET_ENV == 'staging'
+        run: node scripts/airadio-mcp-probe.mjs --canary --preview-url "$AIRADIO_BASE" --channel-only
+
+      - name: report the station address
+        run: |
+          echo "## AI RADIO deployed ($TARGET_ENV)" >> "$GITHUB_STEP_SUMMARY"
+          echo "workers.dev address: $AIRADIO_BASE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: attach airadio.akbrd.com when the zone exists
+        if: env.TARGET_ENV == 'production'
+        run: |
+          ZONE_ID=$(curl -s -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
+            "https://api.cloudflare.com/client/v4/zones?name=akbrd.com" | jq -r '.result[0].id')
+          if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "null" ]; then
+            echo "zone akbrd.com is not in this account yet — the station stays on workers.dev" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          RESULT=$(curl -s -X PUT -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
+            -H "content-type: application/json" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" \
+            -d "{\"zone_id\":\"$ZONE_ID\",\"hostname\":\"airadio.akbrd.com\",\"service\":\"airadio\",\"environment\":\"production\"}")
+          if ! printf '%s' "$RESULT" | jq -e '.success == true' >/dev/null; then
+            echo "::error::custom domain attach failed"
+            exit 1
+          fi

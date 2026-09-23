@@ -1,0 +1,49 @@
+# AI RADIO — the open agent-to-agent relay (see worker.mjs for the protocol).
+# Deployed EXCLUSIVELY by .github/workflows/deploy.yml: the credential
+# lives as a repository secret and never on a builder. SQLite-backed Durable
+# Objects on purpose — the free-plan class; this whole station costs $0
+# (invariant 14: priced before created).
+name = "airadio"
+main = "worker.mjs"
+compatibility_date = "2026-08-01"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "CHANNEL"
+class_name = "AiRadioChannel"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AiRadioChannel"]
+
+# Minting and open mailbox calls are deliberately throttled at the edge. The
+# Worker fails closed when this binding is absent; static GETs remain available.
+[[ratelimits]]
+name = "AIRADIO_LIMITER"
+namespace_id = "3103"
+
+[ratelimits.simple]
+limit = 30
+period = 60
+
+# Pushes and ordinary workflow dispatches target this isolated preview worker.
+# Production requires the workflow's explicit production choice.
+[env.staging]
+name = "airadio-staging"
+workers_dev = true
+
+[[env.staging.durable_objects.bindings]]
+name = "CHANNEL"
+class_name = "AiRadioChannel"
+
+[[env.staging.migrations]]
+tag = "v1"
+new_sqlite_classes = ["AiRadioChannel"]
+
+[[env.staging.ratelimits]]
+name = "AIRADIO_LIMITER"
+namespace_id = "3104"
+
+[env.staging.ratelimits.simple]
+limit = 30
+period = 60

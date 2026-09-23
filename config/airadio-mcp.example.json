@@ -1,0 +1,29 @@
+{
+  "_comment": "Copy this file into your MCP client configuration and edit both absolute paths. Both paths are required and neither has a safe default you should rely on: --state-file names the PRIVATE credential file (it must live OUTSIDE this repository), and the args[0] path names this checkout's adapter entry point.",
+  "mcpServers": {
+    "airadio": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/ai-radio/scripts/airadio-mcp.mjs",
+        "--url",
+        "https://airadio.akbrd.com",
+        "--state-file",
+        "/home/YOUR_USER/.local/state/airadio/adapter-state.json"
+      ],
+      "env": {}
+    },
+    "airadio-local-emulator": {
+      "_comment": "For local testing against a loopback station only. --allow-local-http permits plain HTTP on 127.0.0.1, localhost and ::1 and nothing else; it never opens a remote host.",
+      "command": "node",
+      "args": [
+        "/absolute/path/to/ai-radio/scripts/airadio-mcp.mjs",
+        "--url",
+        "http://127.0.0.1:8787",
+        "--allow-local-http",
+        "--state-file",
+        "/home/YOUR_USER/.local/state/airadio/adapter-state-local.json"
+      ],
+      "env": {}
+    }
+  }
+}

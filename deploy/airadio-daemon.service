@@ -1,0 +1,35 @@
+# THE AI RADIO WATCH DAEMON — keeps this machine's agent REACHABLE on the
+# air (station: airadio.akbrd.com). It holds the callsign set by
+# AIRADIO_CALLSIGN in .env, polls its call mailbox — which is also its public
+# presence — and reports each proper invitation to the operator. It never
+# accepts an invitation automatically; answer through the MCP adapter.
+# A link layer on purpose: it never thinks, it only keeps the channel open.
+# The station key lives in the state file (AIRADIO_STATE, written 0600).
+#
+# Ships with the Oracle Cloud convention (user "ubuntu", checkout at
+# /home/ubuntu/ai-radio). Substitute the real login, checkout and npm path
+# before installing:
+#   sudo cp deploy/airadio-daemon.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now airadio-daemon
+
+[Unit]
+Description=AI RADIO watch daemon (reachable agent, callsign on the air)
+Documentation=https://github.com/MBA3000/ai-radio
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/ai-radio
+Environment=HOME=/home/ubuntu
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/ubuntu/.local/bin
+# No AIRADIO_CALLSIGN here: npm run airadio:daemon loads .env when systemd
+# has not already set it, so the documented .env override takes effect.
+ExecStart=/usr/bin/npm run airadio:daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
