@@ -211,25 +211,33 @@ test("a signed mandate wakes a dormant agent session, bounds it, and a revoke pu
   assert.equal(calls().length, 0, "no mandate, no wake: listening only");
 
   const say = async (text, mandate) => channel.post({ from: "Medet", text, sig: await medet.sign({ frequency: channel.frequency, from: "Medet", text, mandate }) });
+  // The page's rule: answering your operator's own signed words is always fine.
+  await say("please remember 7");
+  assert.ok(await eventually(() => calls().length === 1), "the operator's signed words wake even a dormant session");
+  const direct = calls()[0];
+  assert.match(direct.prompt, /\u2713 operator Medet: please remember 7/u);
+  assert.doesNotMatch(direct.prompt, /please remember 1/u, "the untrusted message that came before did not ride along");
+  assert.match(direct.prompt, /You hold no mandate yet: answer your operator's signed words only/u);
+  assert.equal(direct.argv[direct.argv.indexOf("--tools") + 1], "", "and without a mandate it is chat-only, whatever --tools says");
   await say("Solnze may talk here for an hour: test airadio", { to: "Solnze", scope: "talk", until: new Date(Date.now() + 3_600_000).toISOString(), note: "test airadio" });
-  assert.ok(await eventually(() => calls().length === 1), "the mandate itself wakes the session");
-  const [first] = calls();
+  assert.ok(await eventually(() => calls().length === 2), "the mandate itself wakes the session");
+  const first = calls()[1];
   assert.match(first.prompt, /✓ operator Medet: Solnze may talk here for an hour/u);
-  assert.match(first.prompt, /Your mandate, signed by your operator: talk \(no tools\) until .*; note: test airadio/u);
+  assert.match(first.prompt, /your mandate, signed by your operator: talk \(no tools\) until .*; note: test airadio/iu, "the session, already briefed, hears its new standing");
   assert.equal(first.argv[first.argv.indexOf("--tools") + 1], "", "a talk mandate narrows this machine's --tools to chat-only");
   const status = JSON.parse((await radio("status", "--json", "--offline")).stdout);
   assert.equal(status.channels[0].mandate.active, true);
   assert.match(status.channels[0].agent.label, /on mandate/u);
 
   await say("now with tools", { to: "Solnze", scope: "tools", until: new Date(Date.now() + 3_600_000).toISOString() });
-  assert.ok(await eventually(() => calls().length === 2));
-  assert.ok(!calls()[1].argv.includes("--tools"), "a tools mandate lets this machine's tools through");
+  assert.ok(await eventually(() => calls().length === 3));
+  assert.ok(!calls()[2].argv.includes("--tools"), "a tools mandate lets this machine's tools through");
 
   await say("that is enough", { to: "Solnze", scope: "revoke" });
   assert.ok(await eventually(async () => /revoked the mandate: listen only/u.test((await radio("inbox", channel.frequency, "--peek")).stdout)));
   await channel.say("host", "anyone still talking?");
   await new Promise((ok) => setTimeout(ok, 6_000));
-  assert.equal(calls().length, 2, "revoked: back to listening");
+  assert.equal(calls().length, 3, "revoked: back to listening");
   assert.match((await radio("status", "--offline")).stdout, /mandate: revoked: listen only/u);
 });
 

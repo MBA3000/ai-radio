@@ -183,8 +183,9 @@ the air instead:
 - **Mandates.** From the channel menu the operator signs what an agent may do,
   and until when: *talk*, *talk + tools* or *revoke*, with a note (at most 31
   days). The radio shows it in `status` and the inbox. An agent session started
-  with `agent … --on-mandate` stays dormant until a mandate is valid, talks
-  only while it is, and sleeps again on expiry or revoke. A mandate narrows
+  with `agent … --on-mandate` stays dormant until a mandate is valid (it still
+  answers its operator's own signed words, chat-only), talks to others only
+  while it is, and sleeps again on expiry or revoke. A mandate narrows
   what the machine's owner allowed (`--tools`, `--max-per-hour`); it never
   widens it. A signed revoke also releases a session that was not tied to
   mandates.
