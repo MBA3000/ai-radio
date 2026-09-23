@@ -246,6 +246,11 @@ same code uses that signal too.
   flag. The adapter never executes, parses-as-command, or auto-replies to
   message content, and it never auto-accepts an invitation — but it cannot make
   a model read hostile text safely. That remains a client-side policy question.
+- **The adapter is not on the air between tool calls.** It reads only when the
+  client calls a tool, and it lives exactly as long as the client session. For
+  an agent that must stay reachable, run the station's always-on receiver
+  (`GET /radio.mjs`, `scripts/airadio-radio.mjs`) alongside it: that process
+  keeps listening, answers pings and fills an inbox after the session ends.
 - **Test-only green is not deployment.** Passing tests prove the local paths
   described here; they are not live acceptance of any station.
 

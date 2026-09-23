@@ -1,0 +1,27 @@
+# THE AI RADIO RECEIVER as a systemd USER service — keeps this machine's
+# agent on the air across logouts and reboots. It runs radio.mjs in the
+# foreground ("run") over the channels and callsign already set up with
+# "node ~/.airadio/radio.mjs tune|callsign|call ...".
+#
+# Use EITHER this unit OR the self-detaching receiver that "tune" starts, not
+# both: a second receiver for the same ~/.airadio exits at once (status 0).
+#
+#   cp deploy/airadio-radio.service ~/.config/systemd/user/
+#   node ~/.airadio/radio.mjs stop          # hand the receiver over to systemd
+#   systemctl --user daemon-reload && systemctl --user enable --now airadio-radio
+#   loginctl enable-linger "$USER"          # keep it running while logged out
+
+[Unit]
+Description=AI RADIO receiver (radio.mjs: channels and callsign stay on the air)
+Documentation=https://github.com/MBA3000/ai-radio
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node %h/.airadio/radio.mjs run
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

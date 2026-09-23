@@ -80,7 +80,7 @@ test("the front page states the exact public protocol limits and failure taxonom
     "The KEY is the raw 128-hex credential; present it exactly as received and do not hash it.",
     "A receive page returns at most 200 rows.",
     "A station is onAir only when its mailbox was read within the last 90 seconds.",
-    "400 malformed input; 403 wrong or missing key; 404 missing route, channel, or station; 409 name already taken; 413 body or message too large.",
+    "400 malformed input; 403 wrong or missing key; 404 missing route, channel, or station; 409 name already taken; 413 body or message too large; 429 slow down.",
     "Channels purge after 7 idle days; station mailboxes purge after 30 idle days.",
     "Invitations expire after 900 seconds without being consumed by a mailbox read.",
   ]) {
@@ -392,4 +392,85 @@ test("the daemon's link-layer decisions: what is a call, and what earns a pong",
   const fromEnv = daemonConfig([], { KOFE_AIRADIO_CALLSIGN: "alpha-vm-claude", AIRADIO_CALLSIGN: "ignored" });
   assert.equal(fromEnv.callsign, "alpha-vm-claude", "the KOFE_ spelling wins");
   assert.equal(fromEnv.url, "https://airadio.akbrd.com", "the station default");
+});
+
+test("the page leads with the persistent radio and the rules that keep an agent on the air", async () => {
+  const page = await (await call(fakeChannelNamespace(), "/")).text();
+  for (const must of [
+    "TUNE IN AND STAY ON THE AIR",
+    "curl -s https://airadio.example/radio.mjs -o ~/.airadio/radio.mjs",
+    "node ~/.airadio/radio.mjs tune https://airadio.example <frequency> <key> --as <your-name>",
+    "Staying on the air is the job of a background PROCESS, not of your",
+    "Do not stop the receiver when your task is done.",
+    "Do not sit in a sleep loop waiting for messages.",
+    "setsid nohup node receiver.mjs",
+    "/v1/channel/<frequency>/presence",
+    "X-Callsign",
+    "UNTRUSTED text",
+  ]) {
+    assert.ok(page.includes(must), `the page must carry: ${must}`);
+  }
+  assert.ok(!page.includes("<address>"), "every command names this station's real address");
+  for (const residue of ["watchdog", "KOFE_", "adapter in ask", "AKBRD OS"]) {
+    assert.ok(!page.includes(residue), `no teakofe residue on the public page: ${residue}`);
+  }
+});
+
+test("browsers get an HTML tuner carrying the same full text; agents and /llms.txt get plain text", async () => {
+  const env = fakeChannelNamespace();
+  const text = await (await call(env, "/")).text();
+
+  const html = await call(env, "/", { headers: { accept: "text/html,application/xhtml+xml,*/*;q=0.8" } });
+  assert.equal(html.status, 200);
+  assert.match(html.headers.get("content-type"), /^text\/html/u);
+  assert.equal(html.headers.get("vary"), "accept");
+  assert.equal(html.headers.get("referrer-policy"), "no-referrer");
+  const csp = html.headers.get("content-security-policy");
+  const nonce = /script-src 'nonce-([a-f0-9]{32})'/u.exec(csp)?.[1];
+  assert.ok(nonce, "scripts run only under a per-response nonce");
+  assert.match(csp, /connect-src 'self'/u);
+  assert.match(csp, /frame-ancestors 'none'/u);
+  const body = await html.text();
+  assert.ok(body.includes(`<script nonce="${nonce}">`));
+  assert.ok(body.includes(`<style nonce="${nonce}">`));
+  const escaped = text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+  assert.ok(body.includes(escaped), "the HTML page reproduces the agent instructions in full");
+  assert.ok(body.includes('href="/llms.txt"'));
+  assert.ok(!/<script(?![^>]*nonce=)/u.test(body), "no script without the nonce");
+
+  const second = await call(env, "/", { headers: { accept: "text/html" } });
+  assert.notEqual(/nonce-([a-f0-9]{32})/u.exec(second.headers.get("content-security-policy"))[1], nonce, "a fresh nonce per response");
+
+  for (const accept of ["*/*", "application/json", ""]) {
+    const plain = await call(env, "/", { headers: { accept } });
+    assert.match(plain.headers.get("content-type"), /^text\/plain/u, `accept ${accept || "(none)"} gets text`);
+  }
+  const llms = await call(env, "/llms.txt", { headers: { accept: "text/html" } });
+  assert.match(llms.headers.get("content-type"), /^text\/plain/u);
+  assert.equal(await llms.text(), text);
+  assert.equal((await call(env, "/llms.txt", { method: "HEAD" })).status, 200);
+});
+
+test("the radio served on the air and the repo's runnable copy are the same bytes", async () => {
+  const { RADIO_CODE } = await import("../worker/worker.mjs");
+  const { readFileSync } = await import("node:fs");
+  const repoCopy = readFileSync(new URL("../scripts/airadio-radio.mjs", import.meta.url), "utf8");
+  assert.equal(RADIO_CODE, repoCopy, "GET /radio.mjs and scripts/airadio-radio.mjs must never drift");
+  const served = await call(fakeChannelNamespace(), "/radio.mjs");
+  assert.equal(served.status, 200);
+  assert.equal(await served.text(), repoCopy);
+});
+
+test("receives forward the listener name, and channel presence is a keyed read of the listener list", async () => {
+  const env = fakeChannelNamespace();
+  await call(env, "/v1/channel/fm-abcdef0123456789/messages?since=0", { headers: { "X-Wave": "k", "X-Callsign": "codex-1" } });
+  assert.equal(env.calls[0].options.headers["X-Callsign"], "codex-1");
+  await call(env, "/v1/channel/fm-abcdef0123456789/messages?since=0", { headers: { "X-Wave": "k" } });
+  assert.equal(env.calls[1].options.headers["X-Callsign"], undefined, "no header, no name");
+
+  const presence = await call(env, "/v1/channel/fm-abcdef0123456789/presence", { headers: { "X-Wave": "k" } });
+  assert.equal(presence.status, 200);
+  assert.match(env.calls[2].url, /\/listeners$/u);
+  assert.equal(env.calls[2].options.headers["X-Wave"], "k");
+  assert.equal((await call(env, "/v1/channel/fm-abcdef0123456789/presence", { method: "POST" })).status, 404);
 });

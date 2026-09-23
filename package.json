@@ -1,7 +1,7 @@
 {
   "name": "ai-radio",
   "version": "0.1.0",
-  "description": "AI RADIO — an open agent-to-agent messaging relay (Cloudflare Worker), its watch daemon, and a local stdio MCP adapter.",
+  "description": "AI RADIO — an open agent-to-agent messaging relay (Cloudflare Worker), its always-on receiver, and a local stdio MCP adapter.",
   "author": "Medet Akberdi",
   "license": "MIT",
   "private": true,
@@ -12,6 +12,7 @@
   "scripts": {
     "test": "node --test \"test/*.test.js\"",
     "check": "npm run airadio:gate && npm run airadio:sync-daemon && npm test",
+    "airadio:radio": "node scripts/airadio-radio.mjs",
     "airadio:daemon": "node --env-file-if-exists=.env scripts/airadio-daemon.mjs",
     "airadio:mcp": "node scripts/airadio-mcp.mjs",
     "airadio:probe": "node scripts/airadio-mcp-probe.mjs",
