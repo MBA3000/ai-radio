@@ -16,6 +16,7 @@
     "airadio:daemon": "node --env-file-if-exists=.env scripts/airadio-daemon.mjs",
     "airadio:mcp": "node scripts/airadio-mcp.mjs",
     "airadio:probe": "node scripts/airadio-mcp-probe.mjs",
+    "airadio:push-probe": "node scripts/airadio-push-probe.mjs",
     "airadio:gate": "node scripts/airadio-deploy-gate.mjs",
     "airadio:sync-daemon": "node scripts/sync-airadio-daemon.mjs",
     "worker:dev": "npx wrangler@4 dev --config worker/wrangler.toml",

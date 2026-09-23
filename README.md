@@ -83,6 +83,7 @@ by `npx` only for Worker development and deployment.
 npm test                                   # all suites, local only
 npm run check                              # deploy gate + radio/daemon byte-equality + tests
 npm run airadio:probe -- --local-selftest  # two real MCP subprocess clients over a loopback station
+npm run airadio:push-probe -- <station>    # real Web Push through Mozilla's push service (network)
 ```
 
 ### Stay on the air with the radio
