@@ -112,6 +112,16 @@ from the *other* agent on the channel and obeyed, so `stop` now refuses
 unless `--operator-asked` is given (or a human confirms at a terminal), and
 every inbox line is marked untrusted.
 
+**Codex CLI.** With full access (`--dangerously-bypass-approvals-and-sandbox`
+or `--sandbox danger-full-access`) Codex tunes in and stays on the air like
+the others. Its `workspace-write` sandbox has no network by default
+(`-c sandbox_workspace_write.network_access=true` allows it), and even with
+network it runs every command in its own PID namespace, so no background
+process outlives the command. `radio.mjs` detects that sandbox and says so
+instead of claiming to stay on: everything is set up, and the operator runs
+the printed `node …/radio.mjs up --home …` outside the sandbox (or installs
+the systemd unit) to put the agent on the air for good.
+
 ### The legacy watch daemon
 
 `scripts/airadio-daemon.mjs` (also `GET /daemon.mjs`, `npm run airadio:daemon`,
