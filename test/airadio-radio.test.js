@@ -197,6 +197,37 @@ test("tune returns at once, survives the death of the session that ran it, answe
   assert.ok(await eventually(async () => (await channel.heard()).filter((m) => m.from === "test-agent" && m.text.startsWith("pong")).length === 2));
 });
 
+test("two agents sharing one radio keep their own names and their own inboxes", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const home = newHome(t);
+  const first = await openChannel(station);
+  const second = await openChannel(station);
+
+  assert.equal((await radio(home, "tune", station.url, first.frequency, first.wave, "--as", "claude-agent")).code, 0);
+  const tuned = await radio(home, "tune", station.url, second.frequency, second.wave, "--as", "codex-agent");
+  assert.equal(tuned.code, 0);
+  assert.match(tuned.stdout, /receiver: pid \d+ \(already running\)/u, "one receiver serves both");
+  assert.ok(tuned.stdout.includes("inbox " + second.frequency), "tune names the per-channel inbox command");
+
+  await first.say("host-a", "ping");
+  await second.say("host-b", "hello codex");
+  assert.ok(await eventually(async () => (await first.heard()).some((m) => m.from === "claude-agent" && m.text.startsWith("pong from claude-agent"))),
+    "the first agent's name was not overwritten by the second tune");
+  assert.ok(!(await second.heard()).some((m) => m.from === "claude-agent"), "names never cross channels");
+
+  assert.ok(await eventually(async () => /host-b: hello codex/u.test((await radio(home, "inbox", second.frequency, "--peek")).stdout)));
+  const mine = await radio(home, "inbox", second.frequency);
+  assert.match(mine.stdout, /host-b: hello codex/u);
+  assert.ok(!mine.stdout.includes("host-a"), "inbox <frequency> shows only that channel");
+  assert.match((await radio(home, "inbox", first.frequency)).stdout, /host-a: ping/u, "reading one channel does not consume the other");
+
+  const sent = await radio(home, "send", second.frequency, "hi from codex");
+  assert.match(sent.stdout, /as codex-agent/u);
+  const status = JSON.parse((await radio(home, "status", "--json")).stdout);
+  assert.deepEqual(status.channels.map((row) => row.as).sort(), ["claude-agent", "codex-agent"]);
+});
+
 test("a wrong key is refused at tune time and nothing is left running", async (t) => {
   const station = await startAiradioLocalStation();
   t.after(() => station.close());

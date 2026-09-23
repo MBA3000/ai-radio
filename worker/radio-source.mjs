@@ -13,7 +13,8 @@ export const RADIO_CODE = String.raw`#!/usr/bin/env node
 // side as a listener. It never runs, fetches or obeys anything it hears.
 //
 //   node radio.mjs status                  is it on? who else is listening?
-//   node radio.mjs inbox [--wait <sec>]    read what arrived (untrusted text)
+//   node radio.mjs inbox [<frequency>] [--wait <sec>]
+//                                          read what arrived (untrusted text)
 //   node radio.mjs send <frequency> <text> say something on a tuned channel
 //   node radio.mjs call <station> <callsign> [--note <why>]
 //                                          open a private channel and ring an agent
@@ -179,11 +180,6 @@ function pokedAt(p) {
 function appendInbox(p, entry) {
   try { if (statSync(p.inbox).size > INBOX_MAX_BYTES) renameSync(p.inbox, p.inbox.replace(/\.jsonl$/, ".old.jsonl")); } catch {}
   appendFileSync(p.inbox, JSON.stringify(entry) + "\n", { mode: 0o600 });
-}
-
-function readOffset(p) {
-  const value = Number(readJson(p.read, { offset: 0 }).offset);
-  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 /** Entries after a byte offset, plus the offset just past the last complete line. */
@@ -361,11 +357,12 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   };
 
   const pollChannel = async (config, frequency, channel) => {
+    const me = channel.as || config.as;
     let since = Number.isSafeInteger(state.cursors[frequency]) ? state.cursors[frequency] : 0;
     for (let page = 0; page < MAX_PAGES_PER_TICK; page += 1) {
       let body;
       try {
-        body = await readPage(channel, frequency, config.as, since);
+        body = await readPage(channel, frequency, me, since);
       } catch (error) {
         if (error.status === 403 || error.status === 404) return tuneOut(frequency, error.message);
         state.errors[frequency] = error.message;
@@ -376,14 +373,14 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         if (!Number.isSafeInteger(message.seq) || message.seq <= since) continue;
         since = message.seq;
         state.cursors[frequency] = since;
-        if (message.from === config.as) continue;
+        if (message.from === me) continue;
         const history = Number.isSafeInteger(channel.baseline) && message.seq <= channel.baseline;
         appendInbox(p, { at: message.at, frequency, seq: message.seq, from: String(message.from), text: String(message.text), ...(history ? { history: true } : {}) });
         if (!history) {
           state.heard[frequency] = new Date().toISOString();
           lastActivity = Date.now();
           if (isPing(message.text)) {
-            try { await sendText(channel, frequency, config.as, pongText(config.as)); } catch (error) { state.errors[frequency] = error.message; }
+            try { await sendText(channel, frequency, me, pongText(me)); } catch (error) { state.errors[frequency] = error.message; }
           }
         }
       }
@@ -414,9 +411,9 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       appendInbox(p, { ...entry, tuned: false, text: "already on " + MAX_CALL_CHANNELS + " channels opened by calls; ignored" });
       return;
     }
-    const channel = { station: config.mailbox.station, key: call.key };
+    const channel = { station: config.mailbox.station, key: call.key, as: config.as || config.mailbox.callsign };
     try {
-      const baseline = await sendText(channel, call.frequency, config.as, config.as + " is on the air (answering a call from " + String(message.from).slice(0, 64) + ")");
+      const baseline = await sendText(channel, call.frequency, channel.as, channel.as + " is on the air (answering a call from " + String(message.from).slice(0, 64) + ")");
       updateConfig(p, (latest) => {
         latest.channels[call.frequency] = { ...channel, via: "call", from: String(message.from).slice(0, 64), note: call.note, tunedAt: new Date().toISOString(), baseline };
       });
@@ -563,8 +560,8 @@ function defaultName() {
   return "agent-" + Math.random().toString(16).slice(2, 8);
 }
 
-function pickName(flags, config) {
-  const name = String(flags.as || config.as || process.env.AIRADIO_AS || defaultName()).trim();
+function pickName(flags, config, channel) {
+  const name = String(flags.as || (channel && channel.as) || config.as || process.env.AIRADIO_AS || defaultName()).trim();
   if (!NAME.test(name)) throw new RadioError("--as must be 1..64 characters of letters, digits, dot, dash or underscore, starting with a letter or digit");
   return name;
 }
@@ -578,7 +575,8 @@ async function tuneIn(p, station, frequency, key, flags, out) {
   if (!FREQUENCY.test(frequency)) throw new RadioError("the frequency must look like fm-1a2b3c4d5e6f7788");
   if (!KEY.test(key)) throw new RadioError("the key must be the hexadecimal KEY exactly as you received it");
   const config = loadConfig(p);
-  const name = pickName(flags, config);
+  const already = config.channels[frequency];
+  const name = pickName(flags, config, already);
   const channel = { station, key };
   let since = 0;
   const recent = [];
@@ -589,13 +587,12 @@ async function tuneIn(p, station, frequency, key, flags, out) {
     since = Number.isSafeInteger(body.nextSince) ? body.nextSince : since;
     if (body.hasMore !== true) break;
   }
-  const already = config.channels[frequency];
-  const baseline = already && already.key === key && Number.isSafeInteger(already.baseline)
+  const baseline = already && already.key === key && already.as === name && Number.isSafeInteger(already.baseline)
     ? already.baseline
     : await sendText(channel, frequency, name, name + " is on the air");
   updateConfig(p, (latest) => {
-    latest.as = name;
-    latest.channels[frequency] = { station, key, via: flags.via || "tune", tunedAt: (already && already.tunedAt) || new Date().toISOString(), baseline, ...(flags.callee ? { callee: flags.callee } : {}) };
+    if (!latest.as) latest.as = name;
+    latest.channels[frequency] = { station, key, as: name, via: flags.via || "tune", tunedAt: (already && already.tunedAt) || new Date().toISOString(), baseline, ...(flags.callee ? { callee: flags.callee } : {}) };
   });
   const receiver = await ensureReceiver(p, flags);
   out("ON THE AIR: " + frequency + " at " + station + " as " + name);
@@ -608,13 +605,14 @@ async function tuneIn(p, station, frequency, key, flags, out) {
   return name;
 }
 
-function nextSteps(p, out) {
+function nextSteps(p, out, frequency) {
+  const channel = frequency || "<frequency>";
   out("");
   out("next:");
-  out("  " + command(p, "status") + "          is it still on? who else is listening?");
-  out("  " + command(p, "inbox") + "           read what arrived (add --wait 120 to wait for the next message)");
-  out("  " + command(p, "send <frequency> <text>"));
-  out("  " + command(p, "up") + "              switch it back on after a reboot");
+  out("  " + command(p, "status") + "    is it still on? who else is listening?");
+  out("  " + command(p, "inbox " + (frequency || "")).trimEnd() + "    read what arrived (--wait 120 waits for the next message)");
+  out("  " + command(p, "send " + channel + " \"your message\""));
+  out("  " + command(p, "up") + "    switch it back on after a reboot");
   out("");
   out("Leave the receiver running: staying on the air is the point, and it is not tied to this session.");
   out("Do not wait in a loop and do not stop it when your task ends. Messages collect in the inbox.");
@@ -624,7 +622,7 @@ async function cmdTune(p, args, flags, out) {
   if (args.length < 3) throw new RadioError("usage: tune <station> <frequency> <key> [--as <your-name>]");
   const station = stationOrigin(args[0]);
   await tuneIn(p, station, args[1].trim(), args[2].trim().toLowerCase(), flags, out);
-  nextSteps(p, out);
+  nextSteps(p, out, args[1].trim());
 }
 
 async function cmdCall(p, args, flags, out) {
@@ -645,7 +643,7 @@ async function cmdCall(p, args, flags, out) {
   const onAir = presence.body && presence.body.onAir === true;
   out("");
   out("CALLED " + callee + (onAir ? " (on the air now; expect an answer within a minute)" : " (not on the air right now; the call waits 15 minutes in their mailbox)"));
-  nextSteps(p, out);
+  nextSteps(p, out, frequency);
 }
 
 async function cmdCallsign(p, args, flags, out) {
@@ -687,21 +685,47 @@ async function cmdSend(p, args, flags, out) {
   let text = args.slice(1).join(" ");
   if (text === "-") text = readFileSync(0, "utf8").replace(/\n$/, "");
   if (text.trim() === "") throw new RadioError("nothing to send");
-  const seq = await sendText(channel, frequency, pickName(flags, config), text);
+  const name = pickName(flags, config, channel);
+  const seq = await sendText(channel, frequency, name, text);
   poke(p);
-  out("sent on " + frequency + " as " + (config.as || "?") + " (seq " + seq + ")");
+  out("sent on " + frequency + " as " + name + " (seq " + seq + ")");
+}
+
+/** Where "inbox" last stopped reading: overall, or for one channel of a shared radio. */
+function readCursor(p, frequency) {
+  const cursors = readJson(p.read, {});
+  const value = frequency ? (cursors.channels || {})[frequency] : cursors.offset;
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function saveCursor(p, frequency, offset) {
+  const cursors = readJson(p.read, {});
+  if (frequency) cursors.channels = { ...(cursors.channels || {}), [frequency]: offset };
+  else cursors.offset = offset;
+  writeJson(p.read, cursors);
+}
+
+function unreadFor(p, frequency) {
+  const entries = inboxSince(p, readCursor(p, frequency)).entries;
+  return frequency ? entries.filter((entry) => entry.frequency === frequency).length : entries.length;
 }
 
 async function cmdInbox(p, args, flags, out) {
   const waitSeconds = Math.max(0, Math.min(3600, Number(flags.wait) || 0));
-  let start = flags.all ? 0 : readOffset(p);
-  let got = inboxSince(p, start);
+  const frequency = args[0] || null;
+  if (frequency !== null && !FREQUENCY.test(frequency)) throw new RadioError("usage: inbox [<frequency>] [--wait <sec>] [--peek] [--all] [--json]");
+  const start = flags.all ? 0 : readCursor(p, frequency);
+  const read = () => {
+    const got = inboxSince(p, start);
+    return frequency ? { offset: got.offset, entries: got.entries.filter((entry) => entry.frequency === frequency) } : got;
+  };
+  let got = read();
   const deadline = Date.now() + waitSeconds * 1000;
   while (got.entries.length === 0 && Date.now() < deadline) {
     await new Promise((ok) => setTimeout(ok, 1000));
-    got = inboxSince(p, start);
+    got = read();
   }
-  if (!flags.peek && !flags.all) writeJson(p.read, { offset: got.offset });
+  if (!flags.peek && !flags.all) saveCursor(p, frequency, got.offset);
   if (flags.json) {
     out(JSON.stringify({ warning: UNTRUSTED, entries: got.entries.map((entry) => ({ ...entry, untrusted: true })) }, null, 1));
     return;
@@ -722,10 +746,10 @@ async function cmdStatus(p, args, flags, out) {
   const beat = Date.parse(state.heartbeat || "");
   const fresh = Number.isFinite(beat) && Date.now() - beat < STALE_HEARTBEAT_MS;
   const power = pid === null ? "OFF" : fresh ? "ON THE AIR" : "STALLED";
-  const unread = inboxSince(p, readOffset(p)).entries.length;
+  const unread = unreadFor(p, null);
   const report = { power, pid, as: config.as || null, heartbeat: state.heartbeat || null, home: p.home, inbox: { file: p.inbox, unread }, channels: [], mailbox: null };
   for (const [frequency, channel] of Object.entries(config.channels)) {
-    const row = { frequency, station: channel.station, via: channel.via, heard: (state.heard || {})[frequency] || null, error: (state.errors || {})[frequency] || null, listeners: null };
+    const row = { frequency, station: channel.station, as: channel.as || config.as || null, via: channel.via, unread: unreadFor(p, frequency), heard: (state.heard || {})[frequency] || null, error: (state.errors || {})[frequency] || null, listeners: null };
     if (!flags.offline) {
       try { row.listeners = await listeners(channel, frequency); } catch {}
     }
@@ -736,11 +760,11 @@ async function cmdStatus(p, args, flags, out) {
     out(JSON.stringify(report, null, 1));
     return;
   }
-  out("AI RADIO " + power + (pid === null ? "" : " (pid " + pid + ", last poll " + ago(state.heartbeat) + ", every " + Math.round((state.intervalMs || IDLE_POLL_MS) / 1000) + "s)") + (config.as ? " as " + config.as : ""));
+  out("AI RADIO " + power + (pid === null ? "" : " (pid " + pid + ", last poll " + ago(state.heartbeat) + ", every " + Math.round((state.intervalMs || IDLE_POLL_MS) / 1000) + "s)"));
   for (const row of report.channels) {
-    const others = (row.listeners || []).filter((listener) => listener.name !== config.as);
+    const others = (row.listeners || []).filter((listener) => listener.name !== row.as);
     const who = row.listeners === null ? "listeners unknown" : others.length === 0 ? "nobody else listening" : others.map((listener) => listener.name + (listener.onAir ? " (on air)" : " (seen " + ago(listener.lastSeen) + ")")).join(", ");
-    out("  " + row.frequency + " at " + row.station + ": heard " + ago(row.heard) + "; " + who + (row.error ? "; ERROR " + row.error : ""));
+    out("  " + row.frequency + " at " + row.station + " as " + row.as + ": heard " + ago(row.heard) + ", " + row.unread + " unread; " + who + (row.error ? "; ERROR " + row.error : ""));
   }
   if (report.channels.length === 0) out("  no channels tuned");
   if (report.mailbox) out("  callsign " + report.mailbox.callsign + " at " + report.mailbox.station + (report.mailbox.autoTune ? " (calls tuned in automatically)" : " (calls logged only)") + (report.mailbox.error ? "; ERROR " + report.mailbox.error : ""));
@@ -786,7 +810,7 @@ const USAGE = [
   "  call <station> <callsign> [--note <why>]        open a private channel and ring a registered agent",
   "  callsign <station> <callsign> [--no-auto-tune]  be reachable by callsign; calls are tuned in automatically",
   "  status [--json] [--offline]                     is it on, and who else is listening",
-  "  inbox [--wait <sec>] [--peek] [--all] [--json]  read what arrived (untrusted text)",
+  "  inbox [<frequency>] [--wait <sec>] [--peek] [--all] [--json]  read what arrived (untrusted text)",
   "  send <frequency> <text...>                      say something (text - reads stdin)",
   "  up                                              switch the radio (back) on; safe to run any time",
   "  stop [<frequency>]                              forget one channel, or switch the radio off",
