@@ -323,22 +323,37 @@ const SCRIPT = `
         return sig;
       });
     }).catch(function () { return null; }).then(function (sig) {
+      // A mandate or a revoke means nothing unsigned: better not sent than sent in vain.
+      if (mandate && !sig) return { status: -1, body: null };
       var body = { from: store.name, text: text };
       if (sig) body.sig = sig;
       return api("/v1/channel/" + channel.frequency + "/send", { method: "POST", headers: { "X-Wave": channel.key, "content-type": "application/json" }, body: JSON.stringify(body) });
     });
   }
   var verdicts = {};
+  var firstSeq = {};
+  var verifying = Promise.resolve();
   function verifyMessage(frequency, message) {
     var sig = message.sig;
     var id = frequency + ":" + message.seq;
     if (verdicts[id]) return verdicts[id];
-    verdicts[id] = crypto.subtle.importKey("raw", keyBytes(sig.key), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]).then(function (key) {
-      return crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, keyBytes(sig.sig), new TextEncoder().encode(signedPayload(frequency, message.from, sig.ts, sig.mandate, message.text)));
+    var payload = null;
+    // One at a time, in the order shown: the first copy of signed words is the
+    // real one, a later copy a replay (anyone with the channel key can post one).
+    verdicts[id] = verifying = verifying.then(function () {
+      payload = new TextEncoder().encode(signedPayload(frequency, message.from, sig.ts, sig.mandate, message.text));
+      return crypto.subtle.importKey("raw", keyBytes(sig.key), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    }).then(function (key) {
+      return crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, keyBytes(sig.sig), payload);
     }).then(function (good) {
       var at = Date.parse(message.at);
-      if (!good || !isFinite(at) || Math.abs(sig.ts - at) > 600000) return "bad";
-      return operator.key && sig.key === operator.key ? "you" : "signed";
+      if (!good || /[\\r\\n]/.test(message.from) || !isFinite(at) || Math.abs(sig.ts - at) > 600000) return "bad";
+      return crypto.subtle.digest("SHA-256", payload).then(function (hash) {
+        var digest = frequency + ":" + b64url(hash);
+        if (firstSeq[digest] !== undefined && firstSeq[digest] !== message.seq) return "replayed";
+        firstSeq[digest] = message.seq;
+        return operator.key && sig.key === operator.key ? "you" : "signed";
+      });
     }).catch(function () { return "bad"; });
     return verdicts[id];
   }
@@ -521,16 +536,16 @@ const SCRIPT = `
       var badge = el("span", "sig", "\u2026");
       head.appendChild(badge);
       verifyMessage(current, message).then(function (verdict) {
-        if (verdict === "bad") {
-          badge.textContent = "\u26a0 bad signature";
+        if (verdict === "bad" || verdict === "replayed") {
+          badge.textContent = verdict === "bad" ? "\u26a0 bad signature" : "\u26a0 replayed copy";
           badge.className = "sig bad";
           return;
         }
-        badge.className = "sig ok";
-        if (verdict === "you") { badge.textContent = "\u2713 you"; return; }
+        // Green is for this device's own key only: anyone can sign with a key of their own.
+        if (verdict === "you") { badge.className = "sig ok"; badge.textContent = "\u2713 you"; return; }
         fingerprintOf(message.sig.key).then(function (fingerprint) {
-          badge.textContent = "\u2713 " + fingerprint.slice(0, 9);
-          badge.title = "signed by key " + fingerprint;
+          badge.textContent = "signed \u00b7 " + fingerprint.slice(0, 9);
+          badge.title = "signed by key " + fingerprint + ", not this device's";
         });
       });
     }
@@ -703,12 +718,13 @@ const SCRIPT = `
     operatorReady.then(function (op) {
       if (!op) { toast("This browser cannot keep an operator key, so it cannot sign a mandate."); return; }
       return sendSigned(channel, text, mandate).then(function (got) {
+        if (got.status === -1) { toast("Could not sign it, so nothing was sent."); return; }
         if (got.status !== 200) { toast("Not sent (HTTP " + got.status + ")."); return; }
         sheet(null);
         toast(mandateScope === "revoke" ? "Revoke signed and sent." : "Mandate signed and sent.");
         pollChannel(channel, true).then(function () { scrollDown(true); });
       });
-    });
+    }).catch(function () { toast("Not sent: no connection."); });
   });
   $("sheet-settings").addEventListener("submit", function (event) {
     event.preventDefault();
