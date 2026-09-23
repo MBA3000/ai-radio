@@ -82,10 +82,30 @@ export async function generateVapidKeys() {
   return { publicKey: b64url(raw), privateJwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y, d: jwk.d } };
 }
 
-/** The Authorization header that identifies this station to a push service (RFC 8292). */
-export async function vapidAuthorization({ endpoint, vapid, subject, now = Date.now() }) {
+/**
+ * The Authorization header that identifies this station to a push service
+ * (RFC 8292). The JWT is valid for 12 hours and reused for an hour per push
+ * service, so notifying many phones costs one signature, not one each.
+ */
+const vapidTokens = new Map();
+export async function vapidAuthorization({ endpoint, vapid, subject, now }) {
+  const aud = new URL(endpoint).origin;
+  const cacheKey = vapid.publicKey + " " + aud + " " + subject;
+  if (now === undefined) {
+    const cached = vapidTokens.get(cacheKey);
+    if (cached && cached.until > Date.now()) return cached.value;
+  }
+  const value = await signVapid({ aud, vapid, subject, now: now === undefined ? Date.now() : now });
+  if (now === undefined) {
+    if (vapidTokens.size > 32) vapidTokens.clear();
+    vapidTokens.set(cacheKey, { value, until: Date.now() + 3_600_000 });
+  }
+  return value;
+}
+
+async function signVapid({ aud, vapid, subject, now }) {
   const header = b64url(encoder.encode(JSON.stringify({ typ: "JWT", alg: "ES256" })));
-  const claims = b64url(encoder.encode(JSON.stringify({ aud: new URL(endpoint).origin, exp: Math.floor(now / 1000) + 12 * 3600, sub: subject })));
+  const claims = b64url(encoder.encode(JSON.stringify({ aud, exp: Math.floor(now / 1000) + 12 * 3600, sub: subject })));
   const key = await crypto.subtle.importKey("jwk", vapid.privateJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
   const signature = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, encoder.encode(header + "." + claims)));
   return "vapid t=" + header + "." + claims + "." + b64url(signature) + ", k=" + vapid.publicKey;
@@ -130,7 +150,27 @@ export function parseSubscription(body) {
     return { error: "keys must be base64url" };
   }
   if (p256dh.length !== 65 || p256dh[0] !== 4 || auth.length !== 16) return { error: "keys are not a P-256 public key and a 16-byte auth secret" };
-  return { endpoint, keys: { p256dh: keys.p256dh, auth: keys.auth } };
+  // One spelling per endpoint, so a phone is stored, notified and removed once.
+  return { endpoint: new URL(endpoint).href, keys: { p256dh: keys.p256dh, auth: keys.auth } };
+}
+
+/** A p256dh that is 65 bytes but not a point on the curve would fail every push later. */
+export async function subscriptionKeyUsable(p256dh) {
+  try {
+    await crypto.subtle.importKey("raw", fromB64url(p256dh), { name: "ECDH", namedCurve: "P-256" }, false, []);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The endpoint as stored: its normalized URL, or the input when it does not parse. */
+export function normalizeEndpoint(endpoint) {
+  try {
+    return new URL(endpoint).href;
+  } catch {
+    return String(endpoint);
+  }
 }
 
 /** Encrypt and post one notification. Returns the push service's HTTP status. */

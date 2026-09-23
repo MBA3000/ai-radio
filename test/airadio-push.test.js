@@ -16,6 +16,7 @@ import { inflateSync } from "node:zlib";
 
 import { b64url, encryptPushPayload, fromB64url, generateVapidKeys, parseSubscription, pushEndpointAllowed, vapidAuthorization } from "../worker/push.mjs";
 import { iconPixels } from "../worker/icon.mjs";
+import { pngPixels, samePixels } from "../scripts/sync-airadio-daemon.mjs";
 import { startAiradioLocalStation } from "./helpers/airadio-local-station.js";
 
 /** A browser's push subscription, made with node:crypto: the private half stays here. */
@@ -143,7 +144,7 @@ async function stationWithPushCapture(t, respond = () => 201) {
   return { station, channel, pushes };
 }
 
-test("a message on a channel reaches each subscribed phone, encrypted, and never the sender's own", async (t) => {
+test("a message on a channel reaches each subscribed phone, encrypted, and never the sender's own", { timeout: 60_000 }, async (t) => {
   const { station, channel, pushes } = await stationWithPushCapture(t);
   const key = await (await fetch(station.url + "/v1/push/key")).json();
   assert.equal(fromB64url(key.publicKey).length, 65, "browsers get the station's VAPID public key");
@@ -153,46 +154,60 @@ test("a message on a channel reaches each subscribed phone, encrypted, and never
   assert.equal((await channel.subscribe(phone, "medet")).status, 200);
   assert.equal((await channel.subscribe(phone, "medet", "f".repeat(128))).status, 403, "only key holders subscribe");
   assert.equal((await channel.subscribe(fakeDevice("https://evil.example/x"), "x")).status, 400, "only push services");
+  const offCurve = fakeDevice("https://web.push.apple.com/bad");
+  offCurve.subscription.keys.p256dh = b64url(Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 1)]));
+  assert.equal((await channel.subscribe(offCurve, "x")).status, 400, "a key that is not a curve point would fail every push");
+  const sameAgain = { subscription: { ...phone.subscription, endpoint: "https://WEB.PUSH.APPLE.COM:443/phone-1" } };
+  assert.equal((await channel.subscribe(sameAgain, "medet")).status, 200, "another spelling of the same endpoint is the same phone");
+
+  // In a fresh window, the phone's own words come first and still ring nothing.
+  await channel.say("medet", "back online");
+  assert.equal(pushes.length, 0, "your own words never ring your own phone");
 
   const sent = await channel.say("codex-agent", "Build is green. Deploy staging?");
   assert.equal(sent.status, 200);
   assert.deepEqual(Object.keys(await sent.json()), ["seq"], "the send answer never shows who gets notified");
-  assert.equal(pushes.length, 1);
+  assert.equal(pushes.length, 1, "one phone, notified once");
   const [push] = pushes;
   assert.equal(push.url, "https://web.push.apple.com/phone-1");
   assert.equal(push.headers["Content-Encoding"], "aes128gcm");
   assert.equal(push.headers.TTL, "86400");
   assert.equal(push.headers.Topic, channel.frequency.slice(0, 32));
   assert.match(push.headers.Authorization, new RegExp("^vapid t=[^ ]+, k=" + key.publicKey + "$", "u"));
+  const claims = JSON.parse(Buffer.from(push.headers.Authorization.split(".")[1], "base64url").toString("utf8"));
+  assert.match(claims.sub, /^https:\/\//u, "the VAPID subject is always https");
   const payload = JSON.parse(phone.decrypt(push.body));
-  assert.equal(payload.frequency, channel.frequency);
-  assert.equal(payload.from, "codex-agent");
-  assert.equal(payload.text, "Build is green. Deploy staging?");
-  assert.equal(payload.seq, 1);
+  assert.deepEqual([payload.frequency, payload.from, payload.text, payload.seq], [channel.frequency, "codex-agent", "Build is green. Deploy staging?", 2]);
 
-  await channel.say("medet", "yes, go");
-  assert.equal(pushes.length, 1, "your own words never ring your own phone");
-  await channel.say("codex-agent", "deploying");
-  assert.equal(pushes.length, 1, "at most one notification per phone every 10 s");
+  // Seen in review: inside the phone's 10 s window, "step 3 done" then "deploy?"
+  // must not lose the question. The newest message arrives when the window closes.
+  const started = Date.now();
+  await Promise.all([channel.say("codex-agent", "step 3 done"), new Promise((ok) => setTimeout(ok, 200)).then(() => channel.say("codex-agent", "Decision needed: deploy?"))]);
+  assert.equal(pushes.length, 2, "a burst inside the window costs one more notification");
+  assert.equal(JSON.parse(phone.decrypt(pushes[1].body)).text, "Decision needed: deploy?", "the last word arrives");
+  assert.ok(Date.now() - started >= 9_000, "after the window, not inside it");
 
   assert.equal((await channel.subscribe(phone, "medet", channel.wave, "unsubscribe")).status, 200);
+  await channel.say("codex-agent", "anyone?");
+  assert.equal(pushes.length, 2, "an unsubscribed phone is not notified");
 });
 
-test("a phone the push service forgot is dropped, and a channel keeps at most 16", async (t) => {
+test("a channel notifies at most 16 phones, refuses a 17th, and drops one its push service forgot", async (t) => {
   const gone = "https://fcm.googleapis.com/fcm/send/gone";
   const { channel, pushes } = await stationWithPushCapture(t, (url) => (url === gone ? 410 : 201));
-  for (let index = 0; index < 18; index += 1) {
-    const endpoint = index === 17 ? gone : "https://fcm.googleapis.com/fcm/send/device-" + index;
-    assert.equal((await channel.subscribe(fakeDevice(endpoint), "phone-" + index)).status, 200);
+  const devices = [];
+  for (let index = 0; index < 16; index += 1) {
+    const device = fakeDevice(index === 0 ? gone : "https://fcm.googleapis.com/fcm/send/device-" + index);
+    devices.push(device);
+    assert.equal((await channel.subscribe(device, "phone-" + index)).status, 200);
   }
+  const extra = fakeDevice("https://fcm.googleapis.com/fcm/send/extra");
+  assert.equal((await channel.subscribe(extra, "phone-extra")).status, 409, "a full channel refuses instead of dropping someone else's phone");
+  assert.equal((await channel.subscribe(devices[3], "phone-3")).status, 200, "a known phone can always renew");
   await channel.say("agent", "hello");
-  assert.equal(pushes.length, 16, "the newest 16 subscriptions are kept");
+  assert.equal(pushes.length, 16);
   assert.ok(pushes.some((push) => push.url === gone));
-  await new Promise((ok) => setTimeout(ok, 10_100));
-  pushes.length = 0;
-  await channel.say("agent", "again");
-  assert.equal(pushes.length, 15, "the 410 subscription is gone");
-  assert.ok(!pushes.some((push) => push.url === gone));
+  assert.equal((await channel.subscribe(extra, "phone-extra")).status, 200, "the forgotten phone's slot is free again");
 });
 
 test("the app installs: manifest, service worker, icons and /app", async (t) => {
@@ -217,6 +232,8 @@ test("the app installs: manifest, service worker, icons and /app", async (t) => 
     const idat = png.indexOf("IDAT");
     const raw = inflateSync(png.subarray(idat + 4, idat + 4 + png.readUInt32BE(idat - 4)));
     assert.equal(raw.length, size * (1 + size * 3), "every row decodes");
+    const spec = { size, maskable: icon.purpose === "maskable" };
+    assert.ok(samePixels(pngPixels(png).rgb, iconPixels(size, spec)), icon.src + " is the mark worker/icon.mjs draws");
   }
 
   const worker = await fetch(station.url + "/sw.js");
@@ -251,4 +268,14 @@ test("the icon is the station's mark: amber on the dark field, centred", () => {
   assert.deepEqual(at(0, 0), [0x12, 0x15, 0x13], "the corner is the dark field");
   const dot = at(32, Math.round(64 * ((19 + 16 - 13.35) / 32)) - 1);
   assert.ok(dot[0] > 240 && dot[1] > 160 && dot[2] < 110, "the dot is amber: " + dot);
+});
+
+test("one VAPID signature serves every phone behind the same push service for an hour", async () => {
+  const vapid = await generateVapidKeys();
+  const endpoint = "https://web.push.apple.com/one";
+  const first = await vapidAuthorization({ endpoint, vapid, subject: "https://airadio.example" });
+  const second = await vapidAuthorization({ endpoint: "https://web.push.apple.com/two", vapid, subject: "https://airadio.example" });
+  assert.equal(second, first, "same push service, same token");
+  const other = await vapidAuthorization({ endpoint: "https://fcm.googleapis.com/fcm/send/x", vapid, subject: "https://airadio.example" });
+  assert.notEqual(other, first, "another push service gets its own audience");
 });

@@ -174,16 +174,20 @@ air ("stay on the air" or "keep talking on its own").
 
 How the notifications work, with no dependency and no secret to provision:
 
-- **Web Push, encrypted end to end** (RFC 8291, aes128gcm): only the phone can
-  read the text; Apple's push service sees ciphertext. `worker/push.mjs`
-  reproduces the RFC's own example byte for byte.
+- **Web Push encrypted for the phone** (RFC 8291, aes128gcm): Apple's push
+  service sees only ciphertext. (The station itself relays channel text in the
+  clear; channels are not end-to-end encrypted.) `worker/push.mjs` reproduces
+  the RFC's own example byte for byte.
 - **VAPID** (RFC 8292): the station signs an ES256 JWT with a key pair it makes
   once and keeps in a Durable Object of its own; staging and production never
   share one.
-- A channel keeps up to 16 phones. A message notifies every phone except the
-  sender's own, at most once per 10 s per phone; the station posts only to
-  known push services (Apple, Google, Mozilla, Microsoft), and a phone the push
-  service forgot (404/410) is dropped.
+- A channel notifies up to 16 phones (a 17th is refused, never swapped for
+  someone else's). A message notifies every phone except the sender's own: at
+  once, or — within 10 s of that phone's last notification — when the window
+  closes, with the newest message. The station posts only to known push
+  services (Apple, Google, Mozilla, Microsoft) and drops a phone the push
+  service forgot (404/410). Icons are prebuilt, and the VAPID token is signed
+  once an hour, to stay inside a free-plan request's CPU budget.
 - The service worker only shows notifications and sets the app badge; it
   caches nothing and intercepts no request. Icons are drawn from code
   (`worker/icon.mjs`), so no binary lives in the repository.

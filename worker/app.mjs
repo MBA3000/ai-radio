@@ -197,7 +197,7 @@ const SCRIPT = `
   var store = load();
   var current = null;
   var timers = [];
-  var polling = {};
+  var inflight = {};
   var standalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
   var ios = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
@@ -281,8 +281,12 @@ const SCRIPT = `
 
   // ---------------------------------------------------------------- polling
   function pollChannel(channel, listen) {
-    if (polling[channel.frequency]) return Promise.resolve();
-    polling[channel.frequency] = true;
+    if (inflight[channel.frequency]) return inflight[channel.frequency];
+    var done = function () { delete inflight[channel.frequency]; };
+    inflight[channel.frequency] = readPages(channel, listen, 0).catch(function () {}).then(done, done);
+    return inflight[channel.frequency];
+  }
+  function readPages(channel, listen, depth) {
     var since = channel.lastSeq || 0;
     return api("/v1/channel/" + channel.frequency + "/messages?since=" + since + "&limit=200", { headers: headersFor(channel, listen) }).then(function (got) {
       if (got.status === 403 || got.status === 404) {
@@ -301,8 +305,8 @@ const SCRIPT = `
       if (typeof got.body.nextSince === "number" && got.body.nextSince > (channel.lastSeq || 0)) channel.lastSeq = got.body.nextSince;
       if (current === channel.frequency) channel.readSeq = channel.lastSeq;
       if (messages.length) save();
-      if (got.body.hasMore) return pollChannel(channel, listen);
-    }).catch(function () {}).then(function () { polling[channel.frequency] = false; });
+      if (got.body.hasMore && depth < 20) return readPages(channel, listen, depth + 1);
+    });
   }
   function unread(channel) {
     return Math.max(0, (channel.lastSeq || 0) - (channel.readSeq || 0));
@@ -389,14 +393,17 @@ const SCRIPT = `
     $("who").textContent = "";
     shownSeqs = {};
     voices = {};
-    var saved = channel.lastSeq;
-    channel.lastSeq = Math.max(0, (channel.lastSeq || 0) - 60);
     if (channel.gone) $("log").appendChild(el("li", "msg system", channel.gone));
-    pollChannel(channel, true).then(function () {
-      if ((channel.lastSeq || 0) < (saved || 0)) channel.lastSeq = saved;
-      channel.readSeq = channel.lastSeq;
-      save();
-      scrollDown(true);
+    (inflight[channel.frequency] || Promise.resolve()).then(function () {
+      if (current !== channel.frequency) return;
+      var latest = channel.lastSeq || 0;
+      channel.lastSeq = Math.max(0, latest - 60);
+      return pollChannel(channel, true).then(function () {
+        if ((channel.lastSeq || 0) < latest) channel.lastSeq = latest;
+        channel.readSeq = channel.lastSeq;
+        save();
+        scrollDown(true);
+      });
     });
     presence(channel);
     timers.push(setInterval(function () { pollChannel(channel, true).then(function () { scrollDown(false); }); }, 4000));
@@ -552,6 +559,7 @@ const SCRIPT = `
     store.name = name;
     save();
     sheet(null);
+    resyncNotifications();
     toast("You are " + name + " on the air.");
   });
 
@@ -611,6 +619,32 @@ const SCRIPT = `
       });
     });
   }
+  function postSubscription(channel, sub) {
+    return api("/v1/channel/" + channel.frequency + "/subscribe", {
+      method: "POST",
+      headers: { "X-Wave": channel.key, "content-type": "application/json" },
+      body: JSON.stringify(Object.assign(sub.toJSON(), { name: store.name }))
+    });
+  }
+  // The station's list is the truth for delivery: renew this phone's
+  // subscription on every launch (an idempotent upsert), so a rotated push
+  // endpoint or a new name never leaves a lit bell that stays silent.
+  function resyncNotifications() {
+    var wanted = store.channels.filter(function (channel) { return channel.notify; });
+    if (!wanted.length || !("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) return;
+    if (Notification.permission !== "granted") {
+      wanted.forEach(function (channel) { channel.notify = false; });
+      save();
+      return;
+    }
+    subscription().then(function (sub) {
+      return Promise.all(wanted.map(function (channel) {
+        return postSubscription(channel, sub).then(function (got) {
+          if (got.status === 403 || got.status === 404 || got.status === 409) { channel.notify = false; save(); }
+        });
+      }));
+    }).catch(function () {});
+  }
   function setNotify(channel, on) {
     if (!on) {
       return navigator.serviceWorker.ready.then(function (registration) { return registration.pushManager.getSubscription(); }).then(function (existing) {
@@ -619,12 +653,9 @@ const SCRIPT = `
       }).catch(function () {}).then(function () { channel.notify = false; save(); });
     }
     return subscription().then(function (sub) {
-      return api("/v1/channel/" + channel.frequency + "/subscribe", {
-        method: "POST",
-        headers: { "X-Wave": channel.key, "content-type": "application/json" },
-        body: JSON.stringify(Object.assign(sub.toJSON(), { name: store.name }))
-      });
+      return postSubscription(channel, sub);
     }).then(function (got) {
+      if (got.status === 409) throw new Error("This channel already notifies 16 devices.");
       if (got.status !== 200) throw new Error("The station refused the subscription (HTTP " + got.status + ").");
       channel.notify = true;
       save();
@@ -652,6 +683,7 @@ const SCRIPT = `
 
   clearBadge();
   route();
+  resyncNotifications();
 })();
 `;
 

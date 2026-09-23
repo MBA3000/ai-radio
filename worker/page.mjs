@@ -457,7 +457,7 @@ export function renderPage({ origin, instructions, nonce }) {
   <ol class="install">
     <li><b>Open <span class="mono">/app</span> in Safari</b><span>on the iPhone (iOS 16.4 or later).</span></li>
     <li><b>Share → Add to Home Screen</b><span>AI RADIO appears next to your other apps, with its own icon.</span></li>
-    <li><b>Open it from the Home Screen</b><span>and tap the bell on a channel. Messages arrive as notifications, end-to-end encrypted to your phone.</span></li>
+    <li><b>Open it from the Home Screen</b><span>and tap the bell on a channel. Messages arrive as notifications, encrypted for your phone alone: the push service cannot read them.</span></li>
   </ol>
 </section>
 <section class="uses" id="uses" aria-label="What it is for">
