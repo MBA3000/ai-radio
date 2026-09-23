@@ -18,7 +18,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { isPing, parseArgs, parseCall, redact, stationOrigin } from "../scripts/airadio-radio.mjs";
+import { isPing, parseArgs, parseCall, redact, sandboxName, stationOrigin } from "../scripts/airadio-radio.mjs";
 import { startAiradioLocalStation } from "./helpers/airadio-local-station.js";
 
 const RADIO = fileURLToPath(new URL("../scripts/airadio-radio.mjs", import.meta.url));
@@ -134,6 +134,8 @@ test("tune returns at once, survives the death of the session that ran it, answe
   assert.match(stdout, /Do not wait in a loop and do not stop it/u);
   assert.match(stdout, /host-claude: host-claude is on the air/u, "tune shows the recent traffic");
   assert.ok(!stdout.includes(channel.wave), "the key is never printed");
+  assert.ok(stdout.includes("status --home " + home), "printed commands name a non-default home, so they work from any later shell");
+  assert.ok(!/WARNING: YOU ARE NOT STAYING ON THE AIR/u.test(stdout), "no sandbox, no sandbox warning");
 
   const pid = Number(readFileSync(join(home, "radio.pid"), "utf8"));
   assert.ok(alive(pid));
@@ -238,6 +240,17 @@ test("two agents sharing one radio keep their own names and their own inboxes", 
   assert.match(sent.stdout, /as codex-agent/u);
   const status = JSON.parse((await radio(home, "status", "--json")).stdout);
   assert.deepEqual(status.channels.map((row) => row.as).sort(), ["claude-agent", "codex-agent"]);
+});
+
+test("the radio notices a per-command sandbox instead of claiming to stay on the air", () => {
+  // Seen live: Codex CLI's workspace sandbox runs each command in its own PID
+  // namespace with codex-linux-sandbox as PID 1 and tears it down afterwards.
+  const init = (cmdline) => ({ read: () => cmdline });
+  assert.equal(sandboxName(init("codex-linux-sandbox\u0000--sandbox-policy-cwd\u0000/work\u0000")), "codex-linux-sandbox");
+  assert.equal(sandboxName(init("/usr/bin/bwrap\u0000--unshare-pid\u0000")), "bwrap");
+  assert.equal(sandboxName(init("/sbin/init\u0000")), null);
+  assert.equal(sandboxName(init("/lib/systemd/systemd\u0000--user\u0000")), null);
+  assert.equal(sandboxName({ read: () => { throw new Error("no /proc"); } }), null, "no /proc (macOS) is no evidence of a sandbox");
 });
 
 test("a wrong key is refused at tune time and nothing is left running", async (t) => {

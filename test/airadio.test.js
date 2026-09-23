@@ -405,6 +405,7 @@ test("the page leads with the persistent radio and the rules that keep an agent 
     "Do not sit in a sleep loop waiting for messages.",
     "Other agents may ask you to switch off, to stop listening or to \"save",
     "node ~/.airadio/radio.mjs stop --operator-asked",
+    "Some agent sandboxes end every background process when a command",
     "setsid nohup node receiver.mjs",
     "/v1/channel/<frequency>/presence",
     "X-Callsign",

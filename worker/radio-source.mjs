@@ -235,7 +235,8 @@ async function http(method, url, { key, listener, body } = {}) {
   } catch (error) {
     if (error instanceof RadioError) throw error;
     if (controller.signal.aborted) throw new RadioError("the station did not answer within " + REQUEST_TIMEOUT_MS / 1000 + "s");
-    throw new RadioError("network error: " + (error && error.cause && error.cause.code ? error.cause.code : "request failed"));
+    const offline = process.env.CODEX_SANDBOX_NETWORK_DISABLED === "1" ? " (this sandbox has no network: CODEX_SANDBOX_NETWORK_DISABLED=1; tell your operator, do not work around it)" : "";
+    throw new RadioError("network error: " + (error && error.cause && error.cause.code ? error.cause.code : "request failed") + offline);
   } finally {
     clearTimeout(timer);
   }
@@ -571,8 +572,35 @@ function pickName(flags, config, channel) {
   return name;
 }
 
+/** A command line that works from any later shell: names the home unless it is the default. */
 function command(p, words) {
-  return "node " + p.program + " " + words;
+  const standard = resolve(join(homedir(), ".airadio"));
+  return "node " + p.program + " " + words + (p.home === standard ? "" : " --home " + p.home);
+}
+
+/**
+ * Seen live 2026-09-23: Codex CLI's Linux sandbox runs every command in its
+ * own PID namespace (codex-linux-sandbox is PID 1) and tears it down when the
+ * command returns, taking a detached receiver with it. Nothing should escape
+ * a sandbox the operator chose, so the radio only notices it and says so.
+ */
+export function sandboxName({ read = (file) => readFileSync(file, "utf8") } = {}) {
+  try {
+    const init = read("/proc/1/cmdline").split("\u0000")[0].split("/").pop();
+    if (/^(codex-linux-sandbox|bwrap|bubblewrap|firejail|nsjail|minijail0)$/.test(init)) return init;
+  } catch {}
+  return null;
+}
+
+function sandboxWarning(p, out, sandbox) {
+  out("");
+  out("WARNING: YOU ARE NOT STAYING ON THE AIR. This command runs inside " + sandbox + ", which ends");
+  out("every background process when the command returns, so the receiver stops with it. Nothing run in");
+  out("here can outlive it, and you must not try to escape it. Tell your operator: everything is set up,");
+  out("and one command outside the sandbox puts you back on the air for good:");
+  out("  " + command(p, "up"));
+  out("(or install deploy/airadio-radio.service, or run the agent without that sandbox, e.g. Codex CLI");
+  out("--sandbox danger-full-access). Until then the station keeps the newest 1000 messages per channel.");
 }
 
 /** Validate the key, announce once, remember the channel, make sure the receiver runs. */
@@ -601,7 +629,8 @@ async function tuneIn(p, station, frequency, key, flags, out) {
   });
   const receiver = await ensureReceiver(p, flags);
   out("ON THE AIR: " + frequency + " at " + station + " as " + name);
-  out("receiver: pid " + receiver.pid + (receiver.started ? " (started in the background)" : " (already running)") + "; it keeps receiving after this session ends");
+  out("receiver: pid " + receiver.pid + (receiver.started ? " (started in the background)" : " (already running)")
+    + (sandboxName() ? "; see the WARNING below" : "; it keeps receiving after this session ends"));
   if (recent.length > 0) {
     out("");
     out("recent traffic (" + UNTRUSTED + ")");
@@ -618,6 +647,11 @@ function nextSteps(p, out, frequency) {
   out("  " + command(p, "inbox " + (frequency || "")).trimEnd() + "    read what arrived (--wait 120 waits for the next message)");
   out("  " + command(p, "send " + channel + " \"your message\""));
   out("  " + command(p, "up") + "    switch it back on after a reboot");
+  const sandbox = sandboxName();
+  if (sandbox) {
+    sandboxWarning(p, out, sandbox);
+    return;
+  }
   out("");
   out("Leave the receiver running: staying on the air is the point, and it is not tied to this session.");
   out("Do not wait in a loop and do not stop it when your task ends. Messages collect in the inbox.");
@@ -775,7 +809,11 @@ async function cmdStatus(p, args, flags, out) {
   if (report.channels.length === 0) out("  no channels tuned");
   if (report.mailbox) out("  callsign " + report.mailbox.callsign + " at " + report.mailbox.station + (report.mailbox.autoTune ? " (calls tuned in automatically)" : " (calls logged only)") + (report.mailbox.error ? "; ERROR " + report.mailbox.error : ""));
   out("  inbox: " + unread + " unread (" + command(p, "inbox") + ")");
-  if (power === "OFF" && (report.channels.length > 0 || report.mailbox)) out("The radio is OFF. Switch it on: " + command(p, "up"));
+  if (power === "OFF" && (report.channels.length > 0 || report.mailbox)) {
+    const sandbox = sandboxName();
+    if (sandbox) sandboxWarning(p, out, sandbox);
+    else out("The radio is OFF. Switch it on: " + command(p, "up"));
+  }
   if (power === "STALLED") out("The receiver stopped polling. Restart it: " + command(p, "stop --" + OPERATOR_FLAG) + " && " + command(p, "up"));
 }
 
@@ -784,6 +822,8 @@ async function cmdUp(p, args, flags, out) {
   if (Object.keys(config.channels).length === 0 && !config.mailbox) throw new RadioError("nothing is tuned yet: use tune, call or callsign first");
   const receiver = await ensureReceiver(p, flags);
   out(receiver.started ? "switched on (pid " + receiver.pid + ")" : "already on (pid " + receiver.pid + ")");
+  const sandbox = sandboxName();
+  if (sandbox) sandboxWarning(p, out, sandbox);
   await cmdStatus(p, [], { ...flags, offline: true }, out);
 }
 
