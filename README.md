@@ -133,3 +133,7 @@ the full release and rollback procedure.
 Extracted from the `airadio` subsystem of the teakofe monorepo. The
 `KOFE_AIRADIO_*` and `KOFE_WATCHDOG_*` environment spellings are still
 honoured by the daemon for compatibility with existing installations.
+
+## License
+
+[MIT](LICENSE) © 2026 Medet Akberdi. Made by Medet Akberdi.
