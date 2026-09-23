@@ -78,6 +78,10 @@ if (/fail/i.test(newest)) {
   reply = "the number is " + (memory.number || "unknown") + " (turn " + memory.turns + ")";
 } else if (/thanks/i.test(newest)) {
   reply = "NO_REPLY";
+} else if (/take your time/i.test(newest)) {
+  // A long turn, for tests that stop one midway.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_AGENT_SLOW_MS) || 15_000);
+  reply = "done, slowly";
 } else if (/leak/i.test(newest)) {
   reply = "here it is: " + "c".repeat(128);
 } else {

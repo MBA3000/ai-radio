@@ -181,6 +181,16 @@ main { flex: 1; padding: 14px 16px calc(var(--bottom) + 24px); }
 .toast { position: fixed; left: 50%; bottom: calc(var(--bottom) + 84px); transform: translateX(-50%); z-index: 30; max-width: 92%; padding: 11px 16px; border-radius: 14px;
   background: var(--ink); color: var(--bg); font-size: 14px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
 .hidden { display: none !important; }
+.mono { font-family: var(--mono); }
+.btn.small { padding: 7px 11px; font-size: 13px; border-radius: 10px; }
+.sig { font: 600 11px/1.5 var(--mono); padding: 0 6px; border-radius: 6px; background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+.sig.ok { color: var(--on); }
+.sig.bad { color: var(--bad); }
+.msg.mandate { border-left: 3px solid var(--amber); }
+.segmented.three { grid-template-columns: 1fr 1fr 1fr; }
+.sheet h3 { margin: 16px 0 4px; font-size: 16px; }
+.field select { width: 100%; padding: 12px 14px; border-radius: 14px; border: 1px solid var(--line); background: var(--bg); font-size: 16px; color: var(--ink); }
+.keyline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0 0 8px; }
 a { color: var(--amber); }
 .foot { text-align: center; font-size: 12px; color: var(--muted); margin-top: 28px; }
 `;
@@ -251,6 +261,101 @@ const SCRIPT = `
     var headers = { "X-Wave": channel.key };
     if (listen) headers["X-Callsign"] = store.name;
     return headers;
+  }
+
+  // ---------------------------------------------------------------- operator key
+  // Your identity on the air: an ECDSA P-256 key made on this device. Its
+  // private half is non-extractable and never leaves it; its public half goes
+  // into the prompts you hand to agents, whose radios then verify what you sign.
+  var operator = { key: null, pair: null, fingerprint: "" };
+  function idbDo(mode, run) {
+    return new Promise(function (ok, fail) {
+      var open = indexedDB.open("airadio", 1);
+      open.onupgradeneeded = function () { open.result.createObjectStore("keys"); };
+      open.onerror = function () { fail(open.error); };
+      open.onsuccess = function () {
+        var tx = open.result.transaction("keys", mode);
+        var request = run(tx.objectStore("keys"));
+        tx.oncomplete = function () { ok(request.result); };
+        tx.onerror = function () { fail(tx.error); };
+      };
+    });
+  }
+  function b64url(bytes) {
+    var text = "";
+    new Uint8Array(bytes).forEach(function (byte) { text += String.fromCharCode(byte); });
+    return btoa(text).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+  }
+  function fingerprintOf(key) {
+    return crypto.subtle.digest("SHA-256", keyBytes(key)).then(function (hash) {
+      var hex = Array.prototype.map.call(new Uint8Array(hash).slice(0, 8), function (byte) { return ("0" + byte.toString(16)).slice(-2); }).join("");
+      return hex.match(/.{4}/g).join("-");
+    });
+  }
+  var operatorReady = (window.indexedDB && window.crypto && crypto.subtle ? idbDo("readonly", function (keys) { return keys.get("operator"); }).then(function (pair) {
+    if (pair && pair.privateKey) return pair;
+    return crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]).then(function (made) {
+      return idbDo("readwrite", function (keys) { return keys.put(made, "operator"); }).then(function () { return made; });
+    });
+  }).then(function (pair) {
+    return crypto.subtle.exportKey("raw", pair.publicKey).then(function (raw) {
+      operator.pair = pair;
+      operator.key = b64url(raw);
+      return fingerprintOf(operator.key).then(function (fingerprint) { operator.fingerprint = fingerprint; return operator; });
+    });
+  }) : Promise.resolve(null)).catch(function () { return null; });
+
+  function canonicalMandate(mandate) {
+    var out = {};
+    ["note", "perHour", "scope", "to", "until"].forEach(function (key) { if (mandate && mandate[key] !== undefined && mandate[key] !== null) out[key] = mandate[key]; });
+    return JSON.stringify(out);
+  }
+  function signedPayload(frequency, from, ts, mandate, text) {
+    return ["airadio-signed-v1", frequency, from, String(ts), mandate ? canonicalMandate(mandate) : "", text].join("\\n");
+  }
+  function sendSigned(channel, text, mandate) {
+    return operatorReady.then(function (op) {
+      if (!op) return null;
+      var ts = Date.now();
+      return crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, op.pair.privateKey, new TextEncoder().encode(signedPayload(channel.frequency, store.name, ts, mandate, text))).then(function (signature) {
+        var sig = { v: 1, key: op.key, ts: ts, sig: b64url(signature) };
+        if (mandate) sig.mandate = mandate;
+        return sig;
+      });
+    }).catch(function () { return null; }).then(function (sig) {
+      // A mandate or a revoke means nothing unsigned: better not sent than sent in vain.
+      if (mandate && !sig) return { status: -1, body: null };
+      var body = { from: store.name, text: text };
+      if (sig) body.sig = sig;
+      return api("/v1/channel/" + channel.frequency + "/send", { method: "POST", headers: { "X-Wave": channel.key, "content-type": "application/json" }, body: JSON.stringify(body) });
+    });
+  }
+  var verdicts = {};
+  var firstSeq = {};
+  var verifying = Promise.resolve();
+  function verifyMessage(frequency, message) {
+    var sig = message.sig;
+    var id = frequency + ":" + message.seq;
+    if (verdicts[id]) return verdicts[id];
+    var payload = null;
+    // One at a time, in the order shown: the first copy of signed words is the
+    // real one, a later copy a replay (anyone with the channel key can post one).
+    verdicts[id] = verifying = verifying.then(function () {
+      payload = new TextEncoder().encode(signedPayload(frequency, message.from, sig.ts, sig.mandate, message.text));
+      return crypto.subtle.importKey("raw", keyBytes(sig.key), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    }).then(function (key) {
+      return crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, keyBytes(sig.sig), payload);
+    }).then(function (good) {
+      var at = Date.parse(message.at);
+      if (!good || /[\\r\\n]/.test(message.from) || !isFinite(at) || Math.abs(sig.ts - at) > 600000) return "bad";
+      return crypto.subtle.digest("SHA-256", payload).then(function (hash) {
+        var digest = frequency + ":" + b64url(hash);
+        if (firstSeq[digest] !== undefined && firstSeq[digest] !== message.seq) return "replayed";
+        firstSeq[digest] = message.seq;
+        return operator.key && sig.key === operator.key ? "you" : "signed";
+      });
+    }).catch(function () { return "bad"; });
+    return verdicts[id];
   }
 
   // ---------------------------------------------------------------- station
@@ -411,6 +516,7 @@ const SCRIPT = `
   }
 
   var shownSeqs = {};
+  var heardNames = [];
   var voices = {};
   var recheck = null;
   function appendMessage(message) {
@@ -423,9 +529,26 @@ const SCRIPT = `
     if (shownSeqs[key]) return;
     shownSeqs[key] = true;
     var mine = message.from === store.name;
-    var item = el("li", "msg" + (mine ? " mine" : ""));
+    var item = el("li", "msg" + (mine ? " mine" : "") + (message.sig && message.sig.mandate ? " mandate" : ""));
     var head = el("span", "from");
     head.appendChild(el("span", null, message.from));
+    if (message.sig && window.crypto && crypto.subtle) {
+      var badge = el("span", "sig", "\u2026");
+      head.appendChild(badge);
+      verifyMessage(current, message).then(function (verdict) {
+        if (verdict === "bad" || verdict === "replayed") {
+          badge.textContent = verdict === "bad" ? "\u26a0 bad signature" : "\u26a0 replayed copy";
+          badge.className = "sig bad";
+          return;
+        }
+        // Green is for this device's own key only: anyone can sign with a key of their own.
+        if (verdict === "you") { badge.className = "sig ok"; badge.textContent = "\u2713 you"; return; }
+        fingerprintOf(message.sig.key).then(function (fingerprint) {
+          badge.textContent = "signed \u00b7 " + fingerprint.slice(0, 9);
+          badge.title = "signed by key " + fingerprint + ", not this device's";
+        });
+      });
+    }
     head.appendChild(el("time", null, clock(message.at)));
     item.appendChild(head);
     item.appendChild(el("p", null, message.text));
@@ -443,6 +566,7 @@ const SCRIPT = `
       who.textContent = "";
       who.appendChild(el("span", null, "Listening:"));
       var listeners = got.body.listeners || [];
+      heardNames = listeners.map(function (listener) { return listener.name; }).filter(function (name) { return name !== store.name; });
       if (!listeners.length) who.appendChild(el("span", null, "nobody yet"));
       listeners.forEach(function (listener) {
         var chip = el("span", "chip" + (listener.onAir ? " on" : ""), listener.name + (listener.name === store.name ? " (you)" : ""));
@@ -459,11 +583,7 @@ const SCRIPT = `
     var text = $("text").value.trim();
     if (!channel || !text) return;
     $("text").value = "";
-    api("/v1/channel/" + channel.frequency + "/send", {
-      method: "POST",
-      headers: { "X-Wave": channel.key, "content-type": "application/json" },
-      body: JSON.stringify({ from: store.name, text: text })
-    }).then(function (got) {
+    sendSigned(channel, text, null).then(function (got) {
       if (got.status !== 200) { toast("Not sent (HTTP " + got.status + ")."); $("text").value = text; return; }
       pollChannel(channel, true).then(function () { scrollDown(true); });
     }).catch(function () { toast("Not sent: no connection."); $("text").value = text; });
@@ -489,7 +609,14 @@ const SCRIPT = `
       "Frequency: " + channel.frequency,
       "Key: " + channel.key
     ];
-    if (promptMode === "talk") {
+    if (operator.key) {
+      lines.push("Operator key: " + operator.key);
+      if (promptMode === "talk") {
+        lines.push("Read the station page, tune in with --operator <the operator key above>, and keep the conversation going on your own: hand the channel to this very session, so that you keep answering in this same conversation after this session ends. I can stop you with a signed revoke.");
+      } else {
+        lines.push("Read the station page, tune in with --operator <the operator key above> and stay on the air so you can receive messages; talk when a mandate I sign on the air allows it.");
+      }
+    } else if (promptMode === "talk") {
       lines.push("Read the station page, tune in, and keep the conversation going on your own: hand the channel to this very session, so that you keep answering in this same conversation after this session ends.");
     } else {
       lines.push("Read the station page, tune in and stay on the air so you can receive messages.");
@@ -499,6 +626,7 @@ const SCRIPT = `
   function showInvite(channel) {
     promptChannel = channel;
     $("prompt").textContent = promptText(channel);
+    operatorReady.then(function () { if (promptChannel === channel) $("prompt").textContent = promptText(channel); });
     Array.prototype.forEach.call(document.querySelectorAll("[data-mode]"), function (button) { button.classList.toggle("active", button.getAttribute("data-mode") === promptMode); });
     $("share").classList.toggle("hidden", !navigator.share);
     $("copy").classList.toggle("wide", !navigator.share);
@@ -551,7 +679,53 @@ const SCRIPT = `
     }).catch(function () { toast("No connection to the station."); });
   });
 
-  $("settings").addEventListener("click", function () { $("name").value = store.name; sheet("sheet-settings"); });
+  $("settings").addEventListener("click", function () {
+    $("name").value = store.name;
+    $("op-fp").textContent = operator.fingerprint || "not available in this browser";
+    $("op-copy").classList.toggle("hidden", !operator.key);
+    sheet("sheet-settings");
+  });
+  $("op-copy").addEventListener("click", function () {
+    navigator.clipboard.writeText(operator.key).then(function () { toast("Operator key copied."); }, function () { toast("Copy failed."); });
+  });
+
+  var mandateScope = "talk";
+  Array.prototype.forEach.call(document.querySelectorAll("[data-scope]"), function (button) {
+    button.addEventListener("click", function () {
+      mandateScope = button.getAttribute("data-scope");
+      Array.prototype.forEach.call(document.querySelectorAll("[data-scope]"), function (other) { other.classList.toggle("active", other === button); });
+      $("m-for-row").classList.toggle("hidden", mandateScope === "revoke");
+    });
+  });
+  $("m-send").addEventListener("click", function () {
+    var channel = find(current);
+    var to = $("m-to").value.trim().slice(0, 64);
+    if (!channel) return;
+    if (!to) { toast("Name the agent, or * for everyone on the channel."); return; }
+    var note = $("m-note").value.trim().slice(0, 300);
+    var mandate = { to: to, scope: mandateScope };
+    var text;
+    if (mandateScope === "revoke") {
+      text = "\u270d Mandate for " + to + " revoked: listen only from now on.";
+    } else {
+      mandate.until = new Date(Date.now() + (Number($("m-for").value) || 24) * 3600000).toISOString();
+      text = "\u270d Mandate for " + to + ": " + (mandateScope === "tools" ? "talk and use tools" : "talk (no tools)") + " until " + mandate.until.slice(0, 16).replace("T", " ") + " UTC";
+    }
+    if (note) {
+      mandate.note = note;
+      text += ". Note: " + note;
+    }
+    operatorReady.then(function (op) {
+      if (!op) { toast("This browser cannot keep an operator key, so it cannot sign a mandate."); return; }
+      return sendSigned(channel, text, mandate).then(function (got) {
+        if (got.status === -1) { toast("Could not sign it, so nothing was sent."); return; }
+        if (got.status !== 200) { toast("Not sent (HTTP " + got.status + ")."); return; }
+        sheet(null);
+        toast(mandateScope === "revoke" ? "Revoke signed and sent." : "Mandate signed and sent.");
+        pollChannel(channel, true).then(function () { scrollDown(true); });
+      });
+    }).catch(function () { toast("Not sent: no connection."); });
+  });
   $("sheet-settings").addEventListener("submit", function (event) {
     event.preventDefault();
     var name = $("name").value.trim();
@@ -567,6 +741,10 @@ const SCRIPT = `
     var channel = find(current);
     if (!channel) return;
     $("rename").value = channel.label || "";
+    var names = $("m-names");
+    names.textContent = "";
+    heardNames.concat(["*"]).forEach(function (name) { var option = document.createElement("option"); option.value = name; names.appendChild(option); });
+    if (!$("m-to").value && heardNames.length === 1) $("m-to").value = heardNames[0];
     sheet("sheet-channel");
   });
   $("sheet-channel").addEventListener("submit", function (event) {
@@ -779,11 +957,23 @@ export function renderApp({ nonce }) {
     <h2>Your name on the air</h2>
     <p>Agents and people on your channels see this name next to your messages.</p>
     <label class="field">NAME<input id="name" maxlength="64" autocapitalize="off" spellcheck="false"></label>
+    <h3>Your operator key</h3>
+    <p class="keyline"><span class="mono" id="op-fp"></span><button class="btn small" id="op-copy" type="button">Copy key</button></p>
+    <p>Made on this device and never leaves it. Agents you invite pin it, and it signs everything you send, so their radios know it is really you.</p>
     <div class="row2"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="submit">Save</button></div>
   </form>
   <form class="sheet hidden" id="sheet-channel" aria-label="Channel settings">
     <div class="grab"></div>
     <h2>This channel</h2>
+    <h3>Mandate for an agent</h3>
+    <p>What an agent may do here, and until when. Signed with your operator key; the agent's radio checks it.</p>
+    <label class="field">AGENT<input id="m-to" list="m-names" maxlength="64" autocapitalize="off" spellcheck="false" placeholder="Solnze, or * for everyone"></label>
+    <datalist id="m-names"></datalist>
+    <div class="segmented three"><button type="button" data-scope="talk" class="active">Talk</button><button type="button" data-scope="tools">Talk + tools</button><button type="button" data-scope="revoke">Revoke</button></div>
+    <label class="field" id="m-for-row">FOR<select id="m-for"><option value="1">1 hour</option><option value="8">8 hours</option><option value="24" selected>24 hours</option><option value="168">7 days</option></select></label>
+    <label class="field">NOTE (optional)<input id="m-note" maxlength="300" placeholder="Test airadio and report here"></label>
+    <button class="btn primary wide" id="m-send" type="button">Sign and send the mandate</button>
+    <h3>On this device</h3>
     <label class="field">NAME ON THIS DEVICE<input id="rename" maxlength="40" placeholder="Night shift"></label>
     <div class="row2"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="submit">Save</button></div>
     <p></p>
