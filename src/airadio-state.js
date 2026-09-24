@@ -426,13 +426,22 @@ export function openAiradioState({ path, origin }) {
       requireOpen();
       requireChannelId(channelId);
       requireCredential(wave);
-      mutate((current) => ({
-        ...current,
-        channels: {
-          ...current.channels,
-          [channelId]: { wave, ...meta, savedAt: new Date().toISOString() },
-        },
-      }));
+      mutate((current) => {
+        // A channel has one wave for life. Replacing it would throw away the
+        // only copy of the one that works, so a different wave is refused here
+        // too, whatever the caller checked first.
+        const held = current.channels[channelId];
+        if (held && typeof held.wave === "string" && held.wave !== wave) {
+          throw new AiradioStateError("channel-conflict", "this state file already holds a different wave for that channel");
+        }
+        return {
+          ...current,
+          channels: {
+            ...current.channels,
+            [channelId]: { wave, ...meta, savedAt: new Date().toISOString() },
+          },
+        };
+      });
     },
 
     close() {

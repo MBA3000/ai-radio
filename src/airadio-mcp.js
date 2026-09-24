@@ -149,7 +149,7 @@ export const AIRADIO_MCP_TOOLS = Object.freeze([
   Object.freeze({
     name: "airadio_invite_accept",
     description:
-      "Explicitly accept ONE invitation, named by its mailbox sequence number. The adapter rereads exactly that message itself, validates that it really is a call, and stores the channel credential privately. Nothing is accepted automatically and no reply is sent.",
+      "Explicitly accept ONE invitation, named by its mailbox sequence number. The adapter rereads exactly that message itself, validates that it really is a call, checks with the station that its key opens the channel, and stores the channel credential privately. It never replaces a key it already holds for that channel. Nothing is accepted automatically and no reply is sent.",
     inputSchema: closed({ sequence: { type: "integer", minimum: 1, description: "The mailbox sequence number shown by airadio_mailbox." } }, ["sequence"]),
     annotations: annotations("Accept an invitation", { readOnly: false }),
   }),
@@ -400,6 +400,7 @@ export function createAiradioMcpServer({ client, state, log = () => {}, maxConcu
       "bad-text",
       "text-too-large",
       "identity-conflict",
+      "channel-conflict",
       "unsafe-state-file",
       "unreadable-state",
       "unwritable-state",
@@ -496,15 +497,29 @@ export function createAiradioMcpServer({ client, state, log = () => {}, maxConcu
       if (row === null) return refuse(`no message at sequence ${sequence}`);
       const envelope = parseCallEnvelope(row.text);
       if (envelope === null) return refuse(`the message at sequence ${sequence} is not a call`);
+      const accepted = { accepted: true, channelId: envelope.frequency, from: row.from, note: envelope.note, credentialStored: true };
+      const held = state.channelWave(envelope.frequency);
+      if (held === envelope.key) return toolResult({ ...accepted, alreadyHeld: true });
+      // A channel's wave never changes, so a second one for a channel we hold
+      // is stale, mistaken or hostile. Storing it would destroy the only copy
+      // of the wave that works.
+      if (held !== null) {
+        return refuse(`this adapter already holds a different key for ${envelope.frequency}; that key is kept and the invitation's key was not stored`);
+      }
+      // A call is a stranger's text. Prove its key opens the channel before
+      // keeping it: a key that opens nothing would sit in the state file and
+      // turn the real invitation away later.
+      try {
+        await client.readChannel({ channelId: envelope.frequency, wave: envelope.key, since: 0, limit: 1 });
+      } catch (error) {
+        if (error?.code === "http-status" && (error.status === 403 || error.status === 404)) {
+          return refuse(`the invitation's key does not open ${envelope.frequency} (HTTP ${error.status}); nothing was stored`);
+        }
+        throw error;
+      }
       state.saveChannel(envelope.frequency, envelope.key, { role: "accepted", from: row.from });
       safeLog(`accepted invitation ${sequence} onto ${envelope.frequency}`);
-      return toolResult({
-        accepted: true,
-        channelId: envelope.frequency,
-        from: row.from,
-        note: envelope.note,
-        credentialStored: true,
-      });
+      return toolResult(accepted);
     },
 
     async airadio_channel_send({ channelId, text }) {

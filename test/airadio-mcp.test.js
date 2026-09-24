@@ -528,13 +528,18 @@ test("the mailbox shows an invitation's sequence and note but NEVER its frequenc
   assert.match(reply.message.result.content[0].text, /UNTRUSTED/u, "the text content is fenced as untrusted remote data");
 });
 
-test("accepting an invitation re-reads exactly that sequence and stores the capability", async () => {
+test("accepting an invitation re-reads exactly that sequence, checks its key and stores the capability", async () => {
   const invitation = JSON.stringify({ type: "call", frequency: "fm-1111111111111111", key: PEER_WAVE, note: "meet me" });
   const reads = [];
+  const checks = [];
   const client = fakeClient({
     readMailbox: (args) => {
       reads.push(args);
       return { messages: [{ seq: 5, at: "t", from: "beta-two", text: invitation }], nextSince: 5, hasMore: false };
+    },
+    readChannel: (args) => {
+      checks.push(args);
+      return { messages: [], nextSince: 0, hasMore: false };
     },
   });
   const state = fakeState({ station: { callsign: "alpha-one", origin: ORIGIN }, key: KEY });
@@ -542,6 +547,7 @@ test("accepting an invitation re-reads exactly that sequence and stores the capa
   const reply = await callTool(server, "airadio_invite_accept", { sequence: 5 });
 
   assert.deepEqual(reads, [{ callsign: "alpha-one", key: KEY, since: 4, limit: 1 }], "the adapter rereads the named sequence itself");
+  assert.deepEqual(checks, [{ channelId: "fm-1111111111111111", wave: PEER_WAVE, since: 0, limit: 1 }], "the key is proved against the station first");
   assert.deepEqual(structured(reply), {
     accepted: true,
     channelId: "fm-1111111111111111",
@@ -551,7 +557,66 @@ test("accepting an invitation re-reads exactly that sequence and stores the capa
   });
   assert.equal(state.channelWave("fm-1111111111111111"), PEER_WAVE);
   assert.equal(JSON.stringify(reply).includes(PEER_WAVE), false);
-  assert.deepEqual(client.calls.map((call) => call.name), ["readMailbox"], "accepting must never send an automatic reply");
+  assert.deepEqual(client.calls.map((call) => call.name), ["readMailbox", "readChannel"], "accepting must never send an automatic reply");
+});
+
+test("accept never replaces the key of a channel the adapter already holds", async () => {
+  const hostile = JSON.stringify({ type: "call", frequency: CHANNEL, key: PEER_WAVE, note: "your channel moved" });
+  const client = fakeClient({ readMailbox: () => ({ messages: [{ seq: 5, at: "t", from: "mallory", text: hostile }], nextSince: 5, hasMore: false }) });
+  const state = fakeState({ station: { callsign: "alpha-one", origin: ORIGIN }, key: KEY, channels: new Map([[CHANNEL, WAVE]]) });
+  const { server } = await ready({ client, state });
+  const reply = await callTool(server, "airadio_invite_accept", { sequence: 5 });
+
+  assert.equal(reply.message.result.isError, true);
+  assert.equal(structured(reply).error, "refused");
+  assert.match(structured(reply).reason, /already holds a different key for fm-abcdef0123456789/u);
+  assert.equal(state.channelWave(CHANNEL), WAVE, "the working key is kept");
+  assert.deepEqual(state.saved, [], "nothing is written");
+  assert.deepEqual(client.calls.map((call) => call.name), ["readMailbox"], "a held channel needs no network check to refuse");
+  assert.equal(JSON.stringify(reply).includes(PEER_WAVE) || JSON.stringify(reply).includes(WAVE), false);
+});
+
+test("accepting a channel the adapter already holds with the same key changes nothing", async () => {
+  const again = JSON.stringify({ type: "call", frequency: CHANNEL, key: WAVE, note: "come back" });
+  const client = fakeClient({ readMailbox: () => ({ messages: [{ seq: 6, at: "t", from: "beta-two", text: again }], nextSince: 6, hasMore: false }) });
+  const state = fakeState({ station: { callsign: "alpha-one", origin: ORIGIN }, key: KEY, channels: new Map([[CHANNEL, WAVE]]) });
+  const { server } = await ready({ client, state });
+  const reply = await callTool(server, "airadio_invite_accept", { sequence: 6 });
+
+  assert.equal(reply.message.result.isError, false);
+  assert.deepEqual(structured(reply), { accepted: true, channelId: CHANNEL, from: "beta-two", note: "come back", credentialStored: true, alreadyHeld: true });
+  assert.deepEqual(state.saved, [], "a channel created here keeps its record as it is");
+  assert.deepEqual(client.calls.map((call) => call.name), ["readMailbox"]);
+});
+
+test("a key the station refuses is never stored, and a failed check stores nothing", async () => {
+  const invitation = JSON.stringify({ type: "call", frequency: "fm-1111111111111111", key: PEER_WAVE });
+  const failing = (code, status) => () => {
+    const error = new Error(`upstream said ${PEER_WAVE}`);
+    error.name = "AiradioHttpError";
+    error.code = code;
+    if (status) error.status = status;
+    throw error;
+  };
+  const cases = [
+    [failing("http-status", 403), { error: "refused", reason: "the invitation's key does not open fm-1111111111111111 (HTTP 403); nothing was stored" }],
+    [failing("http-status", 404), { error: "refused", reason: "the invitation's key does not open fm-1111111111111111 (HTTP 404); nothing was stored" }],
+    [failing("http-status", 503), { error: "http-status", status: 503, tool: "airadio_invite_accept" }],
+    [failing("timeout"), { error: "timeout", tool: "airadio_invite_accept" }],
+  ];
+  for (const [readChannel, expected] of cases) {
+    const client = fakeClient({
+      readMailbox: () => ({ messages: [{ seq: 5, at: "t", from: "mallory", text: invitation }], nextSince: 5, hasMore: false }),
+      readChannel,
+    });
+    const state = fakeState({ station: { callsign: "alpha-one", origin: ORIGIN }, key: KEY });
+    const { server } = await ready({ client, state });
+    const reply = await callTool(server, "airadio_invite_accept", { sequence: 5 });
+    assert.equal(reply.message.result.isError, true);
+    assert.deepEqual(structured(reply), expected);
+    assert.deepEqual(state.channels(), [], "no key is kept unless the station accepted it");
+    assert.equal(JSON.stringify(reply).includes(PEER_WAVE), false);
+  }
 });
 
 test("accept refuses anything that is not an exact, valid call", async () => {
