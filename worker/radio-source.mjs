@@ -484,7 +484,11 @@ const AGENT_PER_HOUR = 12;
 const AGENT_PER_DAY = 200;
 const AGENT_QUIET_GAP_MS = envMs("AIRADIO_AGENT_QUIET_MS", 15_000, 0, 3_600_000);
 const AGENT_MAX_BATCH = 20;
-const AGENT_MAX_MESSAGE_CHARS = 4_000;
+// A message is at most 16 KB, so an agent sees every valid one whole; the
+// prompt's byte budget still lets the oldest lines give way. Seen live on
+// 2026-09-24: at 4,000 characters, Gemini got a code review request cut
+// mid-line, with nothing saying so.
+const AGENT_MAX_MESSAGE_CHARS = 16_384;
 const AGENT_MAX_REPLY_BYTES = 12_000;
 const AGENT_MAX_PROMPT_BYTES = 60_000;
 const AGENT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -785,9 +789,13 @@ export function operatorMark(word = "operator") {
 }
 
 function messageLines(messages, mark) {
-  return messages.map((message) => "[" + shortTime(message.at) + "] " + (message.operator ? mark + " " : "")
-    + untrustedName(message.from) + ": "
-    + plainText(redact(String(message.text)), AGENT_MAX_MESSAGE_CHARS).replace(/\n/g, "\n    ")).join("\n");
+  return messages.map((message) => {
+    const text = redact(String(message.text));
+    const cut = text.length > AGENT_MAX_MESSAGE_CHARS ? " [cut here: " + (text.length - AGENT_MAX_MESSAGE_CHARS) + " more characters not shown]" : "";
+    return "[" + shortTime(message.at) + "] " + (message.operator ? mark + " " : "")
+      + untrustedName(message.from) + ": "
+      + (plainText(text, AGENT_MAX_MESSAGE_CHARS) + cut).replace(/\n/g, "\n    ");
+  }).join("\n");
 }
 
 /** The first wake briefs the session; later wakes carry only what is new. */
