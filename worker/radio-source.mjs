@@ -54,7 +54,7 @@ import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.2.1";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -781,6 +781,19 @@ export function allowance(channel, now = Date.now()) {
   if (governed(channel) && !active) return { talk: false, tools: false };
   // The machine's owner sets the ceiling; a mandate can only narrow it.
   return { talk: true, tools: Boolean(channel.agent && channel.agent.tools === true) && (!active || channel.mandate.scope === "tools") };
+}
+
+/**
+ * The mandate line an operator reads in status and trust. Seen live on
+ * 2026-09-24: Solnze read "listen only (no mandate)" on a channel where no
+ * mandate had ever been signed, and concluded her agent would not answer
+ * there. It would have: such a channel is not governed at all. Only a
+ * signed mandate, or an agent started with --on-mandate, governs a channel.
+ */
+export function mandateLine(channel) {
+  if (channel && channel.mandate) return describeMandate(channel.mandate);
+  if (channel && channel.agent && channel.agent.onMandate === true) return "none yet: listen only until your operator signs one";
+  return "none: not governed (the agent talks as its prompt says; your operator can sign one to govern it)";
 }
 
 export function describeMandate(mandate) {
@@ -1782,7 +1795,7 @@ async function cmdTrust(p, args, flags, out) {
   }
   if (!args[1]) {
     out(channel.operator ? "operator of " + frequency + ": " + (channel.operator.name ? channel.operator.name + ", " : "") + "key " + channel.operator.fingerprint : "no operator key pinned for " + frequency + ": every message is untrusted");
-    out("mandate: " + describeMandate(channel.mandate || null));
+    out("mandate: " + mandateLine(channel));
     return;
   }
   if (channel.operator && channel.operator.key !== args[1] && flags[OPERATOR_FLAG] !== true) {
@@ -1893,11 +1906,6 @@ async function cmdAgent(p, args, flags, out) {
   if (sandbox) sandboxWarning(p, out, sandbox);
 }
 
-function mandateOf(config, frequency) {
-  const channel = config.channels[frequency];
-  return channel && channel.mandate ? channel.mandate : null;
-}
-
 async function cmdStatus(p, args, flags, out) {
   const config = loadConfig(p);
   const state = readJson(p.state, {});
@@ -1915,6 +1923,7 @@ async function cmdStatus(p, args, flags, out) {
     const row = { frequency, station: channel.station, as: channel.as || config.as || null, via: channel.via, unread: unreadFor(p, frequency),
       operator: channel.operator ? { name: channel.operator.name || null, fingerprint: channel.operator.fingerprint || keyFingerprint(channel.operator.key) } : null,
       mandate: channel.mandate ? { ...channel.mandate, active: mandateActive(channel), text: describeMandate(channel.mandate) } : null,
+      governed: governed(channel),
       agent: channel.agent ? {
         run: channel.agent.exec ? "exec" : channel.agent.run,
         label: agentLabel(channel.agent) + (governed(channel) ? (mandateActive(channel) ? ", on mandate" : ", dormant until a mandate") : ""),
@@ -1948,7 +1957,7 @@ async function cmdStatus(p, args, flags, out) {
     const who = row.listeners === null ? "listeners unknown" : others.length === 0 ? "nobody else listening" : others.map((listener) => listener.name + (listener.onAir ? " (on air)" : " (seen " + ago(listener.lastSeen) + ")")).join(", ");
     out("  " + row.frequency + " at " + row.station + " as " + row.as + ": heard " + ago(row.heard) + ", " + row.unread + " unread; " + who + (row.error ? "; ERROR " + row.error : ""));
     out("    operator: " + (row.operator ? (row.operator.name ? row.operator.name + ", " : "") + "key " + row.operator.fingerprint : "none pinned (every message is untrusted)")
-      + "; mandate: " + describeMandate(mandateOf(config, row.frequency)));
+      + "; mandate: " + mandateLine(config.channels[row.frequency]));
     if (row.agent) {
       out("    agent: " + row.agent.label + "; " + row.agent.wakesLastHour + " wakes in the last hour" + (row.agent.pending ? ", " + row.agent.pending + " waiting" : "")
         + "; last reply " + ago(row.agent.lastReplyAt) + (row.agent.lastError ? "; ERROR " + row.agent.lastError : ""));
