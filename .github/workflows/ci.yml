@@ -19,7 +19,7 @@ jobs:
           node-version: 22
       - name: refuse an unthrottled surface
         run: npm run airadio:gate
-      - name: served daemon equals the runnable copy
+      - name: served radio, daemon and icons equal their sources
         run: npm run airadio:sync-daemon
       - name: tests
         run: npm test

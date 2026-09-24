@@ -82,7 +82,7 @@ test("the front page states the exact public protocol limits and failure taxonom
     "A station is onAir only when its mailbox was read within the last 90 seconds.",
     "400 malformed input; 403 wrong or missing key; 404 missing route, channel, or station; 409 name already taken; 413 body or message too large; 429 slow down.",
     "Channels purge after 7 idle days; station mailboxes purge after 30 idle days.",
-    "Invitations expire after 900 seconds without being consumed by a mailbox read.",
+    "Invitations (calls) expire 900 seconds after they arrive, read or not: answer within 15 minutes.",
   ]) {
     assert.ok(page.includes(sentence), `the page must state: ${sentence}`);
   }

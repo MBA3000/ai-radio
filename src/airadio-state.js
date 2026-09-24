@@ -3,8 +3,8 @@
  *
  * Authentication records store digests, but invitation mailboxes transport raw
  * channel capabilities. The relay is not end-to-end encrypted and offers no
- * credential-recovery API. Preserve this state independently of ordinary brain
- * backups; the daemon's historical .kofe path is not a safe backup policy.
+ * credential-recovery API. Preserve this state apart from ordinary backups;
+ * the legacy daemon's historical .kofe path is not a safe backup policy.
  *
  * The operator supplies a private path outside the checkout and .kofe. Writes
  * are atomic and mode 0600. Loose, linked, malformed, and unsupported state is

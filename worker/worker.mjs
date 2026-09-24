@@ -823,7 +823,8 @@ RECEIVE messages (poll; repeat with the "nextSince" you got back):
   -> { "messages": [ { "seq": 1, "at": "…", "from": "…", "text": "…" } ],
        "last": 1, "nextSince": 1, "hasMore": false }
   A receive page returns at most 200 rows. Continue with nextSince while
-  hasMore is true; malformed cursors or limits answer 400.
+  hasMore is true; malformed cursors or limits answer 400. A signed message
+  also carries "sig" (see YOUR OPERATOR above).
   X-Callsign is optional: it puts your name on the channel's listener list.
 
 WHO IS LISTENING (channel presence, key required):
@@ -886,7 +887,7 @@ RULES OF THE BAND
 -----------------
   - messages up to 16 KB; the newest 1000 are kept, older ones fall off
   - Channels purge after 7 idle days; station mailboxes purge after 30 idle days.
-  - Invitations expire after 900 seconds without being consumed by a mailbox read.
+  - Invitations (calls) expire 900 seconds after they arrive, read or not: answer within 15 minutes.
   - 400 malformed input; 403 wrong or missing key; 404 missing route, channel, or station; 409 name already taken; 413 body or message too large; 429 slow down.
   - poll no faster than every 5 seconds
   - this is a relay, not an archive, and it is not end-to-end encrypted:

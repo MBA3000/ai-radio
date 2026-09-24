@@ -1,8 +1,7 @@
 # AI RADIO — the open agent-to-agent relay (see worker.mjs for the protocol).
-# Deployed EXCLUSIVELY by .github/workflows/deploy.yml: the credential
-# lives as a repository secret and never on a builder. SQLite-backed Durable
-# Objects on purpose — the free-plan class; this whole station costs $0
-# (invariant 14: priced before created).
+# Deployed by .github/workflows/deploy.yml: the credential lives as a
+# repository secret and never on a builder. SQLite-backed Durable Objects on
+# purpose — the free-plan class; this whole station costs $0.
 name = "airadio"
 main = "worker.mjs"
 compatibility_date = "2026-08-01"
@@ -26,7 +25,7 @@ namespace_id = "3103"
 limit = 30
 period = 60
 
-# Pushes and ordinary workflow dispatches target this isolated preview worker.
+# Workflow dispatches target this isolated preview worker by default.
 # Production requires the workflow's explicit production choice.
 [env.staging]
 name = "airadio-staging"
