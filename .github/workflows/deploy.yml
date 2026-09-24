@@ -1,16 +1,22 @@
 # Deploy AI RADIO to an isolated preview by default. Production remains an
-# explicit workflow_dispatch choice. Every deploy is stamped, read back, and
-# (for preview only) exercised through a disposable channel.
+# explicit workflow_dispatch choice. Every deploy runs the tests first, is
+# stamped, read back, and (for preview only) exercised through a disposable
+# channel.
 #
-# Manual dispatch only for now: the teakofe repository still has an active
-# workflow for the same Cloudflare workers (airadio, airadio-staging), and a
-# push there that touches airadio/** redeploys its older copy to staging. Add a
-# push trigger here only after that workflow is retired, so exactly one source
-# of truth deploys the station.
-#   gh workflow run deploy.yml -f environment=staging
+# This repository is the only source that deploys the station: teakofe's old
+# deploy-airadio.yml is retired. Every push to main that changes more than
+# prose redeploys staging; production is still only ever dispatched by hand:
+#   gh workflow run deploy.yml -f environment=production
 name: deploy
 
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".env.example"
   workflow_dispatch:
     inputs:
       environment:
@@ -22,8 +28,14 @@ on:
           - staging
           - production
 
+# One deploy per target at a time; a newer push waits instead of racing.
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
 jobs:
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -134,3 +146,20 @@ jobs:
             echo "::error::custom domain attach failed"
             exit 1
           fi
+
+  # The same gates as ci.yml, on the exact commit being deployed: a push can
+  # reach main without a pull request, and staging must never run red code.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: refuse an unthrottled surface
+        run: npm run airadio:gate
+      - name: served radio, daemon and icons equal their sources
+        run: npm run airadio:sync-daemon
+      - name: tests
+        run: npm test

@@ -44,8 +44,10 @@ stops this runbook.
 
 ## 2. Deploy staging through the workflow
 
-The workflow performs the deployment, reads `/health` back against its
-`GITHUB_SHA`, and then runs a disposable preview-channel canary. Capture the
+The workflow runs the tests, performs the deployment, reads `/health` back
+against its `GITHUB_SHA`, and then runs a disposable preview-channel canary.
+A push to `main` already deploys staging this way (event `push`); for a
+release branch, dispatch it as below. Capture the
 new run ID from `gh run list`; require its `headSha` to match before waiting.
 The list may initially be empty while GitHub registers the dispatch: rerun
 the list command, never substitute a prior run.
@@ -77,9 +79,8 @@ The canary creates its own channel and leaves it to normal expiry. It never
 touches an operator's mailbox, invitation state, station keys, or someone else's
 channel. Its CLI refuses production origins; preserve that refusal.
 
-Until the teakofe repository retires its `deploy-airadio.yml`, a push there
-that touches `airadio/**` redeploys an older copy to staging. The `/health`
-SHA check above is what tells the two apart: rerun it right before relying on
+Staging follows `main`: the next push there redeploys it. The `/health` SHA
+check above tells which build is live, so rerun it right before relying on
 staging.
 
 ## 3. Capture rollback evidence, then deploy production
