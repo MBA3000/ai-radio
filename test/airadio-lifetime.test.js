@@ -18,7 +18,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { ensureReceiver, hostService, radioPaths, receiverPid, receiverUnit, systemdRunArgs, systemdRunPath } from "../scripts/airadio-radio.mjs";
+import { ensureReceiver, hostService, radioPaths, receiverPid, receiverUnit, systemdRunArgs, systemdRunPath, userHome } from "../scripts/airadio-radio.mjs";
 import { startAiradioLocalStation } from "./helpers/airadio-local-station.js";
 
 const RADIO = fileURLToPath(new URL("../scripts/airadio-radio.mjs", import.meta.url));
@@ -150,3 +150,14 @@ test("tune takes the key from stdin, so it never sits in argv", { timeout: 60_00
   assert.notEqual(empty.code, 0);
   assert.match(empty.stderr, /the key must be the hexadecimal KEY/u);
 });
+
+test("a HOME that is not an absolute POSIX path is not trusted: the passwd entry is", () => {
+  const passwd = () => "/home/medet";
+  assert.equal(userHome({ env: { HOME: "/home/x" }, platform: "linux", passwd }), "/home/x");
+  assert.equal(userHome({ env: { HOME: "C:Usersmedet" }, platform: "linux", passwd }), "/home/medet", "a Windows HOME leaked into WSL (seen with Antigravity)");
+  assert.equal(userHome({ env: { HOME: "C:\\Users\\medet" }, platform: "linux", passwd }), "/home/medet");
+  assert.equal(userHome({ env: {}, platform: "linux", passwd }), "/home/medet", "no HOME at all");
+  assert.equal(userHome({ env: { HOME: "relative/dir" }, platform: "linux", passwd: () => { throw new Error("no passwd"); }, fallback: () => "/fallback" }), "/fallback");
+  assert.equal(userHome({ env: { HOME: "C:\\Users\\medet" }, platform: "win32", fallback: () => "C:\\Users\\medet" }), "C:\\Users\\medet", "native Windows keeps its own home");
+});
+

@@ -47,12 +47,12 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createPublicKey, randomBytes, randomUUID, verify as verifySignature } from "node:crypto";
 import { appendFileSync, chmodSync, closeSync, copyFileSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.2.1";
+export const VERSION = "1.2.2";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -119,8 +119,25 @@ export function stationOrigin(value) {
 
 // ------------------------------------------------------------------- files
 
+/**
+ * The user's home. Seen live on 2026-09-24: Gemini, started through
+ * Antigravity in WSL, inherited a Windows HOME ("C:\\Users\\...") that
+ * arrived mangled, so ~ pointed nowhere. On a POSIX system a HOME that is not
+ * an absolute path is not trusted, and the passwd entry is used instead.
+ */
+export function userHome({ env = process.env, platform = process.platform, passwd = () => userInfo().homedir, fallback = homedir } = {}) {
+  const home = env.HOME;
+  if (platform === "win32") return fallback();
+  if (typeof home === "string" && home.startsWith("/")) return home;
+  try {
+    const entry = passwd();
+    if (typeof entry === "string" && entry.startsWith("/")) return entry;
+  } catch {}
+  return fallback();
+}
+
 export function radioPaths(home) {
-  const dir = resolve(home || process.env.AIRADIO_HOME || join(homedir(), ".airadio"));
+  const dir = resolve(home || process.env.AIRADIO_HOME || join(userHome(), ".airadio"));
   return {
     home: dir,
     program: join(dir, "radio.mjs"),
@@ -1495,7 +1512,7 @@ function pickName(flags, config, channel) {
 
 /** A command line that works from any later shell: names the home unless it is the default. */
 function command(p, words) {
-  const standard = resolve(join(homedir(), ".airadio"));
+  const standard = resolve(join(userHome(), ".airadio"));
   return "node " + p.program + " " + words + (p.home === standard ? "" : " --home " + p.home);
 }
 
