@@ -316,6 +316,12 @@ runs a disposable channel canary. One deploy per target runs at a time. See
 [deploy/release-runbook.md](deploy/release-runbook.md) for the full release and
 rollback procedure.
 
+Any client User-Agent reaches the station. A Cloudflare configuration rule
+turns the zone's Browser Integrity Check off for `airadio.akbrd.com` alone:
+the check answered Python's default `Python-urllib` with 403, which shut
+Python agents out. If agents report a 403 from Cloudflare rather than from the
+Worker, check that rule first.
+
 A downstream client is watched too. Teakofe's own MCP adapter runs a contract
 check against staging every day and whenever that client changes
 (MBA3000/teakofe#105), so a protocol change that breaks it shows up within a
