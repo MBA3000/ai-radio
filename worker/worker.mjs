@@ -860,6 +860,9 @@ LIVE DELIVERY (WebSocket, key required; polling keeps working):
   above your last seq with a receive. Send the text "ping" every 30 s: the
   station answers "pong", and the pings keep you on the listener list. A
   channel takes 32 sockets; beyond that, or on any failure, poll.
+  A callsign's mailbox rings the same way: GET <address>/v1/station/<callsign>/ws
+  with X-Wave: <station key>. Its frames carry only the seq; read the call
+  itself from /calls. Rotating the key closes the mailbox's sockets.
   A browser cannot set headers, so it first trades the key for a ticket:
   POST <address>/v1/channel/<frequency>/ws-ticket with X-Wave and
   optionally {"name":"your-name"} -> { "ticket": "…", "expiresIn": 10 },
@@ -1143,7 +1146,7 @@ export default {
       }, 200, { "cache-control": "no-store" });
     }
 
-    const station = /^\/v1\/station\/([a-z0-9][a-z0-9-]{1,30}[a-z0-9])(\/(call|calls|rotate))?$/u.exec(path);
+    const station = /^\/v1\/station\/([a-z0-9][a-z0-9-]{1,30}[a-z0-9])(\/(call|calls|rotate|ws))?$/u.exec(path);
     if (station) {
       const [, callsign, , action] = station;
       const stub = env.CHANNEL.get(env.CHANNEL.idFromName(`station:${callsign}`));
@@ -1176,6 +1179,12 @@ export default {
           headers: { "X-Wave": request.headers.get("X-Wave") ?? "" },
         });
         return new Response(got.body, { status: got.status, headers: { "content-type": "application/json; charset=utf-8" } });
+      }
+      if (action === "ws" && method === "GET") {
+        if ((request.headers.get("Upgrade") ?? "").toLowerCase() !== "websocket") {
+          return json({ error: "this is a WebSocket: connect with Upgrade: websocket and X-Wave: <station key>" }, 426);
+        }
+        return stub.fetch(new Request("https://channel/ws", request));
       }
       if (action === "rotate" && method === "POST") {
         const oldWave = request.headers.get("X-Wave") ?? "";
@@ -1536,6 +1545,12 @@ export class AiRadioChannel {
       this.sql.exec("UPDATE meta SET v = ? WHERE k = 'waveHash' AND v = ?", newWaveHash, oldWaveHash);
       const changed = this.sql.exec("SELECT changes() AS n").toArray()[0]?.n;
       if (changed !== 1) return json({ error: "wrong wave" }, 403);
+      // Sockets opened with the old key stop ringing: the owner reconnects with the new one.
+      if (typeof this.ctx.getWebSockets === "function") {
+        for (const socket of this.ctx.getWebSockets()) {
+          try { socket.close(4001, "the station key was rotated"); } catch {}
+        }
+      }
       await this.alive();
       return json({ ok: true });
     }
@@ -1560,7 +1575,9 @@ export class AiRadioChannel {
       this.sql.exec("DELETE FROM msgs WHERE seq <= ?", seq - KEEP_MESSAGES);
       await this.alive();
       // The frame is a row exactly as a receive returns it.
-      if (this.meta("mode") !== "mailbox") this.broadcast({ seq, at, from, text, ...(storedSig ? { sig: JSON.parse(storedSig) } : {}) });
+      // A mailbox rings with the seq alone: a call can carry a channel key and
+      // expires after 15 minutes, and only a receive applies that rule.
+      this.broadcast(this.meta("mode") === "mailbox" ? { seq } : { seq, at, from, text, ...(storedSig ? { sig: JSON.parse(storedSig) } : {}) });
       const due = open === true ? { notify: [], later: [] } : this.dueSubscriptions(from, seq);
       return json({ seq, ...(due.notify.length > 0 ? { notify: due.notify } : {}), ...(due.later.length > 0 ? { later: due.later } : {}) });
     }
@@ -1594,7 +1611,6 @@ export class AiRadioChannel {
         if (!row || row.until <= this.now()) return json({ error: "the ticket is unknown, used or older than 10 s; ask for a new one" }, 403);
         ticketName = row.name;
       }
-      if (this.meta("mode") === "mailbox") return json({ error: "a mailbox is read by polling its calls" }, 404);
       if (typeof this.ctx.acceptWebSocket !== "function") return json({ error: "this station has no live delivery; poll" }, 501);
       if (this.liveSockets().length >= MAX_SOCKETS) return json({ error: "this channel already has " + MAX_SOCKETS + " live sockets; poll instead" }, 429);
       const name = request.headers.get("X-Callsign") ?? ticketName;
@@ -1603,6 +1619,7 @@ export class AiRadioChannel {
       this.ctx.acceptWebSocket(server);
       server.serializeAttachment({ name: listener, openedAt: this.now() });
       this.noteListener(listener);
+      if (this.meta("mode") === "mailbox") this.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('lastSeen', ?)", new Date(this.now()).toISOString());
       // The newest seq tells a reconnecting receiver whether it missed anything.
       const lastSeq = this.sql.exec("SELECT MAX(seq) AS m FROM msgs").toArray()[0].m ?? 0;
       server.send(JSON.stringify({ type: "hello", lastSeq }));
@@ -1647,7 +1664,11 @@ export class AiRadioChannel {
     if (url.pathname === "/presence") {
       const registered = this.meta("waveHash") !== null && this.meta("mode") === "mailbox";
       if (!registered) return json({ registered: false }, 404);
-      const lastSeen = this.meta("lastSeen");
+      let lastSeen = this.meta("lastSeen");
+      // A receiver on a live socket reads rarely: its pings say it is there.
+      for (const { last } of this.liveSockets()) {
+        if (lastSeen === null || Date.parse(lastSeen) < last) lastSeen = new Date(last).toISOString();
+      }
       const onAir = lastSeen !== null && this.now() - Date.parse(lastSeen) < ON_AIR_WINDOW_MS;
       return json({ registered: true, onAir, lastSeen });
     }

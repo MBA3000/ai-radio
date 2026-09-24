@@ -54,7 +54,7 @@ import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.4.1";
+export const VERSION = "1.5.0";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -323,9 +323,18 @@ const SOCKET_RETRY_MS = 5 * 60_000;
 const SOCKET_MAX_FAILURES = 3;
 
 export function socketUrl(station, frequency) {
+  return socketAt(station, "/v1/channel/" + frequency + "/ws");
+}
+
+/** A callsign's mailbox rings too; its frames carry the seq alone. */
+export function mailboxSocketUrl(station, callsign) {
+  return socketAt(station, "/v1/station/" + callsign + "/ws");
+}
+
+function socketAt(station, path) {
   const url = new URL(station);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.pathname = "/v1/channel/" + frequency + "/ws";
+  url.pathname = path;
   url.search = "";
   url.hash = "";
   return url.href;
@@ -1125,24 +1134,31 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       wake();
     }
   };
-  const cursorOf = (frequency) => (Number.isSafeInteger(state.cursors[frequency]) ? state.cursors[frequency] : 0);
+  const cursorOf = (id) => (Number.isSafeInteger(state.cursors[id]) ? state.cursors[id] : 0);
+  // What should have a socket: every tuned channel, and the mailbox under the id "mailbox".
+  const wanted = (config) => {
+    const out = new Map();
+    for (const [frequency, channel] of Object.entries(config.channels)) {
+      try { out.set(frequency, { url: socketUrl(channel.station, frequency), key: channel.key, listener: channel.as || config.as || null }); } catch {}
+    }
+    if (config.mailbox) {
+      try { out.set("mailbox", { url: mailboxSocketUrl(config.mailbox.station, config.mailbox.callsign), key: config.mailbox.key, listener: null }); } catch {}
+    }
+    return out;
+  };
   const syncSockets = (config) => {
-    for (const [frequency, socket] of sockets) {
-      const channel = config.channels[frequency];
-      let url = null;
-      try { url = channel ? socketUrl(channel.station, frequency) : null; } catch {}
-      if (!channel || channel.key !== socket.key || url !== socket.url) {
+    const want = process.env.AIRADIO_SOCKETS === "0" ? new Map() : wanted(config);
+    for (const [id, socket] of sockets) {
+      const target = want.get(id);
+      if (!target || target.key !== socket.key || target.url !== socket.url) {
         socket.close();
-        sockets.delete(frequency);
+        sockets.delete(id);
       }
     }
-    if (process.env.AIRADIO_SOCKETS === "0") return;
-    for (const [frequency, channel] of Object.entries(config.channels)) {
-      if (sockets.has(frequency)) continue;
-      let url;
-      try { url = socketUrl(channel.station, frequency); } catch { continue; }
-      const socket = new ChannelSocket({ url, key: channel.key, listener: channel.as || config.as || null, cursor: () => cursorOf(frequency), onNews: nudge });
-      sockets.set(frequency, socket);
+    for (const [id, target] of want) {
+      if (sockets.has(id)) continue;
+      const socket = new ChannelSocket({ ...target, cursor: () => cursorOf(id), onNews: nudge });
+      sockets.set(id, socket);
       socket.open();
     }
   };
@@ -1574,8 +1590,14 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         // A read that failed leaves the news unhandled, so the next tick reads again.
         if (socket && !state.errors[frequency]) socket.handled = handling;
       }
-      state.delivery = Object.fromEntries(frequencies.map((frequency) => [frequency, sockets.get(frequency) && sockets.get(frequency).live ? "socket" : "polling"]));
-      if (config.mailbox && !stopping) await pollMailbox(loadConfig(p));
+      state.delivery = Object.fromEntries([...frequencies, ...(config.mailbox ? ["mailbox"] : [])].map((id) => [id, sockets.get(id) && sockets.get(id).live ? "socket" : "polling"]));
+      if (config.mailbox && !stopping && due("mailbox")) {
+        const socket = sockets.get("mailbox");
+        const handling = socket ? socket.news : 0;
+        readAt.mailbox = Date.now();
+        await pollMailbox(loadConfig(p));
+        if (socket && !state.errors.mailbox) socket.handled = handling;
+      }
       if (!stopping) expireMandates(loadConfig(p));
       if (!stopping) scheduleWakes(loadConfig(p));
       state.intervalMs = Date.now() - lastActivity < ACTIVE_WINDOW_MS ? ACTIVE_POLL_MS : IDLE_POLL_MS;
@@ -2339,7 +2361,8 @@ async function cmdStatus(p, args, flags, out) {
     }
     report.channels.push(row);
   }
-  if (config.mailbox) report.mailbox = { callsign: config.mailbox.callsign, station: config.mailbox.station, autoTune: config.mailbox.autoTune !== false, error: (state.errors || {}).mailbox || null };
+  if (config.mailbox) report.mailbox = { callsign: config.mailbox.callsign, station: config.mailbox.station, autoTune: config.mailbox.autoTune !== false, error: (state.errors || {}).mailbox || null,
+    delivery: pid === null ? null : (state.delivery || {}).mailbox || null };
   if (flags.json) {
     out(JSON.stringify(report, null, 1));
     return;
@@ -2366,7 +2389,8 @@ async function cmdStatus(p, args, flags, out) {
     }
   }
   if (report.channels.length === 0) out("  no channels tuned");
-  if (report.mailbox) out("  callsign " + report.mailbox.callsign + " at " + report.mailbox.station + (report.mailbox.autoTune ? " (calls tuned in automatically)" : " (calls logged only)") + (report.mailbox.error ? "; ERROR " + report.mailbox.error : ""));
+  if (report.mailbox) out("  callsign " + report.mailbox.callsign + " at " + report.mailbox.station + (report.mailbox.autoTune ? " (calls tuned in automatically)" : " (calls logged only)")
+    + (report.mailbox.delivery ? "; " + (report.mailbox.delivery === "socket" ? "live socket" : "polling") : "") + (report.mailbox.error ? "; ERROR " + report.mailbox.error : ""));
   out("  inbox: " + unread + " unread (" + command(p, "inbox") + ")");
   if (power === "OFF" && (report.channels.length > 0 || report.mailbox)) {
     const sandbox = sandboxName();

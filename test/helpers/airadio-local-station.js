@@ -278,8 +278,9 @@ export async function startAiradioLocalStation({ limiter = { limit: async () => 
   const reads = new Map();
   const server = createServer(async (incoming, outgoing) => {
     try {
-      const read = /^\/v1\/channel\/(fm-[a-f0-9]+)\/messages/u.exec(incoming.url ?? "");
-      if (read) reads.set(read[1], (reads.get(read[1]) || 0) + 1);
+      const read = /^\/v1\/(?:channel\/(fm-[a-f0-9]+)\/messages|station\/([a-z0-9-]+)\/calls)/u.exec(incoming.url ?? "");
+      const reader = read ? read[1] || "station:" + read[2] : null;
+      if (reader) reads.set(reader, (reads.get(reader) || 0) + 1);
       const body = await requestBody(incoming);
       const response = await worker.fetch(
         new Request(`https://local.airadio.test${incoming.url ?? "/"}`, {
@@ -313,7 +314,9 @@ export async function startAiradioLocalStation({ limiter = { limit: async () => 
       );
       if (response.status !== 101 || !response.webSocket) return refuse(tcp, response.status, await response.text());
       const socket = response.webSocket.server;
-      const frequency = /^\/v1\/channel\/(fm-[a-f0-9]+)\/ws/u.exec(incoming.url ?? "")?.[1];
+      const target = /^\/v1\/(?:channel\/(fm-[a-f0-9]+)|station\/([a-z0-9-]+))\/ws/u.exec(incoming.url ?? "");
+      // Channels are named by frequency, mailboxes by "station:<callsign>".
+      const frequency = target ? target[1] || "station:" + target[2] : null;
       const accept = createHash("sha1").update(String(incoming.headers["sec-websocket-key"]) + WEBSOCKET_GUID).digest("base64");
       tcp.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n");
       socket.bind(tcp);
@@ -373,7 +376,7 @@ export async function startAiradioLocalStation({ limiter = { limit: async () => 
     url: `http://127.0.0.1:${address.port}`,
     restart: (id) => namespace.restart(id),
     hibernate: (id) => namespace.hibernate(id),
-    /** How many REST receives reached a channel: a receiver on a live socket stops polling. */
+    /** How many REST receives reached a channel (or "station:<callsign>" for a mailbox): a receiver on a live socket stops polling. */
     reads: (frequency) => reads.get(frequency) || 0,
     /** The channel's open sockets. */
     sockets: (frequency) => namespace.object(frequency)?.context.getWebSockets() ?? [],
