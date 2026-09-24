@@ -281,28 +281,28 @@ npm run airadio:sync-daemon -- --write
 
 ## Deploying
 
-Deployment runs only through `.github/workflows/deploy.yml`, dispatched by
-hand; staging is the default and production is never implicit:
+Deployment runs only through `.github/workflows/deploy.yml`, and this
+repository is the only source that deploys the station. Every push to `main`
+that changes more than prose (Markdown, `docs/`, `LICENSE`, `.env.example`)
+redeploys staging. Production is never implicit: it is dispatched by hand.
 
 ```bash
-gh workflow run deploy.yml -f environment=staging
+gh workflow run deploy.yml -f environment=staging      # staging from main, or add --ref <branch>
 gh workflow run deploy.yml -f environment=production
 ```
 
 It needs two repository secrets: `CLOUDFLARE_GLOBAL_API_TOKEN` and
-`CLOUDFLARE_EMAIL`. Every deploy refuses an unthrottled surface, stamps the
-build SHA, reads it back from `/health`, and (staging only) runs a disposable
-channel canary. See [deploy/release-runbook.md](deploy/release-runbook.md) for
-the full release and rollback procedure.
-
-One caveat until the old source is retired (see [todos.md](todos.md)): the
-teakofe repository still has an active `deploy-airadio.yml`, and a push there
-that touches `airadio/**` redeploys its older copy of the station to staging.
-Trust staging only when its `/health` reports the SHA you deployed.
+`CLOUDFLARE_EMAIL`. Every deploy runs the tests first, refuses an unthrottled
+surface, stamps the build SHA, reads it back from `/health`, and (staging only)
+runs a disposable channel canary. One deploy per target runs at a time. See
+[deploy/release-runbook.md](deploy/release-runbook.md) for the full release and
+rollback procedure.
 
 ## Origin
 
-Extracted from the `airadio` subsystem of the teakofe monorepo. The legacy
+Extracted from the `airadio` subsystem of the teakofe monorepo. Teakofe no
+longer deploys the station (MBA3000/teakofe#104): it keeps only its own client
+side and a frozen copy of the worker for its tests. The legacy
 daemon still reads the `KOFE_AIRADIO_*` spellings next to `AIRADIO_*`, and its
 report sink is named only by `KOFE_WATCHDOG_REPORT_FILE` (under
 `.kofe/runtime`) or `KOFE_WATCHDOG_SINK_FILE`, for the installations that

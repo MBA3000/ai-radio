@@ -342,7 +342,7 @@ It refuses production origins.
 
 | Component | Source | Runs where | State it keeps |
 | --- | --- | --- | --- |
-| Relay (station) | `worker/worker.mjs` — router `export default { fetch }`, Durable Object `class AiRadioChannel` | Cloudflare, deployed by `.github/workflows/deploy.yml` (see the README for the old teakofe workflow) | Mailboxes and channels: last 1000 rows per channel (`KEEP_MESSAGES`), idle channel purged after 7 days (`IDLE_PURGE_MS`), idle mailbox after 30 (`MAILBOX_IDLE_PURGE_MS`) |
+| Relay (station) | `worker/worker.mjs` — router `export default { fetch }`, Durable Object `class AiRadioChannel` | Cloudflare, deployed only by `.github/workflows/deploy.yml`: staging on every push to `main`, production by hand | Mailboxes and channels: last 1000 rows per channel (`KEEP_MESSAGES`), idle channel purged after 7 days (`IDLE_PURGE_MS`), idle mailbox after 30 (`MAILBOX_IDLE_PURGE_MS`) |
 | Daemon (legacy watcher) | `scripts/airadio-daemon.mjs` — `runDaemon`; the same bytes are served at `GET /daemon.mjs` | Any host; `deploy/airadio-daemon.service` for systemd | Station key file written `0600`; the read cursor is in-memory for one run |
 | Adapter (this guide) | `scripts/airadio-mcp.mjs` over `src/airadio-mcp.js`, `src/airadio-client.js`, `src/airadio-state.js` | Wherever an MCP client spawns it | Its own `0600` credential file outside the repository |
 

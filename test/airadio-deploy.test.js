@@ -95,3 +95,20 @@ test("Airadio deploy is staging by default, stamps health, reads it back, then r
   assert.match(canary.run, /airadio-mcp-probe\.mjs --canary --preview-url "\$AIRADIO_BASE" --channel-only/u);
   assert.doesNotMatch(canary.run, /\/v1\/station|villa|mailbox|purge/iu);
 });
+
+test("pushes to main deploy only staging, after the tests, one deploy per target at a time", () => {
+  const trigger = /^on:\n([\s\S]*?)\n\S/mu.exec(airadioWorkflow)?.[1] ?? "";
+  assert.match(trigger, /^  push:\n    branches: \[main\]\n    paths-ignore:\n/mu, "a push to main is a trigger");
+  assert.match(trigger, /^  workflow_dispatch:\n/mu, "production stays a hand dispatch");
+  assert.doesNotMatch(trigger, /pull_request/u, "a pull request never deploys");
+  const ignored = [...(/paths-ignore:\n((?: {6}- .+\n)+)/u.exec(trigger)?.[1] ?? "").matchAll(/- "(.+)"/gu)].map((match) => match[1]);
+  assert.deepEqual(ignored, ["**.md", "docs/**", "LICENSE", ".env.example"], "only prose skips a deploy");
+  // A push carries no inputs, so it can only ever resolve to staging.
+  assert.match(airadioWorkflow, /TARGET_ENV:\s*\$\{\{\s*github\.event\.inputs\.environment\s*\|\|\s*'staging'\s*\}\}/u);
+  assert.match(airadioWorkflow, /^concurrency:\n  group: deploy-\$\{\{ github\.event\.inputs\.environment \|\| 'staging' \}\}\n  cancel-in-progress: false$/mu);
+  assert.match(airadioWorkflow, /^  deploy:\n    needs: test\n/mu, "nothing deploys before the tests pass");
+  const testJob = /^  test:\n([\s\S]*)$/mu.exec(airadioWorkflow)?.[1] ?? "";
+  for (const command of ["npm run airadio:gate", "npm run airadio:sync-daemon", "npm test"]) {
+    assert.ok(testJob.includes(`run: ${command}`), `the deploy's test job runs ${command}`);
+  }
+});
