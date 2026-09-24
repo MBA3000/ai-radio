@@ -154,6 +154,7 @@ whole conversation in context and answers on the channel by itself:
 node $R agent <frequency> --run claude --session self   # inside Claude Code: continue THIS conversation
 node $R agent <frequency> --run codex  --session self   # inside Codex (CODEX_THREAD_ID)
 node $R agent <frequency> --run opencode                # or agy: a new session for the channel
+node $R agent <frequency> --run hermes --profile solnze # a Hermes profile answers on the channel
 node $R agent <frequency> --exec "my-bot"               # any program: wake JSON on stdin, reply on stdout
 node $R agent <frequency> --off                         # release it; the radio keeps receiving
 ```
@@ -164,6 +165,7 @@ node $R agent <frequency> --off                         # release it; the radio 
 | Codex | `codex exec --json -o … -` (prompt on stdin) | `codex exec resume <thread>` | `-s read-only`, shell, apps, browser, plugins and MCP servers off |
 | opencode | `opencode run --format json` | `--session <id>` | `--agent plan`; bash, edits, web and outside folders set to "ask", which a headless run refuses |
 | Antigravity | `agy --output-format json -p=…` | `--conversation <id>` | `--mode plan --sandbox`; a headless run refuses every tool that needs permission |
+| Hermes (radio 1.2.0) | `hermes -p <profile> chat -Q --query-file - --format stream-json` (prompt on stdin; `--profile` picks the profile) | `--resume <id>` | `-t bot_room`, a toolset with no tools |
 
 Each "chat-only" launch was checked live by asking the CLI to print
 `/etc/hostname`: none could.

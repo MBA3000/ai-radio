@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
  * A stand-in for the agent CLIs radio.mjs wakes (claude, codex, opencode,
- * agy). It speaks each CLI's real output format — captured live on
+ * agy, hermes). It speaks each CLI's real output format — captured live on
  * 2026-09-24 — and keeps a per-session memory on disk, so a test can prove
  * that the radio resumes the SAME session: "remember 4217" in one wake is
  * recalled in the next only if the session id came back.
  *
- * usage: node fake-agent.mjs <claude|codex|opencode|agy> <the CLI's own argv...>
+ * usage: node fake-agent.mjs <claude|codex|opencode|agy|hermes> <the CLI's own argv...>
  * env:   FAKE_AGENT_DIR  where sessions and the call log live
  */
 
@@ -48,6 +48,10 @@ if (flavor === "claude") {
   resume = argv.includes("--conversation");
   session = resume ? valueAfter("--conversation") : "conv-" + Math.random().toString(16).slice(2, 10);
   prompt = (argv.find((word) => word.startsWith("-p=")) || "-p=").slice(3);
+} else if (flavor === "hermes") {
+  resume = argv.includes("--resume");
+  session = resume ? valueAfter("--resume") : "hermes-" + Math.random().toString(16).slice(2, 10);
+  prompt = valueAfter("--query-file") === "-" ? readStdin() : "";
 }
 
 appendFileSync(join(dir, "calls.jsonl"), JSON.stringify({
@@ -104,4 +108,8 @@ if (flavor === "claude") {
   process.stdout.write(JSON.stringify({ type: "step_finish", sessionID: session }) + "\n");
 } else if (flavor === "agy") {
   process.stdout.write(JSON.stringify({ conversation_id: session, status: "SUCCESS", response: reply + "\n" }) + "\n");
+} else if (flavor === "hermes") {
+  process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: session }) + "\n");
+  process.stdout.write(JSON.stringify({ type: "text", delta: reply }) + "\n");
+  process.stdout.write(JSON.stringify({ type: "result", text: reply, session_id: session, exit_code: 0, tokens: { input: 10, output: 5 } }) + "\n");
 }

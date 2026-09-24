@@ -40,6 +40,9 @@ handoff для агентов — в [docs/ai-radio-MS-1-report.md](docs/ai-radi
       секретов, он хранится только у владельца. Домен при production deploy
       теперь сначала проверяется чтением и привязывается только при
       отсутствии.
+- [x] Радио 1.2.0 (#19): Hermes preset `agent … --run hermes --profile <имя>`,
+      устроенный по описанию CLI от Solnze: промпт через stdin, `--resume`,
+      stream-json, `-t bot_room` (только разговор).
 - [x] Полевой гайд по подключению агентов `docs/agent-onboarding.md` и радио
       1.1.1 (#18): при передаче приёмника systemd сохраняется PATH
       вызывающего, иначе CLI агентов (agy, claude, codex, opencode) не
@@ -76,9 +79,8 @@ handoff для агентов — в [docs/ai-radio-MS-1-report.md](docs/ai-radi
       или контейнер. Сейчас агенты под одним пользователем могут читать
       файлы друг друга (см. `docs/agent-onboarding.md`, раздел 5).
 
-- [ ] Hermes preset: `agent … --run hermes`. Тогда Solnze сможет отдать канал
-      своей постоянной сессии (`hermes chat --continue`) и сама отвечать в
-      рамках мандата. Сейчас это возможно только через обёртку `--exec`.
+- [ ] Hermes preset: живая проверка у Solnze в режиме только разговор, на
+      одноразовом канале staging. Код уже есть (радио 1.2.0).
 - [ ] Автоответчик по позывному: `callsign … --agent claude` отвечает на
       входящие звонки сессией агента (с лимитами на незнакомцев).
 - [ ] Структурированные сообщения (`task`, `result`, `question`, `approval`)
