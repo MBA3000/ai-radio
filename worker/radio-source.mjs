@@ -54,7 +54,7 @@ import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.2.3";
+export const VERSION = "1.3.0";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -279,6 +279,157 @@ async function http(method, url, { key, listener, body } = {}) {
   }
 }
 
+// ------------------------------------------------------------- live delivery
+//
+// Since 1.3.0 the receiver keeps one WebSocket per channel. The station sends
+// "hello" with the channel's newest seq when the socket opens, and a frame for
+// each new message. The socket never handles a message itself: it only says
+// that something is newer than what the receiver has read, and the receiver
+// reads the channel at once through the same REST path it polls with, where
+// signatures, mandates, pings and agents are handled. A quiet channel costs no
+// requests, and a message costs one read. While the socket is up the channel
+// is still polled every 5 minutes, as a safety net. After three failed
+// connections in a row it is polled as before, and the socket is tried again
+// every 5 minutes. AIRADIO_SOCKETS=0 switches sockets off.
+
+export const SOCKET_PING_MS = 30_000;
+const SOCKET_DEAD_MS = 75_000;
+export const SOCKET_SAFETY_POLL_MS = 5 * 60_000;
+const SOCKET_RETRY_MS = 5 * 60_000;
+const SOCKET_MAX_FAILURES = 3;
+
+export function socketUrl(station, frequency) {
+  const url = new URL(station);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/v1/channel/" + frequency + "/ws";
+  url.search = "";
+  url.hash = "";
+  return url.href;
+}
+
+/** The wait before the next connection: 1 s doubling up to 30 s, 5 minutes after three failures, all within ±25%. */
+export function socketDelay(failures, random = Math.random) {
+  const base = failures >= SOCKET_MAX_FAILURES ? SOCKET_RETRY_MS : Math.min(30_000, 1_000 * 2 ** failures);
+  return Math.round(base * (0.75 + random() * 0.5));
+}
+
+export class ChannelSocket {
+  constructor({ url, key, listener = null, cursor = () => 0, onNews = () => {}, WebSocketImpl = globalThis.WebSocket }) {
+    this.url = url;
+    this.key = key;
+    this.listener = listener;
+    this.cursor = cursor;
+    this.onNews = onNews;
+    this.WebSocketImpl = WebSocketImpl;
+    this.state = typeof WebSocketImpl === "function" ? "down" : "unsupported";
+    this.failures = 0;
+    // Each frame that shows something unread counts up; the receiver reads until it has caught up with the count.
+    this.news = 0;
+    this.handled = 0;
+    this.ws = null;
+    this.timer = null;
+    this.pinger = null;
+    this.lastPong = 0;
+    this.stopped = false;
+  }
+
+  get live() {
+    return this.state === "live";
+  }
+
+  open() {
+    if (this.stopped || this.state === "unsupported" || this.ws) return;
+    let ws;
+    try {
+      // Node's WebSocket (undici) sends headers, so the key travels as it does on every read, never in the URL.
+      ws = new this.WebSocketImpl(this.url, { headers: { "X-Wave": this.key, ...(this.listener ? { "X-Callsign": this.listener } : {}) } });
+    } catch {
+      this.failures += 1;
+      this.retry();
+      return;
+    }
+    this.ws = ws;
+    this.state = "connecting";
+    ws.onmessage = (event) => this.heard(event.data);
+    ws.onerror = () => {};
+    ws.onclose = () => {
+      if (this.ws !== ws) return;
+      // A socket that never said hello is a failed connection.
+      if (this.state !== "live") this.failures += 1;
+      this.down();
+    };
+  }
+
+  heard(data) {
+    const text = String(data);
+    if (text === "pong") {
+      this.lastPong = Date.now();
+      return;
+    }
+    let frame = null;
+    try { frame = JSON.parse(text); } catch {}
+    if (!frame || typeof frame !== "object") return;
+    let seq = null;
+    if (frame.type === "hello") {
+      this.state = "live";
+      this.failures = 0;
+      this.lastPong = Date.now();
+      clearInterval(this.pinger);
+      this.pinger = setInterval(() => this.ping(), SOCKET_PING_MS);
+      if (this.pinger.unref) this.pinger.unref();
+      seq = frame.lastSeq;
+    } else if (frame.type === "message" && frame.msg && typeof frame.msg === "object") {
+      seq = frame.msg.seq;
+    }
+    if (Number.isSafeInteger(seq) && seq > this.cursor()) {
+      this.news += 1;
+      this.onNews();
+    }
+  }
+
+  ping() {
+    if (!this.ws || this.state !== "live") return;
+    // No pong for 75 s: the connection is dead even if TCP has not noticed (a laptop that slept).
+    if (Date.now() - this.lastPong > SOCKET_DEAD_MS) {
+      const ws = this.ws;
+      this.down();
+      try { ws.close(); } catch {}
+      return;
+    }
+    try { this.ws.send("ping"); } catch {}
+  }
+
+  down() {
+    this.ws = null;
+    clearInterval(this.pinger);
+    this.pinger = null;
+    this.state = "down";
+    this.retry();
+  }
+
+  retry() {
+    if (this.stopped) return;
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.open();
+    }, socketDelay(this.failures));
+    if (this.timer.unref) this.timer.unref();
+  }
+
+  close() {
+    this.stopped = true;
+    clearTimeout(this.timer);
+    clearInterval(this.pinger);
+    const ws = this.ws;
+    this.ws = null;
+    this.state = "down";
+    if (ws) {
+      try { ws.close(1000); } catch {}
+    }
+  }
+}
+
 function explain(status, what) {
   if (status === 403) return what + ": wrong key (HTTP 403)";
   if (status === 404) return what + ": nothing on that frequency or callsign (HTTP 404; channels purge after 7 idle days)";
@@ -333,7 +484,11 @@ const AGENT_PER_HOUR = 12;
 const AGENT_PER_DAY = 200;
 const AGENT_QUIET_GAP_MS = envMs("AIRADIO_AGENT_QUIET_MS", 15_000, 0, 3_600_000);
 const AGENT_MAX_BATCH = 20;
-const AGENT_MAX_MESSAGE_CHARS = 4_000;
+// A message is at most 16 KB, so an agent sees every valid one whole; the
+// prompt's byte budget still lets the oldest lines give way. Seen live on
+// 2026-09-24: at 4,000 characters, Gemini got a code review request cut
+// mid-line, with nothing saying so.
+const AGENT_MAX_MESSAGE_CHARS = 16_384;
 const AGENT_MAX_REPLY_BYTES = 12_000;
 const AGENT_MAX_PROMPT_BYTES = 60_000;
 const AGENT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -634,9 +789,13 @@ export function operatorMark(word = "operator") {
 }
 
 function messageLines(messages, mark) {
-  return messages.map((message) => "[" + shortTime(message.at) + "] " + (message.operator ? mark + " " : "")
-    + untrustedName(message.from) + ": "
-    + plainText(redact(String(message.text)), AGENT_MAX_MESSAGE_CHARS).replace(/\n/g, "\n    ")).join("\n");
+  return messages.map((message) => {
+    const text = redact(String(message.text));
+    const cut = text.length > AGENT_MAX_MESSAGE_CHARS ? " [cut here: " + (text.length - AGENT_MAX_MESSAGE_CHARS) + " more characters not shown]" : "";
+    return "[" + shortTime(message.at) + "] " + (message.operator ? mark + " " : "")
+      + untrustedName(message.from) + ": "
+      + (plainText(text, AGENT_MAX_MESSAGE_CHARS) + cut).replace(/\n/g, "\n    ");
+  }).join("\n");
 }
 
 /** The first wake briefs the session; later wakes carry only what is new. */
@@ -926,6 +1085,46 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   const running = new Map();
   const children = new Set();
   let lastActivity = Date.now();
+  // Live delivery: a socket per channel, and when each channel was last read.
+  const sockets = new Map();
+  const readAt = {};
+  let news = false;
+  let wakeUp = null;
+  const nudge = () => {
+    news = true;
+    if (wakeUp) {
+      const wake = wakeUp;
+      wakeUp = null;
+      wake();
+    }
+  };
+  const cursorOf = (frequency) => (Number.isSafeInteger(state.cursors[frequency]) ? state.cursors[frequency] : 0);
+  const syncSockets = (config) => {
+    for (const [frequency, socket] of sockets) {
+      const channel = config.channels[frequency];
+      let url = null;
+      try { url = channel ? socketUrl(channel.station, frequency) : null; } catch {}
+      if (!channel || channel.key !== socket.key || url !== socket.url) {
+        socket.close();
+        sockets.delete(frequency);
+      }
+    }
+    if (process.env.AIRADIO_SOCKETS === "0") return;
+    for (const [frequency, channel] of Object.entries(config.channels)) {
+      if (sockets.has(frequency)) continue;
+      let url;
+      try { url = socketUrl(channel.station, frequency); } catch { continue; }
+      const socket = new ChannelSocket({ url, key: channel.key, listener: channel.as || config.as || null, cursor: () => cursorOf(frequency), onNews: nudge });
+      sockets.set(frequency, socket);
+      socket.open();
+    }
+  };
+  // A channel on a live socket is read when the socket shows something unread, and every 5 minutes.
+  const due = (frequency) => {
+    const socket = sockets.get(frequency);
+    if (!socket || !socket.live) return true;
+    return socket.news !== socket.handled || Date.now() - (readAt[frequency] || 0) >= SOCKET_SAFETY_POLL_MS;
+  };
   log("receiver " + VERSION + " on the air (pid " + process.pid + ", home " + p.home + ")");
 
   const tuneOut = (frequency, reason) => {
@@ -1336,10 +1535,19 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         log("nothing is tuned; switching off");
         break;
       }
+      news = false;
+      syncSockets(config);
       for (const frequency of frequencies) {
         if (stopping) break;
+        if (!due(frequency)) continue;
+        const socket = sockets.get(frequency);
+        const handling = socket ? socket.news : 0;
+        readAt[frequency] = Date.now();
         await pollChannel(config, frequency, config.channels[frequency]);
+        // A read that failed leaves the news unhandled, so the next tick reads again.
+        if (socket && !state.errors[frequency]) socket.handled = handling;
       }
+      state.delivery = Object.fromEntries(frequencies.map((frequency) => [frequency, sockets.get(frequency) && sockets.get(frequency).live ? "socket" : "polling"]));
       if (config.mailbox && !stopping) await pollMailbox(loadConfig(p));
       if (!stopping) expireMandates(loadConfig(p));
       if (!stopping) scheduleWakes(loadConfig(p));
@@ -1350,8 +1558,12 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       if (tick + 1 >= maxTicks) break;
       const seen = pokedAt(p);
       const wake = Date.now() + state.intervalMs;
-      while (!stopping && Date.now() < wake) {
-        await new Promise((ok) => setTimeout(ok, Math.min(500, wake - Date.now())));
+      while (!stopping && !news && Date.now() < wake) {
+        await new Promise((ok) => {
+          wakeUp = ok;
+          setTimeout(ok, Math.min(500, wake - Date.now()));
+        });
+        wakeUp = null;
         if (pokedAt(p) > seen) {
           lastActivity = Date.now();
           break;
@@ -1359,6 +1571,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       }
     }
   } finally {
+    for (const socket of sockets.values()) socket.close();
     for (const kill of children) kill("SIGTERM");
     if (running.size > 0) await Promise.race([Promise.allSettled([...running.values()]), new Promise((ok) => setTimeout(ok, 10_000))]);
     for (const kill of children) kill("SIGKILL");
@@ -1974,7 +2187,8 @@ async function cmdStatus(p, args, flags, out) {
         pending: agentRuntime && Array.isArray(agentRuntime.pending) ? agentRuntime.pending.length : 0,
         lastReplyAt: agentRuntime ? agentRuntime.lastReplyAt || null : null,
         lastError: agentRuntime ? agentRuntime.lastError || null : null,
-      } : null, heard: (state.heard || {})[frequency] || null, error: (state.errors || {})[frequency] || null, listeners: null };
+      } : null, heard: (state.heard || {})[frequency] || null, error: (state.errors || {})[frequency] || null,
+      delivery: pid === null ? null : (state.delivery || {})[frequency] || null, listeners: null };
     if (!flags.offline) {
       try { row.listeners = await listeners(channel, frequency); } catch {}
     }
@@ -1996,7 +2210,8 @@ async function cmdStatus(p, args, flags, out) {
   for (const row of report.channels) {
     const others = (row.listeners || []).filter((listener) => listener.name !== row.as);
     const who = row.listeners === null ? "listeners unknown" : others.length === 0 ? "nobody else listening" : others.map((listener) => listener.name + (listener.onAir ? " (on air)" : " (seen " + ago(listener.lastSeen) + ")")).join(", ");
-    out("  " + row.frequency + " at " + row.station + " as " + row.as + ": heard " + ago(row.heard) + ", " + row.unread + " unread; " + who + (row.error ? "; ERROR " + row.error : ""));
+    out("  " + row.frequency + " at " + row.station + " as " + row.as + ": heard " + ago(row.heard) + ", " + row.unread + " unread; " + who
+      + (row.delivery ? "; " + (row.delivery === "socket" ? "live socket" : "polling") : "") + (row.error ? "; ERROR " + row.error : ""));
     out("    operator: " + (row.operator ? (row.operator.name ? row.operator.name + ", " : "") + "key " + row.operator.fingerprint : "none pinned (every message is untrusted)")
       + "; mandate: " + mandateLine(config.channels[row.frequency]));
     if (row.agent) {

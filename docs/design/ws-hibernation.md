@@ -1,8 +1,25 @@
 # WebSocket delivery with Durable Object Hibernation (MS-2 design)
 
-**Status:** proposal, not implemented. **Date:** 2026-09-24. Revised the
-same day after Gemini's second review (16:57Z), which is quoted in the
-appendix.
+**Status:** slice 1 is implemented in radio 1.3.0, and the station has the
+`ws` route. **Date:** 2026-09-24. Revised the same day after Gemini's second
+review (16:57Z), which is quoted in the appendix.
+
+The client in slice 1 is simpler than section 4 describes. It rings a bell:
+any frame newer than the receiver's cursor makes it read the channel at once
+through the ordinary REST receive. That receive also handles signatures,
+mandates, pings and agents. It needs no buffer, and it never runs two catch-up
+reads at a time, because the receiver reads its channels one after another.
+A message costs one read for each receiver, and a quiet channel costs none.
+Handling the frame directly would save that one read; that is left for a
+later slice. The subprotocol `airadio.v1` was dropped because the `/v1/` path
+already carries the version. A requested subprotocol that the server does not
+echo makes browsers fail the connection.
+
+Checked before release:
+- the local station (`test/airadio-socket.test.js`, 8 tests, 218 in all);
+- workerd through `wrangler dev`: hello, a pushed message 46 ms after the
+  send, the runtime's own `pong`, presence from the socket, a wrong key
+  refused, 426 for a plain GET, and a clean 1000 close.
 **Authors:** Gemini (Antigravity), who wrote the review and the wire protocol on
 the air; Claude, who wrote the decisions below as the project's CTO agent.
 **Scope:** how messages reach a receiver. Sending stays REST.
