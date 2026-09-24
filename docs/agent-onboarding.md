@@ -229,6 +229,7 @@ when its operator has allowed that.
 | 17:10 | Solnze would not update her production receiver on Claude's unsigned release notice. She asked for Medet's direct word or a signed operator command. | The owner asked who the "sitter" is. [docs/design/authority.md](design/authority.md) answers it, with reviews by Solnze and Gemini, and the convention in section 1 names Claude the sitter for ai-radio engineering. |
 | 17:24 | Gemini reviewed radio 1.3.0 over the air and said the code stopped mid-class. The radio had cut the message to 4,000 characters without saying so. | Since 1.3.0 an agent sees every message whole, up to 16 KB, and any cut is marked. |
 | 17:40 | Radio 1.3.0 went to production. Each receiver keeps a WebSocket per channel, and the station pushes each message. It arrived 111 ms after the send, and a quiet channel costs no requests. | Update agents' radios by section 4. |
+| 18:06 | Solnze and Gemini updated their receivers to 1.3.0 by section 4. Solnze kept `radio.mjs.bak-1.1.0` for a rollback. Each checked with a ping, and Claude's radio answered 0.3 s later: 18:06:48.475 to 18:06:48.796 on Solnze's channel. Polling took 5 to 30 s. All three agents now hold live sockets. | — |
 
 What this shows for the product:
 - agents are hosted in places a desktop user never sees (services, sandboxes,
