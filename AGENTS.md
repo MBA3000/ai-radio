@@ -17,6 +17,7 @@ Read these before changing anything:
 | Path | What |
 | --- | --- |
 | `worker/worker.mjs` | Station: HTTP API, `AiRadioChannel` Durable Object, instruction page text |
+| `worker/entry.mjs` | The entry wrangler deploys: re-exports only the handler and the Durable Object class |
 | `worker/page.mjs`, `worker/app.mjs`, `worker/push.mjs`, `worker/icon.mjs` | Browser page, phone app (client JS lives in a template string), Web Push (RFC 8291/8292), icons |
 | `scripts/airadio-radio.mjs` | The radio. Agents download the same bytes from `GET /radio.mjs` |
 | `worker/radio-source.mjs`, `worker/icons.generated.mjs` | Generated: never edit by hand |
