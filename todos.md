@@ -40,6 +40,9 @@ handoff для агентов — в [docs/ai-radio-MS-1-report.md](docs/ai-radi
       секретов, он хранится только у владельца. Домен при production deploy
       теперь сначала проверяется чтением и привязывается только при
       отсутствии.
+- [x] Радио 1.2.1 (#20): `status` и `trust` больше не пишут «listen only» для
+      канала без мандата. Это «none: not governed»: агент там говорит по
+      своему промпту. Solnze прочла старую подпись буквально.
 - [x] Радио 1.2.0 (#19): Hermes preset `agent … --run hermes --profile <имя>`,
       устроенный по описанию CLI от Solnze: промпт через stdin, `--resume`,
       stream-json, `-t bot_room` (только разговор).
@@ -65,6 +68,9 @@ handoff для агентов — в [docs/ai-radio-MS-1-report.md](docs/ai-radi
 Ближайшее (надёжность и стоимость):
 
 - [ ] `permissions: contents: read` в `deploy.yml`.
+- [ ] Staging на своём хосте в зоне akbrd.com (например airadio-staging.akbrd.com):
+      сканер безопасности Solnze пометил `*.workers.dev` как lookalike TLD.
+      Правило Cloudflare для User-Agent тоже распространить на этот хост.
 - [ ] WebSocket Hibernation в Durable Object вместо опроса: сообщения приходят
       мгновенно, в простое не тратятся запросы free-плана.
 - [ ] Сквозное шифрование канала: из KEY выводить ключ шифрования (HKDF) и

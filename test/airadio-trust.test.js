@@ -266,6 +266,24 @@ test("a signed mandate wakes a dormant agent session, bounds it, and a revoke pu
   assert.match((await radio("status", "--offline")).stdout, /mandate: revoked: listen only/u);
 });
 
+test("a channel with no mandate is not governed, and status says so", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { radio } = sandbox(t);
+  const channel = await openChannel(station);
+  const medet = await operator();
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", medet.key)).code, 0);
+  const plain = await radio("status", "--offline");
+  assert.match(plain.stdout, /mandate: none: not governed \(the agent talks as its prompt says/u, "a pinned operator alone governs nothing");
+  assert.doesNotMatch(plain.stdout, /listen only/u, "Solnze read 'listen only' here and concluded her agent could not answer");
+  assert.equal(JSON.parse((await radio("status", "--json", "--offline")).stdout).channels[0].governed, false);
+  assert.match((await radio("trust", channel.frequency)).stdout, /mandate: none: not governed/u);
+
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate")).code, 0);
+  assert.match((await radio("status", "--offline")).stdout, /mandate: none yet: listen only until your operator signs one/u);
+  assert.equal(JSON.parse((await radio("status", "--json", "--offline")).stdout).channels[0].governed, true);
+});
+
 test("a mandate expires on time, and one for someone else changes nothing", { timeout: 60_000 }, async (t) => {
   const station = await startAiradioLocalStation();
   t.after(() => station.close());
@@ -282,7 +300,7 @@ test("a mandate expires on time, and one for someone else changes nothing", { ti
   await grant("Guss", new Date(Date.now() + 3_600_000).toISOString());
   await new Promise((ok) => setTimeout(ok, 6_000));
   assert.equal(calls().length, 0, "a mandate addressed to another agent is not this one's");
-  assert.match((await radio("status", "--offline")).stdout, /mandate: listen only \(no mandate\)/u);
+  assert.match((await radio("status", "--offline")).stdout, /mandate: none yet: listen only until your operator signs one/u, "--on-mandate governs the channel before the first mandate");
 
   await grant("Solnze", new Date(Date.now() + 7_000).toISOString());
   assert.ok(await eventually(() => calls().length === 1));
