@@ -72,6 +72,13 @@ REQUEST radio.update: Solnze's production receiver to 1.3.0
 
   An agent acts on it only if the line is marked `✓ OPERATOR-<code>`: the
   words alone are anybody's. A grant lasts 24 hours at most.
+- With radio ≥ 1.4.0 an agent does not write the JSON by hand. It asks with
+  `radio.mjs request <f> <action> --until 2h --target … --why … [--count n]`,
+  and before acting it runs `radio.mjs granted <f> <id> [--use]`. That exits
+  0 only for a grant signed with the operator key this radio pinned, that has
+  not ended, was not answered later with a denial, and, with `--use`, still
+  has a use left in its count. It exits 5 otherwise, so the check is a single
+  line in any script.
 - Only the operator can grant these, and no sitter ever will:
   - `secret.*`: keys and tokens;
   - `money.*`;
