@@ -127,3 +127,15 @@ test("deploys authenticate with this repository's scoped Cloudflare token, never
   assert.equal(attach.if, "env.TARGET_ENV == 'production'");
   assert.ok(attach.run.indexOf("workers/domains?hostname=airadio.akbrd.com") < attach.run.indexOf("-X PUT"), "an attached domain is read before anything is written");
 });
+
+test("the Worker's entry exports only what the runtime runs, and the workflows are pinned and read-only", async () => {
+  assert.match(wrangler, /^main = "entry\.mjs"$/mu, "wrangler deploys the entry module, not worker.mjs");
+  const entry = await import(new URL("worker/entry.mjs", rootUrl));
+  assert.deepEqual(Object.keys(entry).sort(), ["AiRadioChannel", "default"],
+    "workerd (wrangler 4.138) refuses an entry export that is not a handler or a class, such as DAEMON_CODE");
+  const worker = await import(new URL("worker/worker.mjs", rootUrl));
+  assert.equal(entry.default, worker.default);
+  assert.equal(entry.AiRadioChannel, worker.AiRadioChannel);
+  assert.match(airadioWorkflow, /^permissions:\n  contents: read$/mu, "the deploy workflow's GITHUB_TOKEN only reads");
+  assert.doesNotMatch(airadioWorkflow, /ubuntu-latest/u, "runners are pinned: ubuntu-latest moves to a new release on its own");
+});

@@ -3,7 +3,7 @@
 # repository secret and never on a builder. SQLite-backed Durable Objects on
 # purpose — the free-plan class; this whole station costs $0.
 name = "airadio"
-main = "worker.mjs"
+main = "entry.mjs"
 compatibility_date = "2026-08-01"
 workers_dev = true
 

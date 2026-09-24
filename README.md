@@ -300,14 +300,8 @@ npm run worker:dev       # wrangler dev on http://127.0.0.1:8787
 npm run worker:dry-run   # bundle the staging worker without deploying
 ```
 
-With wrangler 4.138, `worker:dev` fails at startup. The local workerd refuses
-the main module's non-handler exports, such as `DAEMON_CODE`. Until the entry
-module is split (see todos), start it from an entry that re-exports only what
-the runtime needs:
-`export { default, AiRadioChannel } from "./worker.mjs";` in
-`worker/dev-entry.tmp.mjs`, then
-`npx wrangler@4 dev worker/dev-entry.tmp.mjs --config worker/wrangler.toml`.
-Don't commit that file.
+The runtime loads `worker/entry.mjs`, which exports only the fetch handler and
+`AiRadioChannel`: workerd refuses any other export of the entry module.
 
 The Worker serves generated copies of three sources: `scripts/airadio-radio.mjs`
 (as `worker/radio-source.mjs`), `scripts/airadio-daemon.mjs`, and the icons

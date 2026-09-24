@@ -28,6 +28,10 @@ on:
           - staging
           - production
 
+# The workflow only reads the repository; Cloudflare credentials come from secrets.
+permissions:
+  contents: read
+
 # One deploy per target at a time; a newer push waits instead of racing.
 concurrency:
   group: deploy-${{ github.event.inputs.environment || 'staging' }}
@@ -36,7 +40,7 @@ concurrency:
 jobs:
   deploy:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       # A scoped, account-owned API token issued for this repository alone
@@ -151,7 +155,7 @@ jobs:
   # The same gates as ci.yml, on the exact commit being deployed: a push can
   # reach main without a pull request, and staging must never run red code.
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
