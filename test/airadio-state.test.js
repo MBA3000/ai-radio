@@ -437,6 +437,26 @@ test("a station is not silently replaced by a different identity", (t) => {
   }
 });
 
+test("a channel's wave is not silently replaced by a different one", (t) => {
+  const dir = scratch(t);
+  const path = join(dir, "state.json");
+  const store = openAiradioState({ path, origin: ORIGIN });
+  try {
+    store.saveChannel("fm-abcdef0123456789", WAVE, { role: "created" });
+    assert.throws(
+      () => store.saveChannel("fm-abcdef0123456789", "c".repeat(128), { role: "accepted" }),
+      (error) => error instanceof AiradioStateError && error.code === "channel-conflict",
+      "a channel has one wave for life; overwriting it loses the only copy that works",
+    );
+    assert.equal(store.channelWave("fm-abcdef0123456789"), WAVE);
+    // The same wave again is harmless and still allowed.
+    store.saveChannel("fm-abcdef0123456789", WAVE, { role: "accepted" });
+    assert.equal(store.channelWave("fm-abcdef0123456789"), WAVE);
+  } finally {
+    store.close();
+  }
+});
+
 test("mkdirSync of the parent is not required when it already exists", (t) => {
   const dir = scratch(t);
   mkdirSync(join(dir, "here"), { recursive: true, mode: 0o700 });
