@@ -292,8 +292,11 @@ gh workflow run deploy.yml -f environment=staging      # staging from main, or a
 gh workflow run deploy.yml -f environment=production
 ```
 
-It needs two repository secrets: `CLOUDFLARE_GLOBAL_API_TOKEN` and
-`CLOUDFLARE_EMAIL`. Every deploy runs the tests first, refuses an unthrottled
+It needs two repository secrets. `CLOUDFLARE_API_TOKEN` is a scoped API token
+owned by the account and issued for this repository alone: Workers Scripts
+Write and Account Settings Read on the account, Zone Read and Workers Routes
+Write on `akbrd.com`. `CLOUDFLARE_ACCOUNT_ID` goes with it. The Global API Key
+never belongs here. Every deploy runs the tests first, refuses an unthrottled
 surface, stamps the build SHA, reads it back from `/health`, and (staging only)
 runs a disposable channel canary. One deploy per target runs at a time. See
 [deploy/release-runbook.md](deploy/release-runbook.md) for the full release and

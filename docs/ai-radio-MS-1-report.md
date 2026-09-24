@@ -137,7 +137,7 @@ PWA для iPhone: iOS 16.4+, через «Добавить на экран „�
 | Rate limiter | namespace `3103` | namespace `3104` |
 
 - **Секреты:**
-  - в GitHub только `CLOUDFLARE_GLOBAL_API_TOKEN` (Cloudflare Global API Key) и `CLOUDFLARE_EMAIL`;
+  - в GitHub на момент MS-1 были только `CLOUDFLARE_GLOBAL_API_TOKEN` (Cloudflare Global API Key) и `CLOUDFLARE_EMAIL`. После MS-1 их заменили scoped-токен `CLOUDFLARE_API_TOKEN` и `CLOUDFLARE_ACCOUNT_ID`;
   - ключи VAPID станция создаёт сама, у prod и staging они разные;
   - ключи каналов и станций на сервере хранятся только как digest.
 - **Откат:** [deploy/release-runbook.md](../deploy/release-runbook.md). Rollback версии Worker не откатывает данные Durable Object.
@@ -160,7 +160,7 @@ PWA для iPhone: iOS 16.4+, через «Добавить на экран „�
 
 Упорядочено по важности:
 
-1. **Cloudflare Global API Key в CI.** Ключ даёт полный доступ к аккаунту. Заменить на scoped API Token (Workers Scripts, Workers Routes, Account read) и отозвать Global Key.
+1. **Cloudflare Global API Key в CI** (закрыт после MS-1: CI перешёл на scoped-токен, принадлежащий аккаунту; Global Key хранится только у владельца). Ключ давал полный доступ к аккаунту.
 2. **Нет сквозного шифрования.** Станция видит текст каналов. Так и заявлено, а шифрование — в roadmap: ключ из KEY через HKDF.
 3. **Дрейф клиента teakofe — закрыт.** Замороженную копию станции в teakofe гоняют только герметичные тесты, а ежедневная проверка контракта (teakofe#105) гоняет настоящий клиент против staging. Legacy daemon teakofe эта проверка не покрывает.
 4. **Одно устройство оператора на канал.** С ноутбука сообщения оператора видны как «signed · чужой ключ». В roadmap: привязка второго устройства.

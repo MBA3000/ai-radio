@@ -112,3 +112,18 @@ test("pushes to main deploy only staging, after the tests, one deploy per target
     assert.ok(testJob.includes(`run: ${command}`), `the deploy's test job runs ${command}`);
   }
 });
+
+test("deploys authenticate with this repository's scoped Cloudflare token, never the Global API Key", () => {
+  assert.match(airadioWorkflow, /^      CLOUDFLARE_API_TOKEN: \$\{\{ secrets\.CLOUDFLARE_API_TOKEN \}\}$/mu);
+  assert.match(airadioWorkflow, /^      CLOUDFLARE_ACCOUNT_ID: \$\{\{ secrets\.CLOUDFLARE_ACCOUNT_ID \}\}$/mu);
+  assert.doesNotMatch(airadioWorkflow, /X-Auth-Key|X-Auth-Email|CLOUDFLARE_API_KEY|CLOUDFLARE_EMAIL|GLOBAL_API/u, "no Global API Key and no email+key pair");
+  const verify = named(airadioSteps, "verify the credential");
+  assert.ok(verify && index(airadioSteps, "verify the credential") < index(airadioSteps, "deploy the worker"));
+  assert.match(verify.run, /-z "\$CLOUDFLARE_API_TOKEN"/u, "an unset token is refused locally");
+  assert.match(verify.run, /-z "\$CLOUDFLARE_ACCOUNT_ID"/u, "an unset account is refused locally");
+  assert.match(verify.run, /\/accounts\/\$CLOUDFLARE_ACCOUNT_ID\/tokens\/verify/u, "an account-owned token verifies at its account");
+  assert.match(verify.run, /"\$STATUS" != "active"/u);
+  const attach = named(airadioSteps, "attach airadio.akbrd.com");
+  assert.equal(attach.if, "env.TARGET_ENV == 'production'");
+  assert.ok(attach.run.indexOf("workers/domains?hostname=airadio.akbrd.com") < attach.run.indexOf("-X PUT"), "an attached domain is read before anything is written");
+});
