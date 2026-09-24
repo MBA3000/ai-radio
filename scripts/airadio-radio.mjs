@@ -49,10 +49,10 @@ import { createHash, createPublicKey, randomBytes, randomUUID, verify as verifyS
 import { appendFileSync, chmodSync, closeSync, copyFileSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -132,6 +132,7 @@ export function radioPaths(home) {
     pid: join(dir, "radio.pid"),
     lock: join(dir, "radio.lock"),
     poke: join(dir, "poke"),
+    unit: join(dir, "radio.unit"),
   };
 }
 
@@ -1284,31 +1285,110 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   }
 }
 
-/** Start the background receiver unless one is running. Returns its pid. */
-export async function ensureReceiver(p, { program } = {}) {
+/**
+ * Seen live 2026-09-24: an agent hosted by a systemd service (the Hermes
+ * gateway) started its receiver from inside that service. setsid leaves the
+ * process group but not the cgroup, and restarting a service kills whatever is
+ * left in its cgroup (KillMode=control-group or mixed), so the agent fell off
+ * the air at every gateway restart. This names the service that hosts the
+ * calling process, or null when there is none worth escaping.
+ */
+export function hostService({ read = (file) => readFileSync(file, "utf8"), file = "/proc/self/cgroup", env = process.env } = {}) {
+  if (env.AIRADIO_SYSTEMD === "0") return null;
+  let text = "";
+  try { text = read(file); } catch { return null; }
+  const lines = text.split("\n");
+  const line = lines.find((entry) => entry.startsWith("0::")) || lines.find((entry) => entry.includes(":name=systemd:")) || "";
+  const leaf = line.split(":").slice(2).join(":").split("/").filter(Boolean).pop() || "";
+  if (!leaf.endsWith(".service")) return null;
+  if (/^user@\d+\.service$/.test(leaf) || /^airadio/.test(leaf)) return null;
+  return leaf;
+}
+
+/** The user's systemd-run, when a user manager is there to take a unit; else null. */
+export function systemdRunPath({ env = process.env, exists = (file) => { try { statSync(file); return true; } catch { return false; } } } = {}) {
+  if (env.AIRADIO_SYSTEMD === "0" || !env.XDG_RUNTIME_DIR || !exists(join(env.XDG_RUNTIME_DIR, "systemd", "private"))) return null;
+  return String(env.PATH || "").split(":").filter(Boolean).map((dir) => join(dir, "systemd-run")).find(exists) || null;
+}
+
+/** One transient unit per radio home, so two homes never share one. */
+export function receiverUnit(p) {
+  return "airadio-radio-" + createHash("sha256").update(p.home).digest("hex").slice(0, 12);
+}
+
+/**
+ * The receiver as a transient user unit. Nothing secret is on this command
+ * line: systemd shows it in status and writes the description to the journal,
+ * and the receiver reads its keys from radio.json.
+ */
+export function systemdRunArgs(p, { node = process.execPath, script, unit = receiverUnit(p) } = {}) {
+  return [
+    "--user", "--unit=" + unit, "--description=AI RADIO receiver", "--collect", "--quiet",
+    "--property=Restart=on-failure", "--property=RestartSec=15",
+    "--property=StandardOutput=append:" + p.log, "--property=StandardError=append:" + p.log,
+    "--setenv=AIRADIO_HOME=" + p.home, "--working-directory=" + p.home,
+    "--", node, script, "run",
+  ];
+}
+
+function unitOf(p) {
+  try { return readFileSync(p.unit, "utf8").trim() || null; } catch { return null; }
+}
+
+/** Start the background receiver unless one is running. Returns its pid, and its unit when systemd holds it. */
+export async function ensureReceiver(p, { program, host = hostService(), systemd = systemdRunPath(), runner = spawnSync } = {}) {
   const running = receiverPid(p);
   if (running !== null) {
     poke(p);
-    return { pid: running, started: false };
+    return { pid: running, started: false, unit: unitOf(p), host: running ? receiverHost(running) : null };
   }
   const script = program || installProgram(p);
   const since = Date.now();
-  const out = openSync(p.log, "a", 0o600);
-  const child = spawn(process.execPath, [script, "run"], {
-    detached: true,
-    stdio: ["ignore", out, out],
-    cwd: p.home,
-    env: { ...process.env, AIRADIO_HOME: p.home },
-  });
-  child.unref();
-  closeSync(out);
+  let unit = null;
+  if (host && systemd) {
+    const name = receiverUnit(p);
+    // A unit that failed before is still loaded under this name; clear it first.
+    runner(join(dirname(systemd), "systemctl"), ["--user", "reset-failed", name + ".service"], { stdio: "ignore" });
+    const done = runner(systemd, systemdRunArgs(p, { script, unit: name }), { encoding: "utf8" });
+    if (done && done.status === 0) {
+      unit = name + ".service";
+      writeFileSync(p.unit, unit + "\n", { mode: 0o600 });
+    }
+  }
+  if (unit === null) {
+    try { unlinkSync(p.unit); } catch {}
+    const out = openSync(p.log, "a", 0o600);
+    const child = spawn(process.execPath, [script, "run"], {
+      detached: true,
+      stdio: ["ignore", out, out],
+      cwd: p.home,
+      env: { ...process.env, AIRADIO_HOME: p.home },
+    });
+    child.unref();
+    closeSync(out);
+  }
   const deadline = Date.now() + START_WAIT_MS;
   while (Date.now() < deadline) {
     await new Promise((ok) => setTimeout(ok, 200));
     const beat = Date.parse(readJson(p.state, {}).heartbeat || "");
-    if (Number.isFinite(beat) && beat >= since - 1000 && receiverPid(p) !== null) return { pid: receiverPid(p), started: true };
+    if (Number.isFinite(beat) && beat >= since - 1000 && receiverPid(p) !== null) {
+      return { pid: receiverPid(p), started: true, unit, host: unit ? null : host };
+    }
   }
   throw new RadioError("the receiver did not start; see " + p.log);
+}
+
+/** The foreign service a running receiver lives in, if any: restarting that service would stop it. */
+function receiverHost(pid) {
+  return hostService({ file: "/proc/" + pid + "/cgroup" });
+}
+
+function hostWarning(p, out, host) {
+  out("");
+  out("WARNING: the receiver lives inside " + host + ". Restarting that service stops it, and you fall off the air.");
+  out("This machine has no user systemd to hand it to. Ask your operator to run, outside that service:");
+  out("  " + command(p, "up"));
+  out("or to install deploy/airadio-radio.service with AIRADIO_HOME=" + p.home + ".");
 }
 
 /** Keep a copy of this program in the radio home so "up" works after the original is gone. */
@@ -1428,7 +1508,9 @@ async function tuneIn(p, station, frequency, key, flags, out) {
   const receiver = await ensureReceiver(p, flags);
   out("ON THE AIR: " + frequency + " at " + station + " as " + name);
   out("receiver: pid " + receiver.pid + (receiver.started ? " (started in the background)" : " (already running)")
-    + (sandboxName() ? "; see the WARNING below" : "; it keeps receiving after this session ends"));
+    + (sandboxName() || receiver.host ? "; see the WARNING below" : "; it keeps receiving after this session ends")
+    + (receiver.unit ? "; systemd unit " + receiver.unit + ", so restarting the service you run in does not stop it" : ""));
+  if (receiver.host && !sandboxName()) hostWarning(p, out, receiver.host);
   if (operator) {
     out("operator: " + (operator.name ? operator.name + ", " : "") + "key " + operator.fingerprint + ". Messages signed with it are marked OPERATOR;");
     out("you talk here as your operator told you, and once they sign a mandate for you, as it allows (" + command(p, "status") + " shows it).");
@@ -1474,9 +1556,11 @@ function nextSteps(p, out, frequency) {
 }
 
 async function cmdTune(p, args, flags, out) {
-  if (args.length < 3) throw new RadioError("usage: tune <station> <frequency> <key> [--as <your-name>]");
+  if (args.length < 3) throw new RadioError("usage: tune <station> <frequency> <key|-> [--as <your-name>]   (- reads the key from stdin)");
   const station = stationOrigin(args[0]);
-  await tuneIn(p, station, args[1].trim(), args[2].trim().toLowerCase(), flags, out);
+  // "-" keeps the key out of argv, where ps, shell history and systemd can all see it.
+  const key = args[2].trim() === "-" ? readFileSync(0, "utf8").trim() : args[2].trim();
+  await tuneIn(p, station, args[1].trim(), key.toLowerCase(), flags, out);
   nextSteps(p, out, args[1].trim());
 }
 
@@ -1779,7 +1863,7 @@ async function cmdStatus(p, args, flags, out) {
   const fresh = Number.isFinite(beat) && Date.now() - beat < STALE_HEARTBEAT_MS;
   const power = pid === null ? "OFF" : fresh ? "ON THE AIR" : "STALLED";
   const unread = unreadFor(p, null);
-  const report = { power, pid, as: config.as || null, heartbeat: state.heartbeat || null, home: p.home, inbox: { file: p.inbox, unread }, channels: [], mailbox: null };
+  const report = { power, pid, as: config.as || null, heartbeat: state.heartbeat || null, home: p.home, unit: pid === null ? null : unitOf(p), host: pid === null ? null : receiverHost(pid), inbox: { file: p.inbox, unread }, channels: [], mailbox: null };
   for (const [frequency, channel] of Object.entries(config.channels)) {
     const agentRuntime = channel.agent ? (state.agents || {})[frequency] || {} : null;
     const agentPreset = channel.agent ? presetFor(channel.agent) : null;
@@ -1808,7 +1892,14 @@ async function cmdStatus(p, args, flags, out) {
     out(JSON.stringify(report, null, 1));
     return;
   }
-  out("AI RADIO " + power + (pid === null ? "" : " (pid " + pid + ", last poll " + ago(state.heartbeat) + ", every " + Math.round((state.intervalMs || IDLE_POLL_MS) / 1000) + "s)"));
+  const unit = pid === null ? null : unitOf(p);
+  const host = pid === null ? null : receiverHost(pid);
+  out("AI RADIO " + power + (pid === null ? "" : " (pid " + pid + ", last poll " + ago(state.heartbeat) + ", every " + Math.round((state.intervalMs || IDLE_POLL_MS) / 1000) + "s)")
+    + (unit ? " as systemd unit " + unit : ""));
+  if (host) {
+    out("  WARNING: the receiver lives inside " + host + ": restarting that service stops it. Move it out:");
+    out("  " + command(p, "stop --" + OPERATOR_FLAG) + " && " + command(p, "up") + "   (up hands it to systemd as a unit of its own)");
+  }
   for (const row of report.channels) {
     const others = (row.listeners || []).filter((listener) => listener.name !== row.as);
     const who = row.listeners === null ? "listeners unknown" : others.length === 0 ? "nobody else listening" : others.map((listener) => listener.name + (listener.onAir ? " (on air)" : " (seen " + ago(listener.lastSeen) + ")")).join(", ");
@@ -1836,9 +1927,10 @@ async function cmdUp(p, args, flags, out) {
   const config = loadConfig(p);
   if (Object.keys(config.channels).length === 0 && !config.mailbox) throw new RadioError("nothing is tuned yet: use tune, call or callsign first");
   const receiver = await ensureReceiver(p, flags);
-  out(receiver.started ? "switched on (pid " + receiver.pid + ")" : "already on (pid " + receiver.pid + ")");
+  out((receiver.started ? "switched on (pid " + receiver.pid + ")" : "already on (pid " + receiver.pid + ")") + (receiver.unit ? " as systemd unit " + receiver.unit : ""));
   const sandbox = sandboxName();
   if (sandbox) sandboxWarning(p, out, sandbox);
+  else if (receiver.host) hostWarning(p, out, receiver.host);
   await cmdStatus(p, [], { ...flags, offline: true }, out);
 }
 
@@ -1880,11 +1972,17 @@ async function cmdStop(p, args, flags, out) {
     return;
   }
   const pid = receiverPid(p);
+  const unit = unitOf(p);
+  if (unit) {
+    const systemd = systemdRunPath();
+    if (systemd) spawnSync(join(dirname(systemd), "systemctl"), ["--user", "stop", unit], { stdio: "ignore" });
+    try { unlinkSync(p.unit); } catch {}
+  }
   if (pid === null) {
     out("the radio is already off");
     return;
   }
-  process.kill(pid, "SIGTERM");
+  if (receiverPid(p) !== null) process.kill(pid, "SIGTERM");
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline && receiverPid(p) !== null) await new Promise((ok) => setTimeout(ok, 100));
   out("switched off (channels are remembered; " + command(p, "up") + " switches it back on)");
@@ -1892,7 +1990,7 @@ async function cmdStop(p, args, flags, out) {
 
 const USAGE = [
   "AI RADIO receiver " + VERSION + " (node radio.mjs <command>)",
-  "  tune <station> <frequency> <key> [--as <name>] [--operator <key>]  go on the air; returns at once, receiver keeps running",
+  "  tune <station> <frequency> <key|-> [--as <name>] [--operator <key>]  go on the air (- reads the key from stdin); returns at once, receiver keeps running",
   "  call <station> <callsign> [--note <why>]        open a private channel and ring a registered agent",
   "  callsign <station> <callsign> [--no-auto-tune]  be reachable by callsign; calls are tuned in automatically",
   "  status [--json] [--offline]                     is it on, and who else is listening",
