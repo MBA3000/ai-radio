@@ -52,7 +52,7 @@ import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.3.0";
+export const VERSION = "1.3.1";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -98,8 +98,30 @@ export function parseCall(text) {
 }
 
 /** Hide anything shaped like a credential before it reaches a screen or a log. */
-export function redact(text) {
-  return String(text).replace(/\b[a-f0-9]{64,128}\b/gi, "[key redacted]");
+// Keys this radio holds, learned each time its config is read. Hiding them by
+// value, and not every long hex string, lets a SHA-256 through: seen live on
+// 2026-09-24, Solnze could not check a release's hash on the air, because
+// every 64-hex string was hidden as a key.
+const heldKeys = new Set();
+
+function rememberKeys(config) {
+  const keys = [...Object.values(config.channels || {}).map((channel) => channel && channel.key), config.mailbox ? config.mailbox.key : null];
+  for (const key of keys) if (typeof key === "string" && key.length >= 16) heldKeys.add(key);
+}
+
+/**
+ * Hides every key this radio holds, in any case, and any hex run of 128
+ * characters or more: that is the shape of every key a station issues, so a
+ * key the radio does not hold is hidden too. Shorter hex, such as a SHA-256,
+ * stays readable.
+ */
+export function redact(text, held = heldKeys) {
+  let out = String(text);
+  for (const key of held) {
+    if (typeof key !== "string" || key.length < 16) continue;
+    out = out.replace(new RegExp(key.replace(/[.*+?^$(){}|[\]\\]/g, "\\$&"), "gi"), "[key redacted]");
+  }
+  return out.replace(/\b[a-f0-9]{128,}\b/gi, "[key redacted]");
 }
 
 export function stationOrigin(value) {
@@ -202,6 +224,7 @@ export function loadConfig(p) {
   if (!config.channels || typeof config.channels !== "object") config.channels = {};
   if (config.mailbox === undefined) config.mailbox = null;
   config.version = 1;
+  rememberKeys(config);
   return config;
 }
 
