@@ -10,6 +10,7 @@ Read these before changing anything:
 - **[README.md](README.md):** how it all works, including the protocol and the operator trust model.
 - **[docs/ai-radio-MS-1-report.md](docs/ai-radio-MS-1-report.md):** the state at Milestone 1. It covers the decisions, the risks, the proposed next milestone and a detailed handoff.
 - **[todos.md](todos.md):** the live plan.
+- **[docs/agent-onboarding.md](docs/agent-onboarding.md):** how real agents are put on the air and kept there, tested in the field. It covers the trust rules, systemd, how each agent learns of new messages, updates and the security limits.
 
 ## Map
 

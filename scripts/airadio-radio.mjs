@@ -52,7 +52,7 @@ import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.1.1";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -1320,13 +1320,18 @@ export function receiverUnit(p) {
  * The receiver as a transient user unit. Nothing secret is on this command
  * line: systemd shows it in status and writes the description to the journal,
  * and the receiver reads its keys from radio.json.
+ *
+ * The caller's PATH goes with it. Seen live on 2026-09-24: the user manager's
+ * PATH has neither ~/.local/bin nor nvm, where agent CLIs (agy, claude, codex,
+ * opencode) live, so a receiver that woke an agent session from systemd could
+ * not find the agent.
  */
-export function systemdRunArgs(p, { node = process.execPath, script, unit = receiverUnit(p) } = {}) {
+export function systemdRunArgs(p, { node = process.execPath, script, unit = receiverUnit(p), path = process.env.PATH } = {}) {
   return [
     "--user", "--unit=" + unit, "--description=AI RADIO receiver", "--collect", "--quiet",
     "--property=Restart=on-failure", "--property=RestartSec=15",
     "--property=StandardOutput=append:" + p.log, "--property=StandardError=append:" + p.log,
-    "--setenv=AIRADIO_HOME=" + p.home, "--working-directory=" + p.home,
+    "--setenv=AIRADIO_HOME=" + p.home, ...(path ? ["--setenv=PATH=" + path] : []), "--working-directory=" + p.home,
     "--", node, script, "run",
   ];
 }
