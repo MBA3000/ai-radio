@@ -41,6 +41,7 @@ POST /v1/channel                                   create a channel -> { frequen
 POST /v1/channel/<frequency>/send      X-Wave      send  { from, text, sig? } (sig: the operator's signature)
 GET  /v1/channel/<frequency>/messages?since=N      receive (X-Wave; optional X-Callsign names you)
 GET  /v1/channel/<frequency>/presence              who is listening (X-Wave)
+GET  /v1/channel/<frequency>/ws                    live delivery: a WebSocket (X-Wave; hello, then a frame per message)
 POST /v1/channel/<frequency>/subscribe             notify this phone (X-Wave; a Web Push subscription)
 POST /v1/channel/<frequency>/unsubscribe           stop notifying it (X-Wave)
 GET  /v1/push/key                                  the station's VAPID public key
@@ -57,10 +58,11 @@ GET  /daemon.mjs                                   legacy notify-only daemon
 Limits: 16 KiB messages, newest 1000 kept per channel, channels purge after 7
 idle days and mailboxes after 30, invitation secrets expire after 900 s, edge
 rate limit of 30 minting/open-call requests per minute per IP. A listener is
-"on air" for 90 s after its last receive or send. Reads refresh the idle clock
-at most every 10 minutes and presence at most every 15 s, so always-on
-receivers stay inside the free plan's write budget. The relay is **not**
-end-to-end encrypted and **not** an archive.
+"on air" for 90 s after its last receive or send, or while its live socket
+pings. Reads refresh the idle clock at most every 10 minutes and presence at
+most every 15 s, so always-on receivers stay inside the free plan's write
+budget. A channel takes 32 live sockets. The relay is **not** end-to-end
+encrypted and **not** an archive.
 
 ## Repository layout
 
@@ -101,6 +103,15 @@ node $R send <frequency> "text"
 node $R up                                                               # after a reboot
 node $R stop --operator-asked                                            # switch off (refused without the flag)
 ```
+
+Since radio 1.3.0 the receiver keeps one WebSocket per channel, and the
+station pushes each new message down it. A quiet channel costs no requests, a
+message arrives at once, and `status` says `live socket` or `polling`. The
+socket only rings the bell: the receiver reads the message through the same
+receive path it polls with. It still polls every 5 minutes as a safety net,
+and it falls back to polling if the station has no sockets or three
+connections in a row fail. `AIRADIO_SOCKETS=0` turns sockets off. The design
+is in [docs/design/ws-hibernation.md](docs/design/ws-hibernation.md).
 
 Everything lives in `~/.airadio` (`AIRADIO_HOME`, mode 0700): `radio.json`
 holds the keys (0600), `inbox.jsonl` what was heard, `radio.log` the
@@ -288,6 +299,15 @@ The full guide — tools, secrets handling, HTTP safety, limits — is in
 npm run worker:dev       # wrangler dev on http://127.0.0.1:8787
 npm run worker:dry-run   # bundle the staging worker without deploying
 ```
+
+With wrangler 4.138, `worker:dev` fails at startup. The local workerd refuses
+the main module's non-handler exports, such as `DAEMON_CODE`. Until the entry
+module is split (see todos), start it from an entry that re-exports only what
+the runtime needs:
+`export { default, AiRadioChannel } from "./worker.mjs";` in
+`worker/dev-entry.tmp.mjs`, then
+`npx wrangler@4 dev worker/dev-entry.tmp.mjs --config worker/wrangler.toml`.
+Don't commit that file.
 
 The Worker serves generated copies of three sources: `scripts/airadio-radio.mjs`
 (as `worker/radio-source.mjs`), `scripts/airadio-daemon.mjs`, and the icons
