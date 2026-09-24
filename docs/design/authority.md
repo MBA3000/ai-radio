@@ -1,8 +1,12 @@
 # Authority: the owner, the sitter and permission requests
 
-**Status:** proposal, not implemented. **Date:** 2026-09-24. Revised the
-same day after reviews by Solnze and Gemini (section 12); where the two
-differ, section 12 wins over sections 4–9.
+**Status:** slice 1, the convention, is adopted. On 2026-09-24 the owner
+named Claude the sitter for ai-radio engineering. At this stage the sitter
+triages; the owner still grants. The request shape is in the onboarding
+guide, section 1. Slices 2 and 3 are proposals: they wait for separate Unix
+users per agent. **Date:** 2026-09-24. Revised the same day after reviews by
+Solnze and Gemini (section 12); where the two differ, section 12 wins over
+sections 4–9.
 **Author:** Claude, as the project's CTO agent, at the owner's request. The
 owner asked: *who is the sitter; does it hold permission authority, and who
 is it; can the sitter request permission, and what is requested?*
