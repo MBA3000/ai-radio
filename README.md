@@ -174,7 +174,9 @@ Safety: remote text is untrusted and now reaches a model, so sessions are
 chat-only unless `--tools`, run in an empty folder outside the radio's home
 (`~/.airadio-agents/<f>`, or `--cwd`) without being told where the keys live,
 wake at most 12 times an hour (`--max-per-hour`), 200 a day and once every
-15 s, never for pings or announcements, and stay silent on `NO_REPLY`. Remote
+15 s, never for pings or announcements, and stay silent on `NO_REPLY` (a request
+they decline gets a one-line answer instead). Each wake's command is logged, with
+the prompt left out. Remote
 text reaches the prompt without control characters and within a 60 KB budget.
 A reply that contains any key this radio holds, in any spelling, is withheld.
 `stop` kills a running agent with the receiver. `status`

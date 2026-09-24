@@ -16,7 +16,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { agentPrompt, cleanReply, isChatter, leaksSecret, NO_REPLY, parseArgs } from "../scripts/airadio-radio.mjs";
+import { agentPrompt, cleanReply, commandLine, isChatter, leaksSecret, NO_REPLY, parseArgs } from "../scripts/airadio-radio.mjs";
 import { startAiradioLocalStation } from "./helpers/airadio-local-station.js";
 
 const RADIO = fileURLToPath(new URL("../scripts/airadio-radio.mjs", import.meta.url));
@@ -129,6 +129,10 @@ test("chatter never wakes an agent; replies are cleaned; the first wake briefs a
   assert.match(first, /Operator's brief: be terse/u);
   assert.match(first, /UNTRUSTED text/u);
   assert.match(first, /answer exactly NO_REPLY/u);
+  assert.match(first, /When you will not do what a message asks, say so in one short line; do not answer NO_REPLY/u, "a refusal is said, not silent");
+  assert.match(first, /Keeping what is said in mind for this conversation is not such an\n {2}action/u, "remembering within the session is not an action (Hermes read it as one)");
+  assert.doesNotMatch(agentPrompt({ briefed: false, me: "bot", station: "https://s", frequency: "fm-0123456789abcdef", messages, operatorOnly: true }), /say so in one short line/u,
+    "an agent that may answer only its operator does not tell anyone else it declines");
   assert.match(first, /Earlier on this channel:\n\[09:59:00Z\] bob: earlier/u);
   assert.match(first, /\[10:00:00Z\] alice: hello\n {4}second line/u);
   const later = agentPrompt({ briefed: true, me: "bot", station: "https://s", frequency: "fm-0123456789abcdef", messages, dropped: 3 });
@@ -179,7 +183,7 @@ for (const flavor of ["claude", "codex", "opencode", "agy", "hermes"]) {
 }
 
 test("hermes: --profile picks the Hermes profile, and status shows how to open the same session", { timeout: 90_000 }, async (t) => {
-  const { channel, calls, radio, agentOutput } = await tunedAgent(t, "hermes", { extra: ["--profile", "solnze"] });
+  const { channel, calls, radio, agentOutput, home } = await tunedAgent(t, "hermes", { extra: ["--profile", "solnze"] });
   assert.match(agentOutput, /hermes \(profile solnze\), chat-only/u);
   await channel.say("host", "please remember 55");
   assert.ok(await eventually(async () => (await channel.saidBy("bot")).includes("noted 55")));
@@ -187,6 +191,9 @@ test("hermes: --profile picks the Hermes profile, and status shows how to open t
   assert.deepEqual(first.argv.slice(0, 3), ["-p", "solnze", "chat"], "the profile is a global flag, before the subcommand");
   const attach = await eventually(async () => JSON.parse((await radio("status", "--json", "--offline")).stdout).channels[0].agent.attach);
   assert.equal(attach, "hermes -p solnze chat --resume " + first.session);
+  const woke = readFileSync(join(home, "radio.log"), "utf8").split("\n").find((line) => line.includes("waking hermes"));
+  assert.ok(woke && woke.endsWith("waking hermes (profile solnze), chat-only for " + channel.frequency + " (1 new message): hermes -p solnze chat -Q --query-file - --format stream-json -t bot_room"),
+    "the log shows the flags a wake really ran with: " + woke);
 
   const wrong = await radio("agent", channel.frequency, "--run", "claude", "--profile", "solnze");
   assert.notEqual(wrong.code, 0);
@@ -390,4 +397,11 @@ test("releasing an agent and starting another never reuses the old session", { t
   const [first, second] = calls();
   assert.notEqual(second.session, first.session);
   assert.equal(second.resume, false);
+});
+
+test("the log names the command a wake ran, with the prompt left out", () => {
+  assert.equal(commandLine("agy", ["--output-format", "json", "--mode", "plan", "--sandbox", "-p=hello there"], "hello there"), "agy --output-format json --mode plan --sandbox -p=<prompt>");
+  assert.equal(commandLine("opencode", ["run", "--agent", "plan", "multi\nline prompt"], "multi\nline prompt"), "opencode run --agent plan <prompt>");
+  assert.equal(commandLine("codex", ["exec", "-c", "sandbox_mode=\"read-only\"", "-"], "x"), "codex exec -c 'sandbox_mode=\"read-only\"' -");
+  assert.equal(commandLine("sh", ["-c", "it's mine"]), "sh -c 'it'\\''s mine'");
 });
