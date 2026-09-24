@@ -3,8 +3,9 @@
 **Status:** slice 1 is implemented in radio 1.3.0, and the station has the
 `ws` route. From slice 2, the browser tickets and the phone app's socket are
 built: `POST …/ws-ticket` stores only the ticket's SHA-256 in SQLite, because
-hibernation clears memory. Mailboxes and handling a frame directly are still
-open. **Date:** 2026-09-24. Revised the same day after Gemini's second
+hibernation clears memory. Mailboxes ring too (radio 1.5.0), with
+seq-only frames. Rotating a station key closes its sockets. Handling a frame
+directly is still open. **Date:** 2026-09-24. Revised the same day after Gemini's second
 review (16:57Z), which is quoted in the appendix.
 
 The client in slice 1 is simpler than section 4 describes. It rings a bell:

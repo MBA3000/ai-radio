@@ -323,3 +323,44 @@ test("a browser trades its key for a ticket: one socket, within 10 s, and only t
   assert.equal(await open(stale.body.ticket).opened, false, "a ticket older than 10 s is refused");
   first.ws.close();
 });
+
+test("a callsign's mailbox rings with the seq alone, counts as on air while it pings, and rotating the key closes it", { timeout: 30_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const made = await (await fetch(station.url + "/v1/station", { method: "POST", headers: { "content-type": "application/json" }, body: '{"callsign":"socket-bot"}' })).json();
+  const url = station.url.replace(/^http/u, "ws") + "/v1/station/socket-bot/ws";
+  const refused = new WebSocket(url, { headers: { "X-Wave": "wrong" } });
+  assert.equal(await new Promise((ok) => { refused.onopen = () => ok(true); refused.onerror = () => ok(false); refused.onclose = () => ok(false); }), false, "a wrong station key opens nothing");
+  const frames = [];
+  const ws = new WebSocket(url, { headers: { "X-Wave": made.key } });
+  ws.onmessage = (event) => frames.push(String(event.data));
+  const closed = new Promise((ok) => ws.addEventListener("close", (event) => ok(event.code)));
+  assert.equal(await new Promise((ok) => { ws.onopen = () => ok(true); ws.onerror = () => ok(false); }), true);
+  const call = await (await fetch(station.url + "/v1/station/socket-bot/call", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ from: "caller", text: "ring ring, with a secret inside" }) })).json();
+  await eventually(() => frames.length >= 2);
+  assert.deepEqual(JSON.parse(frames[0]), { type: "hello", lastSeq: 0 });
+  assert.deepEqual(JSON.parse(frames[1]), { type: "message", msg: { seq: call.seq } }, "a mailbox frame carries the seq alone: calls are read with /calls");
+  assert.equal((await (await fetch(station.url + "/v1/station/socket-bot")).json()).onAir, true, "a socket is the mailbox's presence");
+
+  const rotated = await fetch(station.url + "/v1/station/socket-bot/rotate", { method: "POST", headers: { "X-Wave": made.key } });
+  assert.equal(rotated.status, 200);
+  assert.equal(await closed, 4001, "a socket opened with the old key stops ringing");
+});
+
+test("a radio with a callsign hears a call at once over its mailbox socket, without polling the mailbox", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { radio, inbox } = sandbox(t);
+  assert.equal((await radio("callsign", station.url, "quick-bot")).code, 0);
+  const status = async () => JSON.parse((await radio("status", "--json", "--offline")).stdout);
+  assert.equal(await eventually(async () => (await status()).mailbox.delivery === "socket"), true, "the mailbox is on a live socket");
+  assert.match((await radio("status", "--offline")).stdout, /callsign quick-bot .*; live socket/u);
+  const quietFrom = station.reads("station:quick-bot");
+  await wait(6_500);
+  assert.equal(station.reads("station:quick-bot"), quietFrom, "no mailbox reads while nothing happens");
+  const started = Date.now();
+  await fetch(station.url + "/v1/station/quick-bot/call", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ from: "caller", text: "are you there?" }) });
+  assert.ok(await eventually(() => inbox().some((entry) => entry.kind === "mailbox" && entry.text === "are you there?")), "the call reached the inbox");
+  assert.ok(Date.now() - started < 3_000, "at once, not at the next poll");
+  assert.equal(station.reads("station:quick-bot"), quietFrom + 1, "one call, one read");
+});

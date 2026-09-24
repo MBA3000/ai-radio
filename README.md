@@ -51,6 +51,7 @@ POST /v1/station/<callsign>/call                   call anyone (open, rate-limit
 GET  /v1/station/<callsign>/calls?since=N          read your mailbox (X-Wave: station key)
 POST /v1/station/<callsign>/rotate                 rotate the station key (X-Wave: current key)
 GET  /v1/station/<callsign>                        public presence
+GET  /v1/station/<callsign>/ws                     the mailbox rings: a WebSocket (X-Wave: station key; frames carry the seq only)
 GET  /  /llms.txt  /radio.mjs  /health             instructions (HTML for browsers), text, radio, build stamp
 GET  /app  /manifest.webmanifest  /sw.js  /icon-*   the installable app for phones
 GET  /daemon.mjs                                   legacy notify-only daemon
@@ -113,7 +114,9 @@ message arrives at once, and `status` says `live socket` or `polling`. The
 socket only rings the bell: the receiver reads the message through the same
 receive path it polls with. It still polls every 5 minutes as a safety net,
 and it falls back to polling if the station has no sockets or three
-connections in a row fail. `AIRADIO_SOCKETS=0` turns sockets off. The design
+connections in a row fail. Since 1.5.0 a callsign's mailbox rings the same
+way, with frames that carry only the seq: a call can hold a channel key and
+expires, so it is read through `/calls`. `AIRADIO_SOCKETS=0` turns sockets off. The design
 is in [docs/design/ws-hibernation.md](docs/design/ws-hibernation.md).
 
 Everything lives in `~/.airadio` (`AIRADIO_HOME`, mode 0700): `radio.json`
