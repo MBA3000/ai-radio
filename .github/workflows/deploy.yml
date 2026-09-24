@@ -39,8 +39,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_GLOBAL_API_TOKEN }}
-      CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+      # A scoped, account-owned API token issued for this repository alone
+      # (Workers Scripts Write and Account Settings Read on the account; Zone
+      # Read and Workers Routes Write on akbrd.com), never the Global API Key.
+      # Both values are secrets, so the account id is masked in public logs.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       TARGET_ENV: ${{ github.event.inputs.environment || 'staging' }}
     steps:
       - uses: actions/checkout@v7
@@ -50,32 +54,19 @@ jobs:
 
       - name: verify the credential before touching anything
         run: |
-          if [ -z "$CLOUDFLARE_API_KEY" ] || [ -z "$CLOUDFLARE_EMAIL" ]; then
-            echo "::error::CLOUDFLARE_GLOBAL_API_TOKEN and CLOUDFLARE_EMAIL must both be repository secrets. Nothing was deployed."
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID must both be repository secrets. Nothing was deployed."
             exit 1
           fi
-          OK=$(curl -s -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
-            https://api.cloudflare.com/client/v4/user | jq -r '.success')
-          if [ "$OK" != "true" ]; then
-            echo "::error::Cloudflare refused the email+key pair. Nothing was deployed."
+          STATUS=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify" | jq -r '.result.status')
+          if [ "$STATUS" != "active" ]; then
+            echo "::error::Cloudflare did not confirm the API token as active (status: $STATUS). Nothing was deployed."
             exit 1
           fi
 
       - name: refuse an unthrottled surface
         run: npm run airadio:gate
-
-      - name: resolve the account
-        run: |
-          ACCOUNT_ID=$(curl -s -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
-            https://api.cloudflare.com/client/v4/accounts | jq -r '.result[0].id')
-          if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "null" ]; then
-            echo "::error::no Cloudflare account is visible to this credential"
-            exit 1
-          fi
-          # Run logs of a public repository are public: mask the account id
-          # before it reaches GITHUB_ENV, which echoes it in every later step.
-          echo "::add-mask::$ACCOUNT_ID"
-          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
 
       - name: name the target environment
         run: |
@@ -92,7 +83,7 @@ jobs:
 
       - name: resolve the deployed workers.dev address
         run: |
-          SUB=$(curl -s -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
+          SUB=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" | jq -r '.result.subdomain')
           if [ -z "$SUB" ] || [ "$SUB" = "null" ]; then
             echo "::error::could not resolve the workers.dev subdomain"
@@ -132,13 +123,23 @@ jobs:
       - name: attach airadio.akbrd.com when the zone exists
         if: env.TARGET_ENV == 'production'
         run: |
-          ZONE_ID=$(curl -s -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
+          AUTH="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+          # Read first: an attached domain needs no write, so an ordinary
+          # release changes nothing on the zone.
+          ATTACHED=$(curl -s -H "$AUTH" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?hostname=airadio.akbrd.com" \
+            | jq -r '[.result[]? | select(.hostname == "airadio.akbrd.com" and .service == "airadio")] | length')
+          if [ "$ATTACHED" = "1" ]; then
+            echo "airadio.akbrd.com is already attached to airadio" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          ZONE_ID=$(curl -s -H "$AUTH" \
             "https://api.cloudflare.com/client/v4/zones?name=akbrd.com" | jq -r '.result[0].id')
           if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "null" ]; then
             echo "zone akbrd.com is not in this account yet — the station stays on workers.dev" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          RESULT=$(curl -s -X PUT -H "X-Auth-Email: $CLOUDFLARE_EMAIL" -H "X-Auth-Key: $CLOUDFLARE_API_KEY" \
+          RESULT=$(curl -s -X PUT -H "$AUTH" \
             -H "content-type: application/json" \
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" \
             -d "{\"zone_id\":\"$ZONE_ID\",\"hostname\":\"airadio.akbrd.com\",\"service\":\"airadio\",\"environment\":\"production\"}")

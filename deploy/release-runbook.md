@@ -7,8 +7,10 @@ The source of the deployment sequence is
 [the deploy workflow](../.github/workflows/deploy.yml).
 Its production choice also attaches `airadio.akbrd.com` when the zone exists;
 the owner must have authority for that existing domain operation. Credentials
-(`CLOUDFLARE_GLOBAL_API_TOKEN`, `CLOUDFLARE_EMAIL`) live only in this
-repository's Actions secrets. Do not export or rotate them here.
+(`CLOUDFLARE_API_TOKEN`, a scoped account-owned token, and
+`CLOUDFLARE_ACCOUNT_ID`) live only in this repository's Actions secrets. The
+owner issues and rotates the token outside this repository. Do not export,
+rotate or widen it here, and never add the Global API Key.
 Execute from a clean isolated checkout of the exact reviewed release commit.
 
 ## 1. Freeze the candidate and perform local checks

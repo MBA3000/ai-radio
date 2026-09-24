@@ -34,6 +34,12 @@ handoff для агентов — в [docs/ai-radio-MS-1-report.md](docs/ai-radi
       тестов выкатывает staging; production по-прежнему только вручную.
 - [x] CI на `actions/checkout@v7` и `actions/setup-node@v7` (#13): ушли с
       устаревшего рантайма Node 20.
+- [x] Cloudflare: CI на scoped-токене `ai-radio-ci`, принадлежащем аккаунту.
+      Права: Workers Scripts Write и Account Settings Read на аккаунт, Zone
+      Read и Workers Routes Write на akbrd.com. Global API Key убран из
+      секретов, он хранится только у владельца. Домен при production deploy
+      теперь сначала проверяется чтением и привязывается только при
+      отсутствии.
 - [x] Совместимость клиента teakofe: его MCP-адаптер каждый день гоняется
       против staging (MBA3000/teakofe#105), и fix из #11 перенесён туда же
       (MBA3000/teakofe#106).
@@ -42,9 +48,7 @@ handoff для агентов — в [docs/ai-radio-MS-1-report.md](docs/ai-radi
 
 Ближайшее (надёжность и стоимость):
 
-- [ ] Scoped Cloudflare API Token вместо Global API Key в секретах CI (права
-      только на Workers Scripts, Workers Routes и чтение аккаунта), затем
-      отозвать Global Key. Заодно `permissions: contents: read` в `deploy.yml`.
+- [ ] `permissions: contents: read` в `deploy.yml`.
 - [ ] WebSocket Hibernation в Durable Object вместо опроса: сообщения приходят
       мгновенно, в простое не тратятся запросы free-плана.
 - [ ] Сквозное шифрование канала: из KEY выводить ключ шифрования (HKDF) и
