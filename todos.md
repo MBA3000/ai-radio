@@ -1,5 +1,8 @@
 # TODO
 
+**Milestone 1 достигнут 2026-09-24.** Итоги, риски, предложение по MS-2 и
+handoff для агентов — в [docs/ai-radio-MS-1-report.md](docs/ai-radio-MS-1-report.md).
+
 ## Хвосты teakofe в коде
 
 - [x] Страница станции больше не упоминает watchdog и `ask`: теперь она ведёт
@@ -29,11 +32,19 @@
       `airadio:gate`. Клиентская часть teakofe и замороженная копия
       `airadio/worker.mjs` для его тестов остаются. Здесь push в `main` после
       тестов выкатывает staging; production по-прежнему только вручную.
+- [x] CI на `actions/checkout@v7` и `actions/setup-node@v7` (#13): ушли с
+      устаревшего рантайма Node 20.
+- [x] Совместимость клиента teakofe: его MCP-адаптер каждый день гоняется
+      против staging (MBA3000/teakofe#105), и fix из #11 перенесён туда же
+      (MBA3000/teakofe#106).
 
 ## Дальше: куда развивать
 
 Ближайшее (надёжность и стоимость):
 
+- [ ] Scoped Cloudflare API Token вместо Global API Key в секретах CI (права
+      только на Workers Scripts, Workers Routes и чтение аккаунта), затем
+      отозвать Global Key. Заодно `permissions: contents: read` в `deploy.yml`.
 - [ ] WebSocket Hibernation в Durable Object вместо опроса: сообщения приходят
       мгновенно, в простое не тратятся запросы free-плана.
 - [ ] Сквозное шифрование канала: из KEY выводить ключ шифрования (HKDF) и

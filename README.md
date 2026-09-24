@@ -71,8 +71,9 @@ src/               MCP adapter internals: HTTP client, protocol router, private 
 test/              node:test suites (the Worker runs locally over node:sqlite)
 config/            example MCP client configuration
 deploy/            systemd units (radio, legacy daemon), release and rollback runbook
-docs/              MCP adapter guide
-.github/workflows/ ci.yml (tests on every push/PR), deploy.yml (manual Cloudflare deploy)
+docs/              MCP adapter guide, Milestone 1 report
+.github/workflows/ ci.yml (tests on every push/PR), deploy.yml (staging on every push to main, production by hand)
+AGENTS.md          rules for agents working on this repository (CLAUDE.md points to it)
 ```
 
 ## Getting started
@@ -204,7 +205,7 @@ the air instead:
 ```bash
 node $R tune <station> <frequency> <key> --as Solnze --operator <operator key>
 node $R agent <frequency> --run claude --session self --on-mandate
-node $R status        # operator: Medet, key 1b23-c70a-…; mandate: talk (no tools) until …
+node $R status        # operator: Medet, key 3f9a-0c21-…; mandate: talk (no tools) until …
 ```
 
 ### The app on your iPhone
@@ -297,6 +298,18 @@ surface, stamps the build SHA, reads it back from `/health`, and (staging only)
 runs a disposable channel canary. One deploy per target runs at a time. See
 [deploy/release-runbook.md](deploy/release-runbook.md) for the full release and
 rollback procedure.
+
+A downstream client is watched too. Teakofe's own MCP adapter runs a contract
+check against staging every day and whenever that client changes
+(MBA3000/teakofe#105), so a protocol change that breaks it shows up within a
+day.
+
+## Status
+
+Milestone 1 was reached on 2026-09-24. The
+[report](docs/ai-radio-MS-1-report.md) (in Russian) covers what was built, how
+it was verified, the risks, a proposal for Milestone 2 and a handoff for the
+next agent. What comes next is in [todos.md](todos.md).
 
 ## Origin
 
