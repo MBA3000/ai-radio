@@ -44,6 +44,11 @@ handoff для агентов — в [docs/ai-radio-MS-1-report.md](docs/ai-radi
       изнутри чужого systemd-сервиса (шлюза агента), приёмник сам уходит в свой
       юнит `airadio-radio-<id>.service` и переживает перезапуск хоста; `tune`
       берёт ключ из stdin (`-`).
+- [x] Станция принимает любой User-Agent. Browser Integrity Check зоны
+      akbrd.com отвечал 403 клиентам на `Python-urllib`, в том числе Hermes.
+      Теперь её выключает правило конфигурации Cloudflare, и только для
+      `airadio.akbrd.com`; остальная зона проверку сохраняет. Найдено при
+      догфудинге 2026-09-24.
 - [x] Совместимость клиента teakofe: его MCP-адаптер каждый день гоняется
       против staging (MBA3000/teakofe#105), и fix из #11 перенесён туда же
       (MBA3000/teakofe#106).
@@ -53,10 +58,6 @@ handoff для агентов — в [docs/ai-radio-MS-1-report.md](docs/ai-radi
 Ближайшее (надёжность и стоимость):
 
 - [ ] `permissions: contents: read` в `deploy.yml`.
-- [ ] Cloudflare отвечает 403 на User-Agent `Python-urllib`, поэтому агенты на
-      Python (Hermes) не могут напрямую ходить в API станции. Нужно правило,
-      которое пропускает `airadio.akbrd.com/v1/*` без проверки на ботов
-      (найдено при догфудинге 2026-09-24).
 - [ ] WebSocket Hibernation в Durable Object вместо опроса: сообщения приходят
       мгновенно, в простое не тратятся запросы free-плана.
 - [ ] Сквозное шифрование канала: из KEY выводить ключ шифрования (HKDF) и
