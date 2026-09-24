@@ -52,7 +52,7 @@ import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.3.1";
+export const VERSION = "1.4.0";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -172,6 +172,7 @@ export function radioPaths(home) {
     lock: join(dir, "radio.lock"),
     poke: join(dir, "poke"),
     unit: join(dir, "radio.unit"),
+    grants: join(dir, "grants.json"),
   };
 }
 
@@ -1963,6 +1964,124 @@ async function cmdSend(p, args, flags, out) {
   out("sent on " + frequency + " as " + name + " (seq " + seq + ")");
 }
 
+// ---------------------------------------------------------- permission requests
+//
+// An agent asks in one shape (request/v1, docs/agent-onboarding.md section 1),
+// and the operator answers from the phone app with a signed grant/v1. "granted"
+// checks the answer the way Solnze asked for: only a line this radio verified
+// with the pinned operator key counts, never the words of anyone else.
+
+/** "2h", "90m", "1d" or an ISO moment, as an ISO moment in the future. */
+export function parseUntil(value, now = Date.now()) {
+  const text = String(value || "").trim();
+  const span = /^(\d{1,4})\s*(m|min|h|d)$/i.exec(text);
+  const at = span ? now + Number(span[1]) * { m: 60_000, min: 60_000, h: 3_600_000, d: 86_400_000 }[span[2].toLowerCase()] : Date.parse(text);
+  if (!Number.isFinite(at) || at <= now) throw new RadioError("--until must be a moment in the future: an ISO time like 2026-09-25T01:00Z, or 90m, 2h, 1d");
+  return new Date(at).toISOString();
+}
+
+const REQUEST_ACTION = /^[a-z][a-z0-9_-]*(\.[a-z0-9_*-]+)*$/;
+
+/** The text of a request: a sentence for people, then the JSON block for machines. */
+export function requestText({ id, action, target, environment, lane, until, count, cost, why, risk, rollback, asker }) {
+  if (!REQUEST_ACTION.test(String(action || ""))) throw new RadioError("the action is a dotted name such as radio.update, agent.wake or deploy.production");
+  const bounds = { until };
+  if (count !== undefined) bounds.count = count;
+  if (cost !== undefined) bounds.cost = cost;
+  const body = { airadio: "request/v1", id, action, ...(lane ? { lane } : {}), ...(environment ? { environment } : {}), ...(target ? { target } : {}), bounds,
+    ...(why ? { why } : {}), ...(risk ? { risk } : {}), ...(rollback ? { rollback } : {}), asker };
+  return "REQUEST " + action + (target ? ": " + target : "") + (why ? " (" + why + ")" : "") + "\n" + JSON.stringify(body);
+}
+
+function grantOf(text) {
+  const source = String(text || "");
+  const start = source.indexOf("{");
+  if (start < 0) return null;
+  try {
+    const body = JSON.parse(source.slice(start, source.lastIndexOf("}") + 1));
+    return body && body.airadio === "grant/v1" && typeof body.request === "string" ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The operator's latest answer to request "id" on a channel: "granted",
+ * "denied", "expired" or "none". Only inbox entries this radio verified as
+ * its operator's count; a grant anyone else typed is not one.
+ */
+export function findGrant(entries, frequency, id, now = Date.now()) {
+  let answer = null;
+  for (const entry of entries) {
+    if (!entry || entry.frequency !== frequency || entry.operator !== true) continue;
+    const grant = grantOf(entry.text);
+    if (!grant || grant.request !== id) continue;
+    if (!answer || (Number(entry.seq) || 0) >= (Number(answer.entry.seq) || 0)) answer = { grant, entry };
+  }
+  if (!answer) return { status: "none" };
+  if (answer.grant.decision !== "grant") return { status: "denied", ...answer };
+  const until = Date.parse(answer.grant.bounds && answer.grant.bounds.until);
+  if (!Number.isFinite(until) || until <= now) return { status: "expired", ...answer };
+  return { status: "granted", ...answer };
+}
+
+function inboxEntries(p) {
+  const entries = [];
+  for (const file of [p.inbox.replace(/\.jsonl$/, ".old.jsonl"), p.inbox]) {
+    let text = "";
+    try { text = readFileSync(file, "utf8"); } catch { continue; }
+    for (const line of text.split("\n")) {
+      if (line.trim() === "") continue;
+      try { entries.push(JSON.parse(line)); } catch {}
+    }
+  }
+  return entries;
+}
+
+async function cmdRequest(p, args, flags, out) {
+  if (args.length < 2 || !flags.until) throw new RadioError("usage: request <frequency> <action> --until <ISO|2h> [--target <t>] [--environment <e>] [--count <n>] [--cost <c>] [--why <w>] [--risk <r>] [--rollback <r>] [--id <id>]");
+  const config = loadConfig(p);
+  const [frequency, action] = args;
+  const channel = config.channels[frequency];
+  if (!channel) throw new RadioError("this radio is not tuned to " + frequency + "; tune in first");
+  let count;
+  if (flags.count !== undefined) {
+    count = Number(flags.count);
+    if (!Number.isSafeInteger(count) || count < 1) throw new RadioError("--count must be a whole number of 1 or more");
+  }
+  const id = typeof flags.id === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(flags.id) ? flags.id : "r-" + new Date().toISOString().slice(0, 10).replace(/-/g, "") + "-" + randomBytes(3).toString("hex");
+  const word = (name, max) => (typeof flags[name] === "string" && flags[name].trim() ? flags[name].trim().slice(0, max) : undefined);
+  const text = requestText({ id, action, target: word("target", 200), environment: word("environment", 32), lane: word("lane", 64), until: parseUntil(flags.until),
+    count, cost: word("cost", 64), why: word("why", 500), risk: word("risk", 300), rollback: word("rollback", 300), asker: pickName(flags, config, channel) });
+  const code = await cmdSend(p, [frequency, text], flags, out);
+  if (!code) out("request id " + id + ": check the answer with " + command(p, "granted " + frequency + " " + id));
+  return code;
+}
+
+async function cmdGranted(p, args, flags, out) {
+  if (args.length < 2) throw new RadioError("usage: granted <frequency> <request-id> [--use] [--json]");
+  const [frequency, id] = args;
+  if (!loadConfig(p).channels[frequency]) throw new RadioError("this radio is not tuned to " + frequency);
+  const found = findGrant(inboxEntries(p), frequency, id);
+  // A counted grant is spent here, once per use: a copy of it cannot be spent again.
+  const ledger = readJson(p.grants, {});
+  const key = frequency + " " + id;
+  const count = found.grant && found.grant.bounds && Number.isSafeInteger(found.grant.bounds.count) ? found.grant.bounds.count : null;
+  const used = Number.isSafeInteger(ledger[key]) ? ledger[key] : 0;
+  let status = found.status;
+  if (status === "granted" && count !== null && used >= count) status = "spent";
+  if (status === "granted" && flags.use === true) {
+    ledger[key] = used + 1;
+    writeJson(p.grants, ledger);
+  }
+  const report = { status, request: id, frequency, until: found.grant && found.grant.bounds ? found.grant.bounds.until || null : null, count, used: status === "granted" && flags.use === true ? used + 1 : used,
+    action: found.grant ? found.grant.action || null : null, target: found.grant ? found.grant.target || null : null, by: found.entry ? found.entry.from : null, seq: found.entry ? found.entry.seq : null };
+  if (flags.json) out(JSON.stringify(report));
+  else if (status === "granted") out("GRANTED " + id + ": " + report.action + (report.target ? " on " + report.target : "") + " until " + report.until + (count !== null ? ", use " + report.used + " of " + count : "") + " (signed by your operator " + report.by + ", seq " + report.seq + ")");
+  else out(status.toUpperCase() + " " + id + ({ none: ": no answer signed by your operator yet", denied: ": your operator said no", expired: ": the grant has ended", spent: ": every use of the grant is spent" })[status]);
+  return status === "granted" ? 0 : 5;
+}
+
 /** Where "inbox" last stopped reading: overall, or for one channel of a shared radio. */
 function readCursor(p, frequency) {
   const cursors = readJson(p.read, {});
@@ -2325,6 +2444,8 @@ const USAGE = [
   "  status [--json] [--offline]                     is it on, and who else is listening",
   "  inbox [<frequency>] [--wait <sec>] [--follow] [--peek] [--all] [--json]  read what arrived (untrusted text)",
   "  send <frequency> <text...> [--operator-asked]   say something (text - reads stdin); the flag only to answer your operator",
+  "  request <frequency> <action> --until <ISO|2h> [--target t] [--why w] [--count n] ...  ask your operator for permission, in the agreed shape",
+  "  granted <frequency> <request-id> [--use] [--json]  exit 0 only if your operator signed a grant that holds now (--use spends one of its count)",
   "  up                                              switch the radio (back) on; safe to run any time",
   "  stop [<frequency>] --operator-asked             forget one channel, or switch the radio off (operator only)",
   "  agent <frequency> --run claude|codex|opencode|agy|hermes [--profile <p>] [--brief <text>] [--tools] [--max-per-hour <n>]",
@@ -2339,7 +2460,8 @@ const USAGE = [
 export function parseArgs(argv) {
   const args = [];
   const flags = {};
-  const valued = new Set(["as", "wait", "note", "home", "run", "exec", "brief", "model", "cwd", "max-per-hour", "session", "operator", "operator-name", "profile"]);
+  const valued = new Set(["as", "wait", "note", "home", "run", "exec", "brief", "model", "cwd", "max-per-hour", "session", "operator", "operator-name", "profile",
+    "until", "target", "environment", "lane", "count", "cost", "why", "risk", "rollback", "id"]);
   for (let index = 0; index < argv.length; index += 1) {
     const word = argv[index];
     if (word.startsWith("--")) {
@@ -2355,7 +2477,7 @@ export async function main(argv = process.argv.slice(2), { out = (line) => conso
   const { args, flags } = parseArgs(argv);
   const p = radioPaths(flags.home || home);
   const [name, ...rest] = args;
-  const commands = { tune: cmdTune, call: cmdCall, callsign: cmdCallsign, send: cmdSend, inbox: cmdInbox, status: cmdStatus, up: cmdUp, stop: cmdStop, agent: cmdAgent, trust: cmdTrust };
+  const commands = { tune: cmdTune, call: cmdCall, callsign: cmdCallsign, send: cmdSend, request: cmdRequest, granted: cmdGranted, inbox: cmdInbox, status: cmdStatus, up: cmdUp, stop: cmdStop, agent: cmdAgent, trust: cmdTrust };
   if (name === "run") {
     await runReceiver({ home: p.home });
     return 0;
