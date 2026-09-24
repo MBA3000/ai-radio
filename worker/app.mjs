@@ -578,13 +578,14 @@ const SCRIPT = `
         }
         if (typeof seq === "number" && seq > (channel.lastSeq || 0)) pollChannel(channel, true).then(function () { scrollDown(false); });
       };
-      ws.onclose = function () {
+      ws.onclose = ws.onerror = function () {
         if (socket.ws !== ws) return;
         var wasLive = socket.live;
         socket.ws = null;
         socket.live = false;
         clearInterval(socket.pinger);
         if (!wasLive) socket.fails += 1;
+        try { ws.close(); } catch (error) {}
         socketFailed(channel);
       };
     }).catch(function () { socket.fails += 1; socketFailed(channel); });

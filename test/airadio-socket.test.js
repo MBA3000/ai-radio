@@ -54,7 +54,8 @@ function connect(station, channel, { key = channel.wave, name = null } = {}) {
   const ws = new WebSocket(socketUrl(station.url, channel.frequency), { headers: { "X-Wave": key, ...(name ? { "X-Callsign": name } : {}) } });
   const opened = new Promise((ok) => {
     ws.onopen = () => ok(true);
-    ws.onclose = (event) => ok(false, event);
+    ws.onclose = () => ok(false);
+    ws.onerror = () => ok(false);
   });
   const closed = new Promise((ok) => ws.addEventListener("close", (event) => ok(event.code)));
   ws.onmessage = (event) => frames.push(String(event.data));
@@ -307,7 +308,8 @@ test("a browser trades its key for a ticket: one socket, within 10 s, and only t
     const ws = new WebSocket(socketUrl(station.url, channel.frequency) + "?ticket=" + value);
     const frames = [];
     ws.onmessage = (event) => frames.push(String(event.data));
-    return { ws, frames, opened: new Promise((ok) => { ws.onopen = () => ok(true); ws.onclose = () => ok(false); }) };
+    // Node 22 reports a refused handshake with "error" alone.
+    return { ws, frames, opened: new Promise((ok) => { ws.onopen = () => ok(true); ws.onclose = () => ok(false); ws.onerror = () => ok(false); }) };
   };
   const first = open(good.body.ticket);
   assert.equal(await first.opened, true, "a fresh ticket opens a socket");
