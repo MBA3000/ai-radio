@@ -15,6 +15,7 @@ import test from "node:test";
 import { inflateSync } from "node:zlib";
 
 import { b64url, encryptPushPayload, fromB64url, generateVapidKeys, parseSubscription, pushEndpointAllowed, vapidAuthorization } from "../worker/push.mjs";
+import { endInput, mandateEnd, timeLeft } from "../worker/app.mjs";
 import { iconPixels } from "../worker/icon.mjs";
 import { pngPixels, samePixels } from "../scripts/sync-airadio-daemon.mjs";
 import { startAiradioLocalStation } from "./helpers/airadio-local-station.js";
@@ -249,9 +250,11 @@ test("the app installs: manifest, service worker, icons and /app", async (t) => 
   assert.match(csp, /worker-src 'self'/u);
   assert.match(csp, /manifest-src 'self'/u);
   const html = await app.text();
-  for (const must of ['<link rel="manifest" href="/manifest.webmanifest">', '<link rel="apple-touch-icon" href="/apple-touch-icon.png">', 'name="apple-mobile-web-app-capable" content="yes"', "viewport-fit=cover", '<script nonce="' + nonce + '">', "Add to Home Screen", "Sign and send the mandate", "Your operator key", 'data-scope="revoke"', "crypto.subtle.sign", "airadio-signed-v1", "replayed copy", "Could not sign it, so nothing was sent."]) {
+  for (const must of ['<link rel="manifest" href="/manifest.webmanifest">', '<link rel="apple-touch-icon" href="/apple-touch-icon.png">', 'name="apple-mobile-web-app-capable" content="yes"', "viewport-fit=cover", '<script nonce="' + nonce + '">', "Add to Home Screen", "Sign and send the mandate", "Your operator key", 'data-scope="revoke"', "crypto.subtle.sign", "airadio-signed-v1", "replayed copy", "Could not sign it, so nothing was sent.",
+    'type="datetime-local"', 'data-zone="utc"', 'data-hours="744"', "A mandate lasts at most 31 days."]) {
     assert.ok(html.includes(must), must);
   }
+  assert.ok(!html.includes('id="m-for"'), "a mandate ends at a moment you pick, not after a fixed span");
   assert.ok(!/<script(?![^>]*nonce=)/u.test(html));
   new Function(html.slice(html.indexOf('<script nonce="' + nonce + '">') + 49, html.lastIndexOf("</script>")));
 
@@ -259,6 +262,23 @@ test("the app installs: manifest, service worker, icons and /app", async (t) => 
   for (const must of ['<link rel="manifest" href="/manifest.webmanifest">', 'href="/app"', "Share → Add to Home Screen", "A pager for long jobs", "Reachable behind NAT"]) {
     assert.ok(landing.includes(must), must);
   }
+});
+
+test("a mandate ends at an exact moment, picked in your own time or in UTC", () => {
+  assert.equal(mandateEnd("2026-09-25T01:00", true), Date.UTC(2026, 8, 25, 1, 0), "Medet's 'Sep 25 01:00 Zulu'");
+  assert.equal(mandateEnd("2026-09-25T06:00", false), new Date(2026, 8, 25, 6, 0).getTime(), "or the device's own time");
+  assert.equal(mandateEnd("2026-09-25T01:00:30", true), Date.UTC(2026, 8, 25, 1, 0, 30), "seconds, if the picker gives them");
+  for (const bad of ["", null, "2026-09-25", "2026-02-30T10:00", "2026-09-25T25:00", "25.09.2026 01:00"]) {
+    assert.ok(Number.isNaN(mandateEnd(bad, true)), "not a moment: " + bad);
+  }
+  assert.equal(endInput(Date.UTC(2026, 8, 25, 1, 0), true), "2026-09-25T01:00");
+  assert.equal(endInput(mandateEnd("2026-12-31T23:59", false), false), "2026-12-31T23:59", "the device's time goes both ways");
+  assert.equal(timeLeft((20 * 60 + 20) * 60_000), "in 20 h 20 min");
+  assert.equal(timeLeft((7 * 24 + 3) * 3_600_000 + 59_000), "in 7 d 3 h");
+  assert.equal(timeLeft(24 * 3_600_000 - 5_000), "in 1 d", "a picked day reads as a day");
+  assert.equal(timeLeft(31 * 24 * 3_600_000 - 37_000), "in 31 d", "and a picked month as a month");
+  assert.equal(timeLeft(20_000), "in under a minute");
+  assert.equal(timeLeft(0), "already past");
 });
 
 test("the icon is the station's mark: amber on the dark field, centred", () => {

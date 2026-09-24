@@ -195,6 +195,44 @@ a { color: var(--amber); }
 .foot { text-align: center; font-size: 12px; color: var(--muted); margin-top: 28px; }
 `;
 
+/**
+ * When a mandate ends. The sheet's picker holds "YYYY-MM-DDTHH:MM" with no
+ * zone, read as the operator's own time or as UTC. The app runs these exactly
+ * as written here (they are copied into its script), and the tests call them.
+ */
+export function mandateEnd(value, utc) {
+  var match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(value || ""));
+  if (!match) return NaN;
+  var y = Number(match[1]), mo = Number(match[2]) - 1, d = Number(match[3]), h = Number(match[4]), mi = Number(match[5]), sec = Number(match[6] || 0);
+  var at = utc ? Date.UTC(y, mo, d, h, mi, sec) : new Date(y, mo, d, h, mi, sec).getTime();
+  // "2026-02-30" or a clock hour that a daylight-saving jump skipped is not a moment.
+  return endInput(at, utc) === match[0].slice(0, 16) ? at : NaN;
+}
+
+/** The picker's value for a moment, in the operator's own time or in UTC. */
+export function endInput(at, utc) {
+  var date = new Date(at);
+  var pad = function (n) { return (n < 10 ? "0" : "") + n; };
+  return utc
+    ? date.getUTCFullYear() + "-" + pad(date.getUTCMonth() + 1) + "-" + pad(date.getUTCDate()) + "T" + pad(date.getUTCHours()) + ":" + pad(date.getUTCMinutes())
+    : date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) + "T" + pad(date.getHours()) + ":" + pad(date.getMinutes());
+}
+
+/** How long until then, the way a person says it: "in 20 h 20 min", "in 7 d 3 h". */
+export function timeLeft(ms) {
+  if (!(ms > 0)) return "already past";
+  var minutes = Math.round(ms / 60000);
+  // A day or more reads in whole hours; less than that, in minutes.
+  if (minutes >= 1440) {
+    var hours = Math.round(ms / 3600000);
+    return "in " + Math.floor(hours / 24) + " d" + (hours % 24 ? " " + (hours % 24) + " h" : "");
+  }
+  var parts = [];
+  if (minutes >= 60) parts.push(Math.floor(minutes / 60) + " h");
+  if (minutes % 60) parts.push((minutes % 60) + " min");
+  return "in " + (parts.length ? parts.join(" ") : "under a minute");
+}
+
 const SCRIPT = `
 (function () {
   "use strict";
@@ -690,6 +728,40 @@ const SCRIPT = `
   });
 
   var mandateScope = "talk";
+  var untilUtc = store.untilZone === "utc";
+  var MANDATE_MAX_MS = 31 * 24 * 3600000;
+  ${mandateEnd.toString()}
+  ${endInput.toString()}
+  ${timeLeft.toString()}
+  function showUntil() {
+    var now = Date.now();
+    var at = mandateEnd($("m-until").value, untilUtc);
+    $("m-until-label").textContent = untilUtc ? "UNTIL, UTC" : "UNTIL, YOUR TIME";
+    Array.prototype.forEach.call(document.querySelectorAll("[data-zone]"), function (button) { button.classList.toggle("active", (button.getAttribute("data-zone") === "utc") === untilUtc); });
+    $("m-until").min = endInput(now, untilUtc);
+    $("m-until").max = endInput(now + MANDATE_MAX_MS, untilUtc);
+    $("m-left").textContent = isFinite(at) ? "= " + endInput(at, !untilUtc).replace("T", " ") + (untilUtc ? " your time" : " UTC") + " · " + timeLeft(at - now) : "";
+  }
+  function setUntil(at) {
+    // Down to the minute, so "31 days" is never a minute too long.
+    $("m-until").value = endInput(Math.floor(at / 60000) * 60000, untilUtc);
+    showUntil();
+  }
+  Array.prototype.forEach.call(document.querySelectorAll("[data-zone]"), function (button) {
+    button.addEventListener("click", function () {
+      var at = mandateEnd($("m-until").value, untilUtc);
+      untilUtc = button.getAttribute("data-zone") === "utc";
+      store.untilZone = untilUtc ? "utc" : "local";
+      save();
+      if (isFinite(at)) $("m-until").value = endInput(at, untilUtc);
+      showUntil();
+    });
+  });
+  Array.prototype.forEach.call(document.querySelectorAll("[data-hours]"), function (button) {
+    button.addEventListener("click", function () { setUntil(Date.now() + Number(button.getAttribute("data-hours")) * 3600000); });
+  });
+  $("m-until").addEventListener("input", showUntil);
+  $("m-until").addEventListener("change", showUntil);
   Array.prototype.forEach.call(document.querySelectorAll("[data-scope]"), function (button) {
     button.addEventListener("click", function () {
       mandateScope = button.getAttribute("data-scope");
@@ -708,7 +780,12 @@ const SCRIPT = `
     if (mandateScope === "revoke") {
       text = "\u270d Mandate for " + to + " revoked: listen only from now on.";
     } else {
-      mandate.until = new Date(Date.now() + (Number($("m-for").value) || 24) * 3600000).toISOString();
+      var until = mandateEnd($("m-until").value, untilUtc);
+      var now = Date.now();
+      if (!isFinite(until)) { toast("Pick the date and time the mandate ends."); return; }
+      if (until < now + 60000) { toast("The end must be at least a minute from now."); return; }
+      if (until > now + MANDATE_MAX_MS) { toast("A mandate lasts at most 31 days."); return; }
+      mandate.until = new Date(until).toISOString();
       text = "\u270d Mandate for " + to + ": " + (mandateScope === "tools" ? "talk and use tools" : "talk (no tools)") + " until " + mandate.until.slice(0, 16).replace("T", " ") + " UTC";
     }
     if (note) {
@@ -745,6 +822,9 @@ const SCRIPT = `
     names.textContent = "";
     heardNames.concat(["*"]).forEach(function (name) { var option = document.createElement("option"); option.value = name; names.appendChild(option); });
     if (!$("m-to").value && heardNames.length === 1) $("m-to").value = heardNames[0];
+    var shown = mandateEnd($("m-until").value, untilUtc);
+    if (!isFinite(shown) || shown <= Date.now()) setUntil(Date.now() + 24 * 3600000);
+    else showUntil();
     sheet("sheet-channel");
   });
   $("sheet-channel").addEventListener("submit", function (event) {
@@ -970,7 +1050,12 @@ export function renderApp({ nonce }) {
     <label class="field">AGENT<input id="m-to" list="m-names" maxlength="64" autocapitalize="off" spellcheck="false" placeholder="Solnze, or * for everyone"></label>
     <datalist id="m-names"></datalist>
     <div class="segmented three"><button type="button" data-scope="talk" class="active">Talk</button><button type="button" data-scope="tools">Talk + tools</button><button type="button" data-scope="revoke">Revoke</button></div>
-    <label class="field" id="m-for-row">FOR<select id="m-for"><option value="1">1 hour</option><option value="8">8 hours</option><option value="24" selected>24 hours</option><option value="168">7 days</option></select></label>
+    <div id="m-for-row">
+      <div class="segmented"><button type="button" data-zone="local" class="active">Your time</button><button type="button" data-zone="utc">UTC</button></div>
+      <label class="field"><span id="m-until-label">UNTIL, YOUR TIME</span><input id="m-until" type="datetime-local" step="60"></label>
+      <p id="m-left"></p>
+      <p class="keyline">Now + <button class="btn small" type="button" data-hours="1">1 h</button><button class="btn small" type="button" data-hours="8">8 h</button><button class="btn small" type="button" data-hours="24">24 h</button><button class="btn small" type="button" data-hours="168">7 d</button><button class="btn small" type="button" data-hours="744">31 d</button></p>
+    </div>
     <label class="field">NOTE (optional)<input id="m-note" maxlength="300" placeholder="Test airadio and report here"></label>
     <button class="btn primary wide" id="m-send" type="button">Sign and send the mandate</button>
     <h3>On this device</h3>

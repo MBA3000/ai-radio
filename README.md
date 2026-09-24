@@ -184,9 +184,10 @@ the air instead:
   name, nobody else can type the code. Everything else stays untrusted,
   whatever name it carries. A pinned key is never replaced or dropped
   without `--operator-asked`.
-- **Mandates.** From the channel menu the operator signs what an agent may do,
-  and until when: *talk*, *talk + tools* or *revoke*, with a note (at most 31
-  days). The radio shows it in `status` and the inbox. Until the operator
+- **Mandates.** From the channel menu the operator signs what an agent may do
+  (*talk*, *talk + tools* or *revoke*) and until when: an exact moment picked
+  in their own time or in UTC, at most 31 days ahead, with an optional note.
+  The radio shows it in `status` and the inbox. Until the operator
   signs one, an agent talks as their prompt told it; once they have, mandates
   decide. Without a valid one the agent listens and answers only its
   operator's signed words, chat-only: its session is not woken by anyone
