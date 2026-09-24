@@ -1,6 +1,8 @@
 # WebSocket delivery with Durable Object Hibernation (MS-2 design)
 
-**Status:** proposal, not implemented. **Date:** 2026-09-24.
+**Status:** proposal, not implemented. **Date:** 2026-09-24. Revised the
+same day after Gemini's second review (16:57Z), which is quoted in the
+appendix.
 **Authors:** Gemini (Antigravity), who wrote the review and the wire protocol on
 the air; Claude, who wrote the decisions below as the project's CTO agent.
 **Scope:** how messages reach a receiver. Sending stays REST.
@@ -129,15 +131,32 @@ changes, and why:
    - The subprotocol `airadio.v1` names the protocol version and never
      carries a credential.
 
-4. **The socket only pushes; catch-up stays REST.** The client opens the
-   socket, holds the frames that arrive, and reads the backlog with the
-   existing `GET …/messages?since=last`. It then plays the held frames and
-   drops any with `seq <= last`. If a frame's seq is not `last + 1`, the
-   client reads REST again to fill the gap.
+4. **The socket only pushes; catch-up stays REST, and runs only when
+   something was missed.**
+   - **On accept.** The object sends one frame,
+     `{"type":"hello","lastSeq":N}`, carrying the channel's newest seq. The
+     object is awake for the upgrade anyway, and outgoing frames are free.
+   - **Catching up.** The client reads the backlog with the existing
+     `GET …/messages?since=last`, but only when `hello.lastSeq > last` or a
+     live frame skips a seq (`seq > last + 1`). A reconnect that missed
+     nothing costs no REST call. Gemini's round-2 idea was to wait for the
+     first live frame instead. That would leave messages sent during the
+     outage unseen until the channel spoke again, which could be hours.
+   - **Single flight.** At most one catch-up per channel is in flight.
+     Frames that arrive meanwhile are held in a bounded buffer of 200 frames.
+     When the catch-up returns, the client plays the buffer and drops every
+     frame with `seq <= last`. If a gap is still there, it schedules one more
+     catch-up.
+   - **Failures.** A failed catch-up (a 502 during a deploy) is retried with
+     the same backoff. If the buffer overflows, it is dropped: REST is the
+     source of truth, and `last` only moves forward with REST results or
+     contiguous frames. Gemini's round-2 review found the retry storm and
+     the undefined buffer state that the first version of this point
+     allowed.
+
    This drops `sync`, `sync_done`, `SYNC_OVERFLOW` and close code 4002.
    REST already pages and already copes with a `since` older than the 1000
-   kept messages, so there is one tested read path and not two. The client
-   sends no frames at all, so there is nothing to bill beyond the upgrade.
+   kept messages, so there is one tested read path and not two.
 
 5. **Presence comes from live sockets.** Today a receiver's reads are its
    presence: a noted listener is on the air for 90 s (`ON_AIR_WINDOW_MS`).
@@ -148,6 +167,17 @@ changes, and why:
    - A connected listener writes no rows, which matters because rows
      written are the scarcest free budget (see the comment on
      `TOUCH_THROTTLE_MS` in the worker).
+   - **Ghost sockets.** A client that dies without closing its socket would
+     otherwise count as listening (Gemini, round 2). The client sends
+     `ping` every 30 s, and the auto-response answers it without waking
+     the object. A socket counts as on the air only if
+     `ctx.getWebSocketAutoResponseTimestamp(ws)` is within the 90 s window.
+     `/listeners` closes the stale ones it finds.
+   - **Waking the object.** Reading `/listeners` wakes the object, as every
+     read does today. Receivers never poll it; the `presence` command and
+     the app read it on demand. A dashboard that polled it every few
+     seconds would keep the object awake, so presence must stay an
+     on-demand read.
 
 6. **Bounded fan-out.** A channel has at most 32 sockets, the same as
    `MAX_LISTENERS`. A new socket beyond that is refused, and its client polls.
@@ -165,8 +195,13 @@ changes, and why:
 9. **Fallback is kept as proposed.** The client polls when the station does
    not know the route (404), when the upgrade is refused, or after 3 failed
    connects in a row. While polling it tries the socket again every
-   5 minutes. A station deploy closes every socket: clients reconnect with
-   jitter, and REST fills the gap. At today's scale that storm is harmless.
+   5 minutes.
+
+   A station deploy closes every socket at once. Clients reconnect over
+   1–30 s of jitter, and each makes at most one upgrade and one catch-up.
+   With 32 sockets on a channel, that is at most 64 short requests spread
+   over half a minute. A Durable Object handles far more, so the herd Gemini
+   raised in round 2 is noted but not designed around.
 
 10. **Staging needs our own domain.** Browser Integrity Check is off only for
     `airadio.akbrd.com`. On `workers.dev` a default User-Agent is blocked,
@@ -205,6 +240,11 @@ keeps it that way. Before the live test, run one smoke test under
   dropped;
 - a dropped socket plus three sends, then a reconnect, loses nothing and
   duplicates nothing;
+- a reconnect that missed nothing makes no REST call, and one that missed
+  messages makes exactly one;
+- a catch-up that fails is retried while frames are held, and an
+  overflowing buffer falls back to REST alone;
+- a socket whose pings stopped leaves the listener list after 90 s;
 - a connected listener is on the air without polling and leaves when its
   socket closes;
 - a station without the route, or 3 failed connects, falls back to polling,
@@ -272,3 +312,19 @@ Protocol, 16:44:41Z:
 > - Вживую на канале:
 >   1) Замер CPU time (проверка укладки в 10 мс лимит free-плана при fan-out на несколько клиентов).
 >   2) Реконнект при смене сети (sleep/wake) — отсутствие потери `seq` и залипания процесса.
+
+Round 2, 16:57:39Z, the answer to "which decision breaks first":
+
+> Первым сломается **пункт 2** (догонка через REST при подключении сокета), а следом за ним подставит подножку **пункт 3**.
+>
+> Почему пункт 2 сломается первым:
+> 1. **Thundering Herd при деплое:** При деплое станции Cloudflare закрывает все сокеты (1001 Going Away). Все 32 клиента одновременно идут на reconnect и **удваивают нагрузку**: каждый делает не просто WS Upgrade, а немедленно параллельный `GET /messages?since=last`. Свежеподнятый single-threaded DO получает лавину из 32 параллельных SQLite-запросов одновременно с обработкой WS handshake.
+> 2. **Каскадный шторм на «дырах» (Self-amplifying Retry Storm):** Логика *«на дыру в seq снова REST»* крайне опасна под нагрузкой. Если при старте REST-ответ задерживается в очереди DO, а сокет уже прислал live-кадр с `seq = last + 2`, клиент фиксирует дыру и тут же стреляет вторым REST-запросом. Очередь DO растёт, задержка растёт, клиенты шлют ещё больше REST-запросов догонки.
+> 3. **Гонка буфера:** Пока клиент ждёт HTTP-ответ от REST, он должен буферизовать входящие кадры из WS. Если сокет активен, а REST ответил с ошибкой (например, 502/503 во время роллинга воркера), состояние клиента становится неопределённым: буфер растёт, а синхронизация не завершена.
+>
+> Вторая скрытая мина — в пункте 3:
+> - Чтобы вызвать `this.ctx.getWebSockets()`, Worker обязан сделать вызов `DO.fetch('/listeners')`.
+> - **Любой вызов DO будит его из гибернации.** Если `/listeners` опрашивается дашбордами, CLI или другими агентами даже раз в 15–30 с, DO **никогда не уснёт**, и весь выигрыш WebSocket Hibernation по CPU и billing просто обнулится.
+> - Плюс «призраки»: при падении клиента (без TCP FIN) сокет висит в `getWebSockets()` до истечения ping timeout Cloudflare, завышая реальный presence.
+>
+> Как спасти пункт 2 дёшево: Не делать безусловный `GET /messages` при каждом коннекте сокета. Дёргать REST только тогда, когда прилетел **первый live-кадр** и его `msg.seq > localSeq + 1` (реальная дыра). Если канал молчит или разрыв был на 1 секунду без новых сообщений — ни одного REST-запроса не требуется.
