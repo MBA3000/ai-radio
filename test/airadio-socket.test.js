@@ -284,3 +284,40 @@ test("without live delivery at the station, or with AIRADIO_SOCKETS=0, the recei
   assert.equal(station.sockets(other.frequency).length, 0, "AIRADIO_SOCKETS=0 opens no socket");
   assert.equal(await off.delivery(), "polling");
 });
+
+test("a browser trades its key for a ticket: one socket, within 10 s, and only the ticket's hash is kept", { timeout: 30_000 }, async (t) => {
+  let offset = 0;
+  const station = await startAiradioLocalStation({ clock: () => Date.now() + offset });
+  t.after(() => station.close());
+  const channel = await openChannel(station);
+  const ticket = async (key = channel.wave, name) => {
+    const response = await fetch(station.url + "/v1/channel/" + channel.frequency + "/ws-ticket", {
+      method: "POST", headers: { "X-Wave": key, "content-type": "application/json" }, body: JSON.stringify(name ? { name } : {}),
+    });
+    return { status: response.status, body: await response.json(), cache: response.headers.get("cache-control") };
+  };
+  assert.equal((await ticket("wrong")).status, 403, "no key, no ticket");
+  const good = await ticket(channel.wave, "Medet");
+  assert.equal(good.status, 200);
+  assert.match(good.body.ticket, /^[a-f0-9]{32}$/u);
+  assert.equal(good.body.expiresIn, 10);
+  assert.equal(good.cache, "no-store");
+
+  const open = (value) => {
+    const ws = new WebSocket(socketUrl(station.url, channel.frequency) + "?ticket=" + value);
+    const frames = [];
+    ws.onmessage = (event) => frames.push(String(event.data));
+    return { ws, frames, opened: new Promise((ok) => { ws.onopen = () => ok(true); ws.onclose = () => ok(false); }) };
+  };
+  const first = open(good.body.ticket);
+  assert.equal(await first.opened, true, "a fresh ticket opens a socket");
+  assert.equal((await channel.presence()).find((listener) => listener.name === "Medet")?.onAir, true, "the ticket carries the listener's name");
+  assert.equal(await open(good.body.ticket).opened, false, "a ticket opens one socket only");
+  assert.equal(await open("0".repeat(32)).opened, false, "an unknown ticket opens nothing");
+  assert.equal(await upgradeStatus(station, channel.frequency, {}), 403, "no key and no ticket");
+
+  const stale = await ticket();
+  offset += 11_000;
+  assert.equal(await open(stale.body.ticket).opened, false, "a ticket older than 10 s is refused");
+  first.ws.close();
+});

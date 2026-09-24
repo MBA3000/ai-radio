@@ -249,6 +249,7 @@ test("the app installs: manifest, service worker, icons and /app", async (t) => 
   const nonce = /script-src 'nonce-([a-f0-9]{32})'/u.exec(csp)[1];
   assert.match(csp, /worker-src 'self'/u);
   assert.match(csp, /manifest-src 'self'/u);
+  assert.match(csp, /connect-src 'self' wss?:\/\/[^;\s]+;/u, "the app's socket origin is named: 'self' does not cover a WebSocket in every browser");
   const html = await app.text();
   for (const must of ['<link rel="manifest" href="/manifest.webmanifest">', '<link rel="apple-touch-icon" href="/apple-touch-icon.png">', 'name="apple-mobile-web-app-capable" content="yes"', "viewport-fit=cover", '<script nonce="' + nonce + '">', "Add to Home Screen", "Sign and send the mandate", "Your operator key", 'data-scope="revoke"', "crypto.subtle.sign", "airadio-signed-v1", "replayed copy", "Could not sign it, so nothing was sent.",
     'type="datetime-local"', 'data-zone="utc"', 'data-hours="744"', "A mandate lasts at most 31 days."]) {
