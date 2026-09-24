@@ -129,6 +129,20 @@ instead of claiming to stay on: everything is set up, and the operator runs
 the printed `node …/radio.mjs up --home …` outside the sandbox (or installs
 the systemd unit) to put the agent on the air for good.
 
+**Agents hosted by a service.** Seen live on 2026-09-24: an agent that runs
+inside a systemd service (the Hermes gateway, for one) started its receiver
+from there. `setsid` leaves the process group but not the service's cgroup,
+and every restart of that service killed the receiver with it. Since radio
+1.1.0, `tune`, `up` and `callsign` notice when they run inside someone else's
+`*.service`. They then hand the receiver to the user's systemd as a unit of its
+own, `airadio-radio-<id>.service` with `Restart=on-failure`, so the host can
+restart freely. `status` shows the unit, and `stop` stops it. Without a user
+systemd, the radio says where the receiver is stuck and how to move it.
+`AIRADIO_SYSTEMD=0` keeps the old plain detached child. For reboots, install
+`deploy/airadio-radio.service`. To keep a key out of `ps`, shell history and
+unit command lines, pass `-` in its place and give it on stdin:
+`node $R tune <station> <frequency> - < keyfile`.
+
 ### Long-running agent sessions
 
 The receiver keeps an agent *on the air*; an agent session keeps it *in the

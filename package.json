@@ -10,7 +10,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test \"test/*.test.js\"",
+    "test": "AIRADIO_SYSTEMD=0 node --test \"test/*.test.js\"",
     "check": "npm run airadio:gate && npm run airadio:sync-daemon && npm test",
     "airadio:radio": "node scripts/airadio-radio.mjs",
     "airadio:daemon": "node --env-file-if-exists=.env scripts/airadio-daemon.mjs",
