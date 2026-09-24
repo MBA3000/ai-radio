@@ -28,7 +28,7 @@ function sandbox(t, { quietMs = "0", extraEnv = {} } = {}) {
   const fake = join(root, "fake");
   const home = join(root, "home");
   for (const dir of [bin, fake, home]) mkdirSync(dir, { recursive: true });
-  for (const flavor of ["claude", "codex", "opencode", "agy"]) {
+  for (const flavor of ["claude", "codex", "opencode", "agy", "hermes"]) {
     writeFileSync(join(bin, flavor), "#!/bin/sh\nexec \"" + process.execPath + "\" \"" + FAKE + "\" " + flavor + " \"$@\"\n");
     chmodSync(join(bin, flavor), 0o755);
   }
@@ -144,9 +144,11 @@ const CHAT_ONLY = {
     && call.argv.includes("mcp_servers={}"),
   opencode: (call) => call.argv.join(" ").includes("--agent plan") && /"bash":"ask"/u.test(call.opencodeConfig || "") && /"external_directory":"ask"/u.test(call.opencodeConfig || ""),
   agy: (call) => call.argv.includes("--mode") && call.argv.includes("plan") && call.argv.includes("--sandbox"),
+  hermes: (call) => call.argv[call.argv.indexOf("-t") + 1] === "bot_room" && call.argv[call.argv.indexOf("--query-file") + 1] === "-"
+    && !call.argv.includes("--yolo") && !call.argv.includes(call.prompt),
 };
 
-for (const flavor of ["claude", "codex", "opencode", "agy"]) {
+for (const flavor of ["claude", "codex", "opencode", "agy", "hermes"]) {
   test(`${flavor}: every wake resumes the same session, so the agent remembers across messages`, { timeout: 90_000 }, async (t) => {
     const { channel, calls, radio, home } = await tunedAgent(t, flavor);
 
@@ -175,6 +177,24 @@ for (const flavor of ["claude", "codex", "opencode", "agy"]) {
     assert.match(inbox.stdout, /AGENT bot: noted 4217/u, "the operator sees what the agent said");
   });
 }
+
+test("hermes: --profile picks the Hermes profile, and status shows how to open the same session", { timeout: 90_000 }, async (t) => {
+  const { channel, calls, radio, agentOutput } = await tunedAgent(t, "hermes", { extra: ["--profile", "solnze"] });
+  assert.match(agentOutput, /hermes \(profile solnze\), chat-only/u);
+  await channel.say("host", "please remember 55");
+  assert.ok(await eventually(async () => (await channel.saidBy("bot")).includes("noted 55")));
+  const [first] = calls().filter((call) => call.flavor === "hermes");
+  assert.deepEqual(first.argv.slice(0, 3), ["-p", "solnze", "chat"], "the profile is a global flag, before the subcommand");
+  const attach = await eventually(async () => JSON.parse((await radio("status", "--json", "--offline")).stdout).channels[0].agent.attach);
+  assert.equal(attach, "hermes -p solnze chat --resume " + first.session);
+
+  const wrong = await radio("agent", channel.frequency, "--run", "claude", "--profile", "solnze");
+  assert.notEqual(wrong.code, 0);
+  assert.match(wrong.stderr, /--profile is for --run hermes/u);
+  const bad = await radio("agent", channel.frequency, "--run", "hermes", "--profile", "../etc");
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.stderr, /--profile must be a Hermes profile name/u);
+});
 
 test("pings, NO_REPLY, key redaction and --off", { timeout: 90_000 }, async (t) => {
   const { channel, calls, radio } = await tunedAgent(t, "claude");

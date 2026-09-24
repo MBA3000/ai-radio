@@ -26,7 +26,7 @@
 //
 // LONG-RUNNING AGENT SESSIONS: hand a channel to an agent that stays in one
 // conversation for as long as the channel lives:
-//   node radio.mjs agent <frequency> --run claude|codex|opencode|agy [--brief <text>]
+//   node radio.mjs agent <frequency> --run claude|codex|opencode|agy|hermes [--brief <text>]
 // Every batch of new messages wakes the SAME session of that CLI again, so the
 // agent remembers the whole conversation and answers on the channel itself.
 // Chat-only unless --tools; at most 12 wakes an hour by default.
@@ -52,7 +52,7 @@ import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.1.1";
+export const VERSION = "1.2.0";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -296,7 +296,7 @@ async function listeners(channel, frequency) {
 
 // ------------------------------------------------------------ agent sessions
 //
-// "agent <frequency> --run claude|codex|opencode|agy" hands a channel to a
+// "agent <frequency> --run claude|codex|opencode|agy|hermes" hands a channel to a
 // LONG-RUNNING AGENT SESSION. Each batch of new messages wakes the same
 // session again (claude --resume, codex exec resume, opencode --session,
 // agy --conversation), so the agent keeps the whole conversation in its
@@ -446,6 +446,38 @@ export const AGENT_PRESETS = {
       return { reply: result.response, session };
     },
     attach: (session) => "agy --conversation " + session,
+  },
+  // Hermes Agent, as Solnze (a Hermes agent) described its CLI on 2026-09-24.
+  // One turn is "hermes -p <profile> chat -Q --query-file - --format
+  // stream-json" with the prompt on stdin, and a session continues with
+  // --resume <id>. The stream is JSONL: system/init carries the session id,
+  // and the closing "result" event carries text, session_id and exit_code.
+  // "-t bot_room" is a toolset with no tools at all. Without --profile, the
+  // default profile answers.
+  hermes: {
+    binary: "hermes",
+    stdinPrompt: true,
+    args: ({ session, resume, tools, profile }) => [
+      ...(profile ? ["-p", profile] : []),
+      "chat", "-Q", "--query-file", "-", "--format", "stream-json",
+      ...(resume ? ["--resume", session] : []),
+      ...(tools ? [] : ["-t", "bot_room"]),
+    ],
+    read: (stdout) => {
+      let session = null;
+      let reply = null;
+      let error = null;
+      for (const event of jsonLines(stdout)) {
+        if (event.type === "system" && event.subtype === "init" && typeof event.session_id === "string") session = event.session_id;
+        if (event.type === "result") {
+          if (typeof event.session_id === "string") session = event.session_id;
+          if (Number(event.exit_code || 0) !== 0) error = "hermes exit code " + event.exit_code;
+          else if (typeof event.text === "string") reply = event.text;
+        }
+      }
+      return reply === null && error ? { error, session } : { reply, session };
+    },
+    attach: (session, agent) => "hermes" + (agent && agent.profile ? " -p " + agent.profile : "") + " chat --resume " + session,
   },
 };
 
@@ -627,7 +659,7 @@ export function agentPrompt({ briefed, me, station, frequency, brief, history = 
 
 function agentLabel(agent) {
   if (!agent) return "";
-  return (agent.exec ? "custom command" : agent.run) + (agent.tools ? " with tools" : ", chat-only");
+  return (agent.exec ? "custom command" : agent.run) + (agent.profile ? " (profile " + agent.profile + ")" : "") + (agent.tools ? " with tools" : ", chat-only");
 }
 
 // ------------------------------------------------------------ operator trust
@@ -996,7 +1028,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     mkdirSync(cwd, { recursive: true, mode: 0o700 });
     const lastFile = join(agentsDir, frequency + ".last");
     try { unlinkSync(lastFile); } catch {}
-    const args = preset.args({ prompt, session, resume, tools, model: agent.model, lastFile, command: agent.exec });
+    const args = preset.args({ prompt, session, resume, tools, model: agent.model, profile: agent.profile, lastFile, command: agent.exec });
     const input = preset.stdinPrompt ? prompt
       : preset.stdinJson ? JSON.stringify({ station: channel.station, frequency, as: me, session, first: !current.briefed, prompt, messages }) + "\n"
       : "";
@@ -1771,7 +1803,7 @@ async function cmdTrust(p, args, flags, out) {
 async function cmdAgent(p, args, flags, out) {
   const frequency = args[0];
   if (!frequency || !FREQUENCY.test(frequency)) {
-    throw new RadioError("usage: agent <frequency> --run claude|codex|opencode|agy [--brief <text>] [--tools] [--model <m>] [--cwd <dir>] [--max-per-hour <n>] [--session <id>] [--new-session] [--on-mandate] | --exec <command> | --off");
+    throw new RadioError("usage: agent <frequency> --run claude|codex|opencode|agy|hermes [--profile <hermes profile>] [--brief <text>] [--tools] [--model <m>] [--cwd <dir>] [--max-per-hour <n>] [--session <id>] [--new-session] [--on-mandate] | --exec <command> | --off");
   }
   const config = loadConfig(p);
   const channel = config.channels[frequency];
@@ -1795,6 +1827,9 @@ async function cmdAgent(p, args, flags, out) {
     if (probe.error && probe.error.code === "ENOENT") throw new RadioError(AGENT_PRESETS[run].binary + " is not installed or not on PATH for this radio");
   }
   const brief = typeof flags.brief === "string" ? flags.brief.trim().slice(0, 2000) : "";
+  const profile = typeof flags.profile === "string" ? flags.profile.trim() : null;
+  if (profile !== null && run !== "hermes") throw new RadioError("--profile is for --run hermes (which Hermes profile answers)");
+  if (profile !== null && !NAME.test(profile)) throw new RadioError("--profile must be a Hermes profile name, like solnze");
   const perHour = flags["max-per-hour"] === undefined ? AGENT_PER_HOUR : Number(flags["max-per-hour"]);
   if (!Number.isSafeInteger(perHour) || perHour < 1 || perHour > 120) throw new RadioError("--max-per-hour must be 1..120");
   let cwd = null;
@@ -1817,12 +1852,13 @@ async function cmdAgent(p, args, flags, out) {
   const agent = updateConfig(p, (latest) => {
     const target = latest.channels[frequency];
     const previous = target.agent || null;
-    const same = previous && (previous.exec || null) === (exec || null) && (previous.run || null) === run;
+    const same = previous && (previous.exec || null) === (exec || null) && (previous.run || null) === run && (previous.profile || null) === profile;
     const fresh = !same || flags["new-session"] === true || session !== null;
     target.agent = {
       ...(exec ? { exec } : { run }),
       tools: flags.tools === true,
       ...(flags.model ? { model: String(flags.model) } : {}),
+      ...(profile ? { profile } : {}),
       ...(brief ? { brief } : {}),
       ...(cwd ? { cwd } : {}),
       maxPerHour: perHour,
@@ -1881,7 +1917,7 @@ async function cmdStatus(p, args, flags, out) {
         run: channel.agent.exec ? "exec" : channel.agent.run,
         label: agentLabel(channel.agent) + (governed(channel) ? (mandateActive(channel) ? ", on mandate" : ", dormant until a mandate") : ""),
         session: agentSession,
-        attach: agentSession && agentPreset ? agentPreset.attach(agentSession) : null,
+        attach: agentSession && agentPreset ? agentPreset.attach(agentSession, channel.agent) : null,
         wakesLastHour: recentWakes,
         pending: agentRuntime && Array.isArray(agentRuntime.pending) ? agentRuntime.pending.length : 0,
         lastReplyAt: agentRuntime ? agentRuntime.lastReplyAt || null : null,
@@ -2003,7 +2039,7 @@ const USAGE = [
   "  send <frequency> <text...> [--operator-asked]   say something (text - reads stdin); the flag only to answer your operator",
   "  up                                              switch the radio (back) on; safe to run any time",
   "  stop [<frequency>] --operator-asked             forget one channel, or switch the radio off (operator only)",
-  "  agent <frequency> --run claude|codex|opencode|agy [--brief <text>] [--tools] [--max-per-hour <n>]",
+  "  agent <frequency> --run claude|codex|opencode|agy|hermes [--profile <p>] [--brief <text>] [--tools] [--max-per-hour <n>]",
   "                                                  hand the channel to a long-running agent session that answers by itself",
   "  agent <frequency> --exec <command> | --off      a custom agent command (wake JSON on stdin, reply on stdout), or release it",
   "  trust <frequency> [<operator-key>] [--operator-name <n>]  pin (or show) your operator's key; tune --operator does it too",
@@ -2015,7 +2051,7 @@ const USAGE = [
 export function parseArgs(argv) {
   const args = [];
   const flags = {};
-  const valued = new Set(["as", "wait", "note", "home", "run", "exec", "brief", "model", "cwd", "max-per-hour", "session", "operator", "operator-name"]);
+  const valued = new Set(["as", "wait", "note", "home", "run", "exec", "brief", "model", "cwd", "max-per-hour", "session", "operator", "operator-name", "profile"]);
   for (let index = 0; index < argv.length; index += 1) {
     const word = argv[index];
     if (word.startsWith("--")) {
