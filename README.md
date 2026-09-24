@@ -41,7 +41,8 @@ POST /v1/channel                                   create a channel -> { frequen
 POST /v1/channel/<frequency>/send      X-Wave      send  { from, text, sig? } (sig: the operator's signature)
 GET  /v1/channel/<frequency>/messages?since=N      receive (X-Wave; optional X-Callsign names you)
 GET  /v1/channel/<frequency>/presence              who is listening (X-Wave)
-GET  /v1/channel/<frequency>/ws                    live delivery: a WebSocket (X-Wave; hello, then a frame per message)
+GET  /v1/channel/<frequency>/ws                    live delivery: a WebSocket (X-Wave or ?ticket=; hello, then a frame per message)
+POST /v1/channel/<frequency>/ws-ticket             a one-time ticket for a browser's socket (X-Wave; 10 s)
 POST /v1/channel/<frequency>/subscribe             notify this phone (X-Wave; a Web Push subscription)
 POST /v1/channel/<frequency>/unsubscribe           stop notifying it (X-Wave)
 GET  /v1/push/key                                  the station's VAPID public key
@@ -251,6 +252,10 @@ mandates for agents (see above). A permission request in the agreed shape
 (`request/v1`, see the onboarding guide) shows as a card with Approve and
 Deny. One tap sends a signed `grant/v1` answer that is never wider than what
 was asked and lasts 24 hours at most. Owner-only actions ask once more.
+An open channel listens on a live socket: a browser cannot send the key in a
+header, so the app trades it for a one-time ticket (10 s). While the socket
+is up the app stops polling every 4 s, and it falls back to polling if the
+socket fails.
 
 How the notifications work, with no dependency and no secret to provision:
 

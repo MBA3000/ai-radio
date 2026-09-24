@@ -54,7 +54,7 @@ import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.4.0";
+export const VERSION = "1.4.1";
 export const ACTIVE_POLL_MS = 5_000;
 export const IDLE_POLL_MS = 30_000;
 const ACTIVE_WINDOW_MS = 120_000;
@@ -374,14 +374,17 @@ export class ChannelSocket {
     }
     this.ws = ws;
     this.state = "connecting";
-    ws.onmessage = (event) => this.heard(event.data);
-    ws.onerror = () => {};
-    ws.onclose = () => {
+    const lost = () => {
       if (this.ws !== ws) return;
       // A socket that never said hello is a failed connection.
       if (this.state !== "live") this.failures += 1;
       this.down();
+      try { ws.close(); } catch {}
     };
+    ws.onmessage = (event) => this.heard(event.data);
+    // Node 22's WebSocket reports a refused handshake with "error" and no "close", so either one counts.
+    ws.onerror = lost;
+    ws.onclose = lost;
   }
 
   heard(data) {

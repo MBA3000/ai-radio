@@ -531,7 +531,65 @@ const SCRIPT = `
   }
 
   // ---------------------------------------------------------------- views
-  function stopTimers() { timers.forEach(clearInterval); timers = []; }
+  function stopTimers() { timers.forEach(clearInterval); timers = []; closeSocket(); }
+
+  // ---------------------------------------------------------------- live socket
+  // While a channel is open, a socket rings as soon as the station hears
+  // something, and the app reads it the usual way. A browser cannot send the
+  // key in a header, so it trades it for a ticket good for one socket, within
+  // 10 s. Any failure falls back to polling every 4 s.
+  var socket = { ws: null, live: false, fails: 0, retry: null, pinger: null };
+  function closeSocket() {
+    clearTimeout(socket.retry);
+    clearInterval(socket.pinger);
+    var ws = socket.ws;
+    socket.ws = null;
+    socket.live = false;
+    if (ws) { try { ws.close(1000); } catch (error) {} }
+  }
+  function socketFailed(channel) {
+    // Polling carries on meanwhile. The socket is tried again after 1 s, 2 s and 4 s, then left alone.
+    if (current !== channel.frequency || socket.fails >= 3) return;
+    clearTimeout(socket.retry);
+    socket.retry = setTimeout(function () { if (current === channel.frequency) openSocket(channel); }, 1000 * Math.pow(2, socket.fails) * (0.75 + Math.random() * 0.5));
+  }
+  function openSocket(channel) {
+    if (!window.WebSocket || socket.ws || socket.fails >= 3) return;
+    var frequency = channel.frequency;
+    api("/v1/channel/" + frequency + "/ws-ticket", { method: "POST", headers: Object.assign(headersFor(channel, false), { "content-type": "application/json" }), body: JSON.stringify({ name: store.name }) }).then(function (got) {
+      if (current !== frequency || socket.ws) return;
+      if (got.status !== 200 || !got.body || typeof got.body.ticket !== "string") { socket.fails += 1; socketFailed(channel); return; }
+      var ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/v1/channel/" + frequency + "/ws?ticket=" + got.body.ticket);
+      socket.ws = ws;
+      ws.onmessage = function (event) {
+        if (socket.ws !== ws) return;
+        var text = String(event.data);
+        if (text === "pong") return;
+        var frame = null;
+        try { frame = JSON.parse(text); } catch (error) { return; }
+        if (!frame) return;
+        var seq = frame.type === "hello" ? frame.lastSeq : frame.type === "message" && frame.msg ? frame.msg.seq : null;
+        if (frame.type === "hello") {
+          socket.live = true;
+          socket.fails = 0;
+          clearInterval(socket.pinger);
+          // The pings keep this phone on the listener list; the station answers them without waking.
+          socket.pinger = setInterval(function () { try { ws.send("ping"); } catch (error) {} }, 30000);
+        }
+        if (typeof seq === "number" && seq > (channel.lastSeq || 0)) pollChannel(channel, true).then(function () { scrollDown(false); });
+      };
+      ws.onclose = ws.onerror = function () {
+        if (socket.ws !== ws) return;
+        var wasLive = socket.live;
+        socket.ws = null;
+        socket.live = false;
+        clearInterval(socket.pinger);
+        if (!wasLive) socket.fails += 1;
+        try { ws.close(); } catch (error) {}
+        socketFailed(channel);
+      };
+    }).catch(function () { socket.fails += 1; socketFailed(channel); });
+  }
   function route() {
     stopTimers();
     var frequency = (location.hash.match(FREQUENCY) || [])[0];
@@ -624,8 +682,12 @@ const SCRIPT = `
       });
     });
     presence(channel);
-    timers.push(setInterval(function () { pollChannel(channel, true).then(function () { scrollDown(false); }); }, 4000));
+    timers.push(setInterval(function () { if (!socket.live) pollChannel(channel, true).then(function () { scrollDown(false); }); }, 4000));
+    // A live socket rings when something is new; this poll is only a safety net.
+    timers.push(setInterval(function () { if (socket.live) pollChannel(channel, true).then(function () { scrollDown(false); }); }, 60000));
     timers.push(setInterval(function () { presence(channel); }, 15000));
+    socket.fails = 0;
+    openSocket(channel);
   }
 
   var shownSeqs = {};
