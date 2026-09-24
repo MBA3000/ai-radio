@@ -108,6 +108,12 @@ test("calls, station addresses, flags and redaction are parsed strictly", () => 
 
   assert.deepEqual(parseArgs(["tune", "s", "f", "k", "--as", "me", "--wait=5", "--json"]), { args: ["tune", "s", "f", "k"], flags: { as: "me", wait: "5", json: true } });
   assert.equal(redact("key " + KEY + " here"), "key [key redacted] here");
+  const sha = "579d2862929bc9987c2e8ef8cb35257e8d335cb6e906f71de5604a3bbcdee7a0";
+  assert.equal(redact("release sha256 " + sha, new Set()), "release sha256 " + sha, "a SHA-256 stays readable on the air (Solnze could not check a release's hash)");
+  const held64 = "0123456789abcdef".repeat(4);
+  assert.equal(redact("mine: " + held64.toUpperCase() + ".", new Set([held64])), "mine: [key redacted].", "a key this radio holds is hidden in any case, whatever its length");
+  assert.equal(redact("x" + "b".repeat(130) + "y", new Set()), "x" + "b".repeat(130) + "y", "hex glued to letters is not a key-shaped word");
+  assert.equal(redact("k=" + "c".repeat(128), new Set()), "k=[key redacted]", "any 128-hex word is hidden, held or not");
 });
 
 test("tune returns at once, survives the death of the session that ran it, answers pings and keeps an inbox", { timeout: 90_000 }, async (t) => {
