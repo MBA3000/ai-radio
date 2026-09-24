@@ -2,8 +2,9 @@
 # explicit workflow_dispatch choice. Every deploy is stamped, read back, and
 # (for preview only) exercised through a disposable channel.
 #
-# Manual dispatch only for now: the same Cloudflare workers (airadio,
-# airadio-staging) were previously deployed from the teakofe repository. Add a
+# Manual dispatch only for now: the teakofe repository still has an active
+# workflow for the same Cloudflare workers (airadio, airadio-staging), and a
+# push there that touches airadio/** redeploys its older copy to staging. Add a
 # push trigger here only after that workflow is retired, so exactly one source
 # of truth deploys the station.
 #   gh workflow run deploy.yml -f environment=staging

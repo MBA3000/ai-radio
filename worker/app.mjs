@@ -4,9 +4,12 @@
  * on notifications for a channel (iOS 16.4+ delivers Web Push to Home Screen
  * apps). It keeps your channels on this device, shows who is listening,
  * lets you talk, and hands out ready prompts that put an agent on the air.
+ * It holds the operator's key: it signs everything sent from here, and the
+ * channel menu signs mandates that say what an agent may do, and until when.
  *
- * Keys stay on the device (localStorage); the station sees them only as the
- * X-Wave header it already requires. Every remote string is rendered as text.
+ * Channel keys stay on the device (localStorage); the station sees them only
+ * as the X-Wave header it already requires. The operator key is a
+ * non-extractable WebCrypto key in IndexedDB: its private half never leaves. Every remote string is rendered as text.
  * Scripts and styles run under a per-response CSP nonce; the service worker
  * caches nothing and intercepts no request — it only shows notifications.
  */

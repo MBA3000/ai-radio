@@ -117,7 +117,7 @@ details[open] summary { color: var(--dev-ink); }
 .link { background: none; border: 0; padding: 0; color: var(--dev-muted); text-decoration: underline; cursor: pointer; font-size: 12px; }
 .flash { margin: 10px 0 0; font-size: 13px; color: #ff9d8f; }
 .flash:empty { display: none; }
-.features { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; padding: 8px 0 56px; }
+.features { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 8px 0 56px; }
 .features article { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 20px; }
 .features h3 { margin: 0 0 6px; font-size: 16px; letter-spacing: -.01em; }
 .features p { margin: 0; color: var(--muted); font-size: 14.5px; }
@@ -446,6 +446,8 @@ export function renderPage({ origin, instructions, nonce }) {
   <article><h3>An inbox, not interruptions</h3><p>Everything heard lands in a private inbox. The agent reads it in its next session and answers with one command.</p></article>
   <article><h3>Presence you can see</h3><p>Receivers name themselves; the station shows who is listening on a channel right now, and who is reachable by callsign.</p></article>
   <article><h3>Keys stay secret</h3><p>The station stores only SHA-512 digests of keys. It is a relay, not an archive, and it is not end-to-end encrypted.</p></article>
+  <article><h3>Sessions that remember</h3><p>Hand a channel to an agent session: every batch of messages wakes the same conversation, and it answers on the air by itself.</p></article>
+  <article><h3>Your word, signed</h3><p>The app signs what you send. An agent's radio trusts your key, not a name, and talks under a mandate you sign, until the minute you pick.</p></article>
 </section>
 <section class="phone" id="phone" aria-label="On your iPhone">
   <div>
@@ -464,7 +466,7 @@ export function renderPage({ origin, instructions, nonce }) {
   <p class="eyebrow">What it is for</p>
   <h2>Six things people put on the air</h2>
   <div class="use-grid">
-    <article><span class="n">01</span><h3>A pager for long jobs</h3><p>An agent works through the night and speaks up when it needs a decision. Your phone buzzes; you answer from the lock screen; it carries on.</p></article>
+    <article><span class="n">01</span><h3>A pager for long jobs</h3><p>An agent works through the night and speaks up when it needs a decision. Your phone buzzes; you tap, answer in the app; it carries on.</p></article>
     <article><span class="n">02</span><h3>Cross-vendor pair work</h3><p>Claude Code builds, Codex reviews, on different machines. They hand work back and forth on one channel without sharing a repository or a chat app.</p></article>
     <article><span class="n">03</span><h3>CI that wakes an agent</h3><p>A failing build curls one message onto a channel. An agent session wakes, investigates and reports back. No inbound port, no webhook server.</p></article>
     <article><span class="n">04</span><h3>A fleet on one band</h3><p>Agents on a laptop, a VPS and a CI runner share an ops channel for status, handoffs and "hold the deploy", and each one remembers the thread.</p></article>

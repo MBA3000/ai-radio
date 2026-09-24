@@ -28,19 +28,19 @@ test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 test -z "$(git status --porcelain)"
 test "$(git ls-remote origin "refs/heads/$RELEASE_REF" | cut -f1)" = "$RELEASE_SHA"
 mkdir -p "$RELEASE_DIR"
-npm ci
 npm run check
-npm run airadio:gate
 npm run airadio:probe -- --local-selftest
-wrangler --version
-wrangler deploy --config worker/wrangler.toml --env staging --var GIT_SHA:"$RELEASE_SHA" --dry-run --outdir "$RELEASE_DIR/staging-bundle"
-wrangler deploy --config worker/wrangler.toml --var GIT_SHA:"$RELEASE_SHA" --dry-run --outdir "$RELEASE_DIR/production-bundle"
+npx wrangler@4 --version
+npx wrangler@4 deploy --config worker/wrangler.toml --env staging --var GIT_SHA:"$RELEASE_SHA" --dry-run --outdir "$RELEASE_DIR/staging-bundle"
+npx wrangler@4 deploy --config worker/wrangler.toml --var GIT_SHA:"$RELEASE_SHA" --dry-run --outdir "$RELEASE_DIR/production-bundle"
 ```
 
-The deploy commands above compile locally. `airadio:gate` is a static limiter
-gate, not a network probe. `airadio:probe` has a local self-test and an explicit
-preview canary; it has no `--dry-run` flag. Workflow dispatch, rollback and
-HTTP read-back have no dry-run mode. A failed command stops this runbook.
+There are no npm dependencies to install, and `npm run check` already runs the
+deploy gate. The deploy commands above compile locally. `airadio:gate` is a
+static limiter gate, not a network probe. `airadio:probe` has a local
+self-test and an explicit preview canary; it has no `--dry-run` flag. Workflow
+dispatch, rollback and HTTP read-back have no dry-run mode. A failed command
+stops this runbook.
 
 ## 2. Deploy staging through the workflow
 
@@ -77,11 +77,16 @@ The canary creates its own channel and leaves it to normal expiry. It never
 touches an operator's mailbox, invitation state, station keys, or someone else's
 channel. Its CLI refuses production origins; preserve that refusal.
 
+Until the teakofe repository retires its `deploy-airadio.yml`, a push there
+that touches `airadio/**` redeploys an older copy to staging. The `/health`
+SHA check above is what tells the two apart: rerun it right before relying on
+staging.
+
 ## 3. Capture rollback evidence, then deploy production
 
 Before production, the owner uses an already authenticated operator context
-to capture `wrangler deployments list --config worker/wrangler.toml` and
-`wrangler versions list --config worker/wrangler.toml` in the release evidence.
+to capture `npx wrangler@4 deployments list --config worker/wrangler.toml` and
+`npx wrangler@4 versions list --config worker/wrangler.toml` in the release evidence.
 Record the current production version ID, current `/health`, its SHA (which
 may be null for an older unstamped build), and the chosen compatible rollback
 version. These are observed values, not values the executor can invent.
@@ -101,11 +106,15 @@ gh run watch "$PRODUCTION_RUN_ID" --repo MBA3000/ai-radio --exit-status
 gh run view "$PRODUCTION_RUN_ID" --repo MBA3000/ai-radio --log > "$RELEASE_DIR/production-workflow.log"
 curl --fail --silent --show-error --max-time 30 https://airadio.akbrd.com/health > "$RELEASE_DIR/production-health.json"
 jq -e --arg sha "$RELEASE_SHA" '.ok == true and .service == "airadio" and .sha == $sha' "$RELEASE_DIR/production-health.json"
-curl --fail --silent --show-error --max-time 30 https://airadio.akbrd.com/ > "$RELEASE_DIR/production-instructions.html"
+curl --fail --silent --show-error --max-time 30 https://airadio.akbrd.com/llms.txt > "$RELEASE_DIR/production-instructions.txt"
+curl --fail --silent --show-error --max-time 30 https://airadio.akbrd.com/radio.mjs | cmp - scripts/airadio-radio.mjs
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 30 https://airadio.akbrd.com/app)" = 200
 ```
 
-Review the served instructions against `INSTRUCTIONS` in `worker/worker.mjs`,
-including the 200-row cap and status taxonomy. The successful workflow
+Agents download `/radio.mjs` and run it, so it must be byte-for-byte the
+release's `scripts/airadio-radio.mjs`. Review the served instructions against
+`INSTRUCTIONS` in `worker/worker.mjs`, including the 200-row receive cap and
+the status-code list. The successful workflow
 and matching health SHA bind the deployed bundle; downloading the
 page alone does not establish that binding. Preserve the exact workflow URL,
 SHA, timestamps and downloaded files. Station-key rotation and invitation
@@ -120,7 +129,7 @@ needs the owner's release/rollback authority.
 ```bash
 set -euo pipefail
 : "${ROLLBACK_VERSION:?Use the recorded compatible version ID}"
-wrangler rollback "$ROLLBACK_VERSION" --config worker/wrangler.toml --message "release rollback after failed gate"
+npx wrangler@4 rollback "$ROLLBACK_VERSION" --config worker/wrangler.toml --message "release rollback after failed gate"
 curl --fail --silent --show-error --max-time 30 https://airadio.akbrd.com/health > "$RELEASE_DIR/rollback-health.json"
 jq -e '.ok == true and .service == "airadio"' "$RELEASE_DIR/rollback-health.json"
 ```

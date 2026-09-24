@@ -83,7 +83,7 @@ async function main() {
     return;
   }
   if (args.length === 1 && args[0] === "--local-selftest") {
-    const child = spawn("npm", ["test", "--", "test/airadio-mcp-interop.test.js"], {
+    const child = spawn(process.execPath, ["--test", "test/airadio-mcp-interop.test.js"], {
       cwd: root,
       env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
       stdio: "inherit",

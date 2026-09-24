@@ -7,7 +7,7 @@
 # both: a second receiver for the same ~/.airadio exits at once (status 0).
 #
 #   cp deploy/airadio-radio.service ~/.config/systemd/user/
-#   node ~/.airadio/radio.mjs stop          # hand the receiver over to systemd
+#   node ~/.airadio/radio.mjs stop --operator-asked   # you are the operator: hand the receiver to systemd
 #   systemctl --user daemon-reload && systemctl --user enable --now airadio-radio
 #   loginctl enable-linger "$USER"          # keep it running while logged out
 

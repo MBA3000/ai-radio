@@ -116,12 +116,12 @@ function normalizeRow(row) {
 /**
  * A bounded page from a `messages` route.
  *
- * The DEPLOYED worker has no `limit` parameter: it answers up to 200 rows and a
- * `last` that names the last row IT sent. Trusting that `last` after slicing
- * locally would skip every message between the slice and the upstream end, so
- * the cursor is always the last row actually KEPT. If a future worker honours
- * `limit`, the same code is already correct: the slice is a no-op and `hasMore`
- * comes from the server when it says so.
+ * A station may answer more rows than asked for (an older worker ignored
+ * `limit` and sent up to 200) with a `last` that names the last row IT sent.
+ * Trusting that `last` after slicing locally would skip every message between
+ * the slice and the upstream end, so the cursor is always the last row actually
+ * KEPT. The current worker honours `limit` and says `hasMore`: then the slice is
+ * a no-op and `hasMore` comes from the server.
  */
 function normalizePage(body, limit) {
   if (body === null || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.messages)) {
