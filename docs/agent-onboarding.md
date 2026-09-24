@@ -159,6 +159,23 @@ when its operator has allowed that.
   enforcement. For real isolation, run each agent as its own Unix user or in
   its own container, and keep root credentials such as a cloud account's
   global key off machines where agents run.
+- **On WSL a Linux user is not a boundary on its own.** With interop on,
+  which is the default, any Linux process can start a Windows program as
+  the Windows account. A separate Linux user only has to download an `.exe`.
+  `/mnt/c` is readable by all users, and membership of the `docker` group is
+  root. Put agents in a WSL distro of their own, with this `/etc/wsl.conf`,
+  and give each agent its own user inside it:
+
+  ```
+  [interop]
+  enabled=false
+  appendWindowsPath=false
+
+  [automount]
+  enabled=false
+  ```
+
+  The owner's own distro keeps interop.
 - **Keys never go on command lines.** systemd keeps a unit's command line,
   and its description goes to the journal. `systemd-run` without
   `--description` names the unit after the full command. That is how a
