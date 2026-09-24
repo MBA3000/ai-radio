@@ -68,14 +68,14 @@ test("the unit is named per radio home and its command line carries nothing secr
   assert.match(receiverUnit(a), /^airadio-radio-[0-9a-f]{12}$/u);
   assert.notEqual(receiverUnit(a), receiverUnit(b), "two homes never share a unit");
   assert.equal(receiverUnit(a), receiverUnit(radioPaths("/home/x/.airadio")), "the same home always gets the same unit");
-  const args = systemdRunArgs(b, { node: "/usr/bin/node", script: b.program, unit: "airadio-radio-0123456789ab" });
+  const args = systemdRunArgs(b, { node: "/usr/bin/node", script: b.program, unit: "airadio-radio-0123456789ab", path: "/home/x/.local/bin:/usr/bin" });
   assert.deepEqual(args, [
     "--user", "--unit=airadio-radio-0123456789ab", "--description=AI RADIO receiver", "--collect", "--quiet",
     "--property=Restart=on-failure", "--property=RestartSec=15",
     "--property=StandardOutput=append:" + b.log, "--property=StandardError=append:" + b.log,
-    "--setenv=AIRADIO_HOME=" + b.home, "--working-directory=" + b.home,
+    "--setenv=AIRADIO_HOME=" + b.home, "--setenv=PATH=/home/x/.local/bin:/usr/bin", "--working-directory=" + b.home,
     "--", "/usr/bin/node", b.program, "run",
-  ]);
+  ], "the caller's PATH goes along: systemd's own PATH lacks ~/.local/bin and nvm, where agent CLIs live");
   assert.ok(!args.some((arg) => /[0-9a-f]{64}|fm-/u.test(arg)), "no key and no frequency: systemd keeps the command line and the description");
 });
 
@@ -107,6 +107,7 @@ test("inside a foreign service the receiver is handed to systemd, and stop stops
   assert.equal(readFileSync(p.unit, "utf8").trim(), receiverUnit(p) + ".service", "the unit is remembered for stop and status");
   assert.deepEqual(calls[0], ["/usr/bin/systemctl", ["--user", "reset-failed", receiverUnit(p) + ".service"]], "a failed leftover of the same name is cleared first");
   assert.deepEqual(calls[1], ["/usr/bin/systemd-run", systemdRunArgs(p, { script: p.program, unit: receiverUnit(p) })]);
+  assert.ok(calls[1][1].includes("--setenv=PATH=" + process.env.PATH), "the receiver keeps the PATH its agent CLIs were found on");
 
   const status = JSON.parse((await radio(home, ["status", "--json", "--offline"])).stdout);
   assert.equal(status.unit, receiverUnit(p) + ".service");

@@ -19,6 +19,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# systemd's PATH has neither ~/.local/bin nor nvm. If "node" lives there, or you hand a
+# channel to an agent session (radio.mjs agent --run agy|claude|codex|opencode), set PATH
+# to include them and/or use node's absolute path in ExecStart, for example:
+# Environment=PATH=%h/.local/bin:%h/.nvm/versions/node/v24.21.0/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/env node %h/.airadio/radio.mjs run
 Restart=on-failure
 RestartSec=15

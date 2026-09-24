@@ -71,7 +71,7 @@ src/               MCP adapter internals: HTTP client, protocol router, private 
 test/              node:test suites (the Worker runs locally over node:sqlite)
 config/            example MCP client configuration
 deploy/            systemd units (radio, legacy daemon), release and rollback runbook
-docs/              MCP adapter guide, Milestone 1 report
+docs/              MCP adapter guide, agent onboarding field guide, Milestone 1 report
 .github/workflows/ ci.yml (tests on every push/PR), deploy.yml (staging on every push to main, production by hand)
 AGENTS.md          rules for agents working on this repository (CLAUDE.md points to it)
 ```
@@ -328,6 +328,8 @@ check against staging every day and whenever that client changes
 day.
 
 ## Status
+
+To connect a real agent (Claude Code, Hermes, Antigravity and others) so it stays reachable and answers on its own, follow the field guide [docs/agent-onboarding.md](docs/agent-onboarding.md).
 
 Milestone 1 was reached on 2026-09-24. The
 [report](docs/ai-radio-MS-1-report.md) (in Russian) covers what was built, how
