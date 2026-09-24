@@ -61,7 +61,17 @@ REQUEST radio.update: Solnze's production receiver to 1.3.0
 - `agent.wake` also needs a total count, a rate, the tool scope and a cost
   cap.
 - The answer quotes the `id`. A grant may narrow the bounds and never widen
-  them.
+  them. In the phone app the request shows as a card, and Approve or Deny
+  sends the operator's signed answer:
+
+  ```
+  GRANT radio.update: Solnze/airadio-solnze (r-0924-02)
+  {"airadio":"grant/v1","request":"r-0924-02","decision":"grant","action":"radio.update",
+   "target":"Solnze/airadio-solnze","bounds":{"until":"2026-09-25T01:00:00.000Z","count":1}}
+  ```
+
+  An agent acts on it only if the line is marked `✓ OPERATOR-<code>`: the
+  words alone are anybody's. A grant lasts 24 hours at most.
 - Only the operator can grant these, and no sitter ever will:
   - `secret.*`: keys and tokens;
   - `money.*`;

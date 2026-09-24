@@ -15,7 +15,7 @@ import test from "node:test";
 import { inflateSync } from "node:zlib";
 
 import { b64url, encryptPushPayload, fromB64url, generateVapidKeys, parseSubscription, pushEndpointAllowed, vapidAuthorization } from "../worker/push.mjs";
-import { endInput, mandateEnd, timeLeft } from "../worker/app.mjs";
+import { answerText, endInput, mandateEnd, parseAnswer, parseRequest, timeLeft } from "../worker/app.mjs";
 import { iconPixels } from "../worker/icon.mjs";
 import { pngPixels, samePixels } from "../scripts/sync-airadio-daemon.mjs";
 import { startAiradioLocalStation } from "./helpers/airadio-local-station.js";
@@ -298,4 +298,35 @@ test("one VAPID signature serves every phone behind the same push service for an
   assert.equal(second, first, "same push service, same token");
   const other = await vapidAuthorization({ endpoint: "https://fcm.googleapis.com/fcm/send/x", vapid, subject: "https://airadio.example" });
   assert.notEqual(other, first, "another push service gets its own audience");
+});
+
+test("a permission request becomes a card, and the operator's answer is a signed grant never wider than asked", () => {
+  const text = 'REQUEST radio.update: Solnze to 1.3.0\n{"airadio":"request/v1","id":"r-0924-02","action":"radio.update","environment":"production",'
+    + '"target":"Solnze/airadio-solnze","bounds":{"until":"2026-09-25T01:00:00Z","count":1},"why":"live sockets","rollback":"bak-1.2.3","asker":"Solnze"}';
+  const request = parseRequest(text);
+  assert.equal(request.id, "r-0924-02");
+  assert.equal(request.action, "radio.update");
+  assert.equal(request.until, "2026-09-25T01:00:00.000Z");
+  assert.equal(request.count, 1);
+  assert.equal(request.ownerOnly, false);
+  assert.equal(parseRequest("just words"), null);
+  assert.equal(parseRequest('{"airadio":"request/v2","id":"x","action":"a"}'), null, "only the agreed shape");
+  assert.equal(parseRequest('{"airadio":"request/v1","id":"x","action":"rm -rf /"}'), null, "an action is a name, not a command");
+  assert.equal(parseRequest('{"airadio":"request/v1","id":"x","action":"secret.roll"}').ownerOnly, true);
+  assert.equal(parseRequest('{"airadio":"request/v1","id":"x","action":"deploy.production"}').ownerOnly, true);
+
+  const now = Date.parse("2026-09-24T20:00:00Z");
+  const grant = answerText(request, "grant", now);
+  assert.match(grant, /^GRANT radio\.update: Solnze\/airadio-solnze \(r-0924-02\)\n/u);
+  const body = JSON.parse(grant.slice(grant.indexOf("{")));
+  assert.deepEqual(body, { airadio: "grant/v1", request: "r-0924-02", decision: "grant", action: "radio.update", target: "Solnze/airadio-solnze",
+    bounds: { until: "2026-09-25T01:00:00.000Z", count: 1 } });
+  const wide = answerText({ ...request, until: "2026-10-30T00:00:00Z" }, "grant", now);
+  assert.equal(JSON.parse(wide.slice(wide.indexOf("{"))).bounds.until, "2026-09-25T20:00:00.000Z", "a grant lasts 24 hours at most");
+  const deny = answerText(request, "deny", now);
+  assert.match(deny, /^DENY radio\.update/u);
+  assert.equal(JSON.parse(deny.slice(deny.indexOf("{"))).bounds, undefined, "a denial grants nothing");
+  assert.deepEqual(parseAnswer(grant), { request: "r-0924-02", decision: "grant" });
+  assert.deepEqual(parseAnswer(deny), { request: "r-0924-02", decision: "deny" });
+  assert.equal(parseAnswer(text), null);
 });

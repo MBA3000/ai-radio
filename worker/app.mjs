@@ -190,6 +190,13 @@ main { flex: 1; padding: 14px 16px calc(var(--bottom) + 24px); }
 .sig.ok { color: var(--on); }
 .sig.bad { color: var(--bad); }
 .msg.mandate { border-left: 3px solid var(--amber); }
+.req { margin: 8px 0 2px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); font-size: 13px; }
+.req dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0 0 8px; }
+.req dt { color: var(--muted); font: 600 11px/1.6 var(--mono); text-transform: uppercase; }
+.req dd { margin: 0; overflow-wrap: anywhere; }
+.req .owner { color: var(--bad); font: 700 11px/1.6 var(--mono); margin-left: 6px; }
+.req .row { display: flex; gap: 8px; }
+.req .done { font: 600 12px/1.6 var(--mono); color: var(--muted); }
 .segmented.three { grid-template-columns: 1fr 1fr 1fr; }
 .sheet h3 { margin: 16px 0 4px; font-size: 16px; }
 .field select { width: 100%; padding: 12px 14px; border-radius: 14px; border: 1px solid var(--line); background: var(--bg); font-size: 16px; color: var(--ink); }
@@ -234,6 +241,71 @@ export function timeLeft(ms) {
   if (minutes >= 60) parts.push(Math.floor(minutes / 60) + " h");
   if (minutes % 60) parts.push((minutes % 60) + " min");
   return "in " + (parts.length ? parts.join(" ") : "under a minute");
+}
+
+/**
+ * A permission request in the shape of docs/agent-onboarding.md, section 1:
+ * a sentence for people, then a JSON block with "airadio":"request/v1".
+ * Returns the fields a card shows, or null when the text is not one.
+ */
+export function parseRequest(text) {
+  var source = String(text || "");
+  var start = source.indexOf("{");
+  var end = source.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  var body;
+  try { body = JSON.parse(source.slice(start, end + 1)); } catch (error) { return null; }
+  if (!body || typeof body !== "object" || body.airadio !== "request/v1") return null;
+  var word = function (value, max) { return typeof value === "string" && value.trim() ? value.trim().slice(0, max) : null; };
+  var id = word(body.id, 64);
+  var action = word(body.action, 64);
+  if (!id || !action || !/^[a-z][a-z0-9_-]*(\.[a-z0-9_*-]+)*$/.test(action)) return null;
+  var bounds = body.bounds && typeof body.bounds === "object" ? body.bounds : {};
+  var until = Date.parse(bounds.until);
+  return {
+    id: id,
+    action: action,
+    target: word(body.target, 200),
+    environment: word(body.environment, 32),
+    until: isFinite(until) ? new Date(until).toISOString() : null,
+    count: typeof bounds.count === "number" && bounds.count >= 1 && bounds.count % 1 === 0 ? bounds.count : null,
+    cost: typeof bounds.cost === "number" ? String(bounds.cost) : word(bounds.cost, 64),
+    why: word(body.why, 500),
+    risk: word(body.risk, 300),
+    rollback: word(body.rollback, 300),
+    asker: word(body.asker, 64),
+    // What no sitter may grant, and what stays with the owner by default (docs/design/authority.md).
+    ownerOnly: /^(secret|money|irreversible|authority)(\.|$)/.test(action) || action === "deploy.production",
+  };
+}
+
+/**
+ * The operator's answer to a request, sent signed: a grant never wider than
+ * what was asked and 24 hours at most, or a denial. Agents check it the way
+ * they check any operator line: by the signature, not by the words.
+ */
+export function answerText(request, decision, now) {
+  var granted = decision === "grant";
+  var answer = { airadio: "grant/v1", request: request.id, decision: granted ? "grant" : "deny", action: request.action };
+  if (request.target) answer.target = request.target;
+  if (granted) {
+    var cap = now + 24 * 3600000;
+    var asked = request.until ? Date.parse(request.until) : NaN;
+    answer.bounds = { until: new Date(isFinite(asked) ? Math.min(asked, cap) : cap).toISOString() };
+    if (request.count) answer.bounds.count = request.count;
+  }
+  return (granted ? "GRANT " : "DENY ") + request.action + (request.target ? ": " + request.target : "") + " (" + request.id + ")\n" + JSON.stringify(answer);
+}
+
+/** The request id and decision in an answer, or null. */
+export function parseAnswer(text) {
+  var source = String(text || "");
+  var start = source.indexOf("{");
+  if (start < 0) return null;
+  var body;
+  try { body = JSON.parse(source.slice(start, source.lastIndexOf("}") + 1)); } catch (error) { return null; }
+  if (!body || body.airadio !== "grant/v1" || typeof body.request !== "string") return null;
+  return { request: body.request, decision: body.decision === "grant" ? "grant" : "deny" };
 }
 
 const SCRIPT = `
@@ -583,7 +655,13 @@ const SCRIPT = `
           return;
         }
         // Green is for this device's own key only: anyone can sign with a key of their own.
-        if (verdict === "you") { badge.className = "sig ok"; badge.textContent = "\u2713 you"; return; }
+        if (verdict === "you") {
+          badge.className = "sig ok";
+          badge.textContent = "\u2713 you";
+          var reply = parseAnswer(message.text);
+          if (reply) markAnswered(reply.request, reply.decision);
+          return;
+        }
         fingerprintOf(message.sig.key).then(function (fingerprint) {
           badge.textContent = "signed \u00b7 " + fingerprint.slice(0, 9);
           badge.title = "signed by key " + fingerprint + ", not this device's";
@@ -592,8 +670,80 @@ const SCRIPT = `
     }
     head.appendChild(el("time", null, clock(message.at)));
     item.appendChild(head);
-    item.appendChild(el("p", null, message.text));
+    // A request or an answer shows its sentence for people; its JSON block is in the card.
+    var request = parseRequest(message.text);
+    var shaped = request || parseAnswer(message.text);
+    var words = shaped ? message.text.slice(0, message.text.indexOf("{")).trim() : message.text;
+    if (words) item.appendChild(el("p", null, words));
+    if (request) item.appendChild(requestCard(request, mine));
     $("log").appendChild(item);
+  }
+
+  // A request in the agreed shape becomes a card: one tap signs the answer.
+  ${parseRequest.toString()}
+  ${answerText.toString()}
+  ${parseAnswer.toString()}
+  var answered = {};
+  var cards = {};
+  function markAnswered(id, decision) {
+    answered[current + ":" + id] = decision;
+    var card = cards[current + ":" + id];
+    if (!card) return;
+    var row = card.querySelector(".row");
+    if (row) row.remove();
+    var note = card.querySelector(".done") || card.appendChild(el("div", "done"));
+    note.textContent = decision === "grant" ? "✓ granted by you" : "✗ denied by you";
+  }
+  function requestCard(request, mine) {
+    var card = el("div", "req");
+    cards[current + ":" + request.id] = card;
+    var list = el("dl");
+    var add = function (label, value) { if (!value) return; list.appendChild(el("dt", null, label)); list.appendChild(el("dd", null, value)); };
+    var action = el("dd", null, request.action);
+    if (request.ownerOnly) action.appendChild(el("span", "owner", "OWNER ONLY"));
+    list.appendChild(el("dt", null, "ask"));
+    list.appendChild(action);
+    add("target", request.target);
+    add("where", request.environment);
+    add("until", request.until ? clock(request.until) + " (" + timeLeft(Date.parse(request.until) - Date.now()) + ")" : "not given: a grant lasts 24 h");
+    add("count", request.count ? String(request.count) : null);
+    add("cost", request.cost);
+    add("why", request.why);
+    add("risk", request.risk);
+    add("rollback", request.rollback);
+    add("from", request.asker);
+    card.appendChild(list);
+    var decided = answered[current + ":" + request.id];
+    var expired = request.until && Date.parse(request.until) <= Date.now();
+    if (decided || mine || expired) {
+      card.appendChild(el("div", "done", decided ? (decided === "grant" ? "✓ granted by you" : "✗ denied by you") : mine ? "your request" : "expired"));
+      return card;
+    }
+    var row = el("div", "row");
+    var answer = function (decision) {
+      if (decision === "grant" && request.ownerOnly && !window.confirm("Grant " + request.action + (request.target ? " on " + request.target : "") + "? It is owner-only: this answer is yours alone.")) return;
+      var channel = find(current);
+      if (!channel) return;
+      operatorReady.then(function (op) {
+        // An unsigned answer grants nothing: agents check the signature, not the words.
+        if (!op) { toast("This browser cannot sign, so nothing was sent."); return; }
+        return sendSigned(channel, answerText(request, decision, Date.now()), null).then(function (got) {
+          if (got.status !== 200) { toast("Not sent (HTTP " + got.status + ")."); return; }
+          markAnswered(request.id, decision);
+          pollChannel(channel, true).then(function () { scrollDown(true); });
+        });
+      }).catch(function () { toast("Not sent: no connection."); });
+    };
+    var yes = el("button", "btn primary small", "Approve");
+    var no = el("button", "btn small", "Deny");
+    yes.type = "button";
+    no.type = "button";
+    yes.addEventListener("click", function () { answer("grant"); });
+    no.addEventListener("click", function () { answer("deny"); });
+    row.appendChild(yes);
+    row.appendChild(no);
+    card.appendChild(row);
+    return card;
   }
   function scrollDown(force) {
     var nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 160;

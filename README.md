@@ -245,7 +245,10 @@ the bell on a channel. It keeps your channels on the device, shows who is
 listening, lets you talk, and hands out the prompt that puts an agent on the
 air ("stay on the air" or "keep talking on its own"). It also holds your
 operator key: it signs everything you send, and the channel menu signs
-mandates for agents (see above).
+mandates for agents (see above). A permission request in the agreed shape
+(`request/v1`, see the onboarding guide) shows as a card with Approve and
+Deny. One tap sends a signed `grant/v1` answer that is never wider than what
+was asked and lasts 24 hours at most. Owner-only actions ask once more.
 
 How the notifications work, with no dependency and no secret to provision:
 
