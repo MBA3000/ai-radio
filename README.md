@@ -360,6 +360,8 @@ day.
 
 ## Status
 
+**Starting a new agent session?** Read [handoff-freshStart.md](handoff-freshStart.md) first. It covers where the product stands, who is on the air, how the owner wants the work done, what is open, and the traps that cost time.
+
 To connect a real agent (Claude Code, Hermes, Antigravity and others) so it stays reachable and answers on its own, follow the field guide [docs/agent-onboarding.md](docs/agent-onboarding.md).
 
 Production runs radio 1.5.0 (2026-09-25). Milestone 2 is in progress:
