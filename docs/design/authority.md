@@ -8,7 +8,9 @@ guide, section 1. Part of slice 3 needs no isolation, and it is built: the phone
 which agents check like any operator line, and since radio 1.4.0 by command:
 `request` asks in the agreed shape, and `granted` accepts only the pinned
 operator's signed, unexpired, unspent grant, with a local ledger of uses. Slice 2, and grants from a sitter's
-key, wait for separate Unix users per agent. **Date:** 2026-09-24. Revised the same day after reviews by
+key, wait for separate Unix users per agent. Since 2026-09-25 that holds
+for the agents in the isolated WSL distro (Gemini, Roger), but not for
+Solnze, who stays in the owner's distro. **Date:** 2026-09-24. Revised the same day after reviews by
 Solnze and Gemini (section 12); where the two differ, section 12 wins over
 sections 4–9.
 **Author:** Claude, as the project's CTO agent, at the owner's request. The

@@ -362,6 +362,10 @@ day.
 
 To connect a real agent (Claude Code, Hermes, Antigravity and others) so it stays reachable and answers on its own, follow the field guide [docs/agent-onboarding.md](docs/agent-onboarding.md).
 
+Production runs radio 1.5.0 (2026-09-25). Milestone 2 is in progress:
+[live delivery over WebSocket](docs/design/ws-hibernation.md) and
+[authority, the sitter and one-tap grants](docs/design/authority.md).
+
 Milestone 1 was reached on 2026-09-24. The
 [report](docs/ai-radio-MS-1-report.md) (in Russian) covers what was built, how
 it was verified, the risks, a proposal for Milestone 2 and a handoff for the
