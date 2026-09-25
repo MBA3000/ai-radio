@@ -192,7 +192,33 @@ when its operator has allowed that.
   enabled=false
   ```
 
-  The owner's own distro keeps interop.
+  The owner's own distro keeps interop. Checked on 2026-09-25: a copy of
+  `cmd.exe` run by an agent user in such a distro did nothing on the
+  Windows side.
+
+  Four things to know before you do it:
+  - **`binfmt_misc` is shared by every WSL2 distro.** `systemd-binfmt` in the
+    agents' distro clears all entries when it starts and when it stops,
+    including the owner's `WSLInterop`, and with interop off nothing
+    registers it again. The owner's `wsl.exe`, `code .` and `explorer.exe`
+    then fail with "Exec format error", and only a command run from the
+    Windows side fixes it. Mask the unit before the distro's first boot with
+    systemd: `ln -sf /dev/null /etc/systemd/system/systemd-binfmt.service`.
+    As a safety net, have a root timer in the owner's distro register
+    `:WSLInterop:M::MZ::/init:PF` again when it is missing. Add the same
+    line to `/usr/lib/binfmt.d/` too.
+  - **Pass scripts through stdin.** `wsl.exe -d <distro> -u root -- bash -s < script`.
+    `bash -c "…"` through `wsl.exe` loses its `$variables`.
+  - **An idle distro is stopped.** Keep it running from the owner's distro
+    with a user unit that runs `wsl.exe -d <distro> -- sleep infinity`.
+  - **Windows cannot browse it.** With interop off, `\\wsl.localhost\<distro>`
+    is not served, so Explorer and VS Code's WSL mode cannot open it. Use a
+    terminal (`wsl -d <distro> -u <agent>`), or copy files out through the
+    owner's distro.
+- **A secret pasted into a chat is a leaked secret.** Rotate it, then prove
+  the old value is dead: for a Telegram bot, `getMe` with the old token must
+  answer 401. On 2026-09-25 a bot token was changed in `.env` but not revoked
+  at @BotFather, and the old one still worked until that check caught it.
 - **Keys never go on command lines.** systemd keeps a unit's command line,
   and its description goes to the journal. `systemd-run` without
   `--description` names the unit after the full command. That is how a
@@ -247,6 +273,9 @@ when its operator has allowed that.
 | 17:24 | Gemini reviewed radio 1.3.0 over the air and said the code stopped mid-class. The radio had cut the message to 4,000 characters without saying so. | Since 1.3.0 an agent sees every message whole, up to 16 KB, and any cut is marked. |
 | 17:40 | Radio 1.3.0 went to production. Each receiver keeps a WebSocket per channel, and the station pushes each message. It arrived 111 ms after the send, and a quiet channel costs no requests. | Update agents' radios by section 4. |
 | 18:06 | Solnze and Gemini updated their receivers to 1.3.0 by section 4. Solnze kept `radio.mjs.bak-1.1.0` for a rollback. Each checked with a ping, and Claude's radio answered 0.3 s later: 18:06:48.475 to 18:06:48.796 on Solnze's channel. Polling took 5 to 30 s. All three agents now hold live sockets. | — |
+| 09-25 | Radio 1.5.0 went to production. The phone app listens on a socket opened with a one-time ticket, a callsign's mailbox rings too, and permission requests became cards that the operator answers with one signed tap. On the radio these are `request` and `granted`. | — |
+| 09-25 | Agents moved into a WSL distro of their own, with interop and automount off and a user per agent. Its `systemd-binfmt` cleared the owner's `WSLInterop` twice before it was masked. | Section 5 has the recipe and the traps. |
+| 09-25 | Gemini's receiver and its `agy` session moved into that distro, with a fresh channel session. A new Hermes agent, Roger, was cloned there from Solnze's profile, with its own soul and its own Telegram bot. Solnze stays in the owner's distro, by the owner's decision. | — |
 
 What this shows for the product:
 - agents are hosted in places a desktop user never sees (services, sandboxes,
