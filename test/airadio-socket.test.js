@@ -233,7 +233,7 @@ test("the idle purge spares a channel someone listens to on a live socket", { ti
   client.ws.close();
 });
 
-test("a receiver on a live socket stops polling, and a message arrives at once with one read", { timeout: 60_000 }, async (t) => {
+test("a receiver on a live socket stops polling, and a message arrives within 1 s with one read", { timeout: 60_000 }, async (t) => {
   const station = await startAiradioLocalStation();
   t.after(() => station.close());
   const channel = await openChannel(station);
@@ -251,7 +251,7 @@ test("a receiver on a live socket stops polling, and a message arrives at once w
   await channel.say("host", "over the socket");
   const heard = await eventually(() => inbox().find((entry) => entry.text === "over the socket"));
   assert.ok(heard, "the message reached the inbox");
-  assert.ok(Date.now() - started < 3_000, "at once, not at the next poll: " + (Date.now() - started) + " ms");
+  assert.ok(Date.now() - started < 1_000, "within 1 s of the send, not at the next poll: " + (Date.now() - started) + " ms");
   assert.equal(station.reads(channel.frequency), quietFrom + 1, "one message, one read");
 
   // A deploy drops every socket; what was said meanwhile is read on reconnect.
@@ -260,6 +260,27 @@ test("a receiver on a live socket stops polling, and a message arrives at once w
   await channel.say("host", "and once more");
   assert.ok(await eventually(() => inbox().some((entry) => entry.text === "and once more")), "the reconnect caught up");
   assert.equal(await eventually(async () => (await delivery()) === "socket" && station.sockets(channel.frequency).length === 1), true);
+  const seqs = inbox().filter((entry) => Number.isSafeInteger(entry.seq)).map((entry) => entry.seq);
+  assert.equal(new Set(seqs).size, seqs.length, "nothing heard twice");
+});
+
+test("when the socket drops and cannot come back, the receiver polls and still hears every message", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const channel = await openChannel(station);
+  const { radio, inbox, delivery } = sandbox(t);
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "bot")).code, 0);
+  assert.equal(await eventually(async () => (await delivery()) === "socket"), true);
+
+  // The station stops taking sockets, then drops the one that is open.
+  station.webSockets(false);
+  station.restart(channel.frequency);
+  await channel.say("host", "said while the socket is down");
+  assert.ok(await eventually(() => inbox().some((entry) => entry.text === "said while the socket is down")), "the poll heard it");
+  assert.equal(await eventually(async () => (await delivery()) === "polling"), true, "the receiver says it polls");
+  assert.equal(station.sockets(channel.frequency).length, 0, "no socket came back");
+  await channel.say("host", "and still heard");
+  assert.ok(await eventually(() => inbox().some((entry) => entry.text === "and still heard")), "polling keeps going");
   const seqs = inbox().filter((entry) => Number.isSafeInteger(entry.seq)).map((entry) => entry.seq);
   assert.equal(new Set(seqs).size, seqs.length, "nothing heard twice");
 });
