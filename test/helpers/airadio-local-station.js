@@ -276,6 +276,7 @@ export async function startAiradioLocalStation({ limiter = { limit: async () => 
   const namespace = new LocalChannelNamespace(clock);
   const env = { CHANNEL: namespace, AIRADIO_LIMITER: limiter, ...(gitSha === undefined ? {} : { GIT_SHA: gitSha }), ...bindings };
   const reads = new Map();
+  let liveDelivery = webSockets;
   const server = createServer(async (incoming, outgoing) => {
     try {
       const read = /^\/v1\/(?:channel\/(fm-[a-f0-9]+)\/messages|station\/([a-z0-9-]+)\/calls)/u.exec(incoming.url ?? "");
@@ -307,7 +308,7 @@ export async function startAiradioLocalStation({ limiter = { limit: async () => 
   server.on("upgrade", async (incoming, tcp, head) => {
     tcp.on("error", () => {});
     try {
-      if (!webSockets) return refuse(tcp, 404, '{"error":"unknown call — GET / for the instructions"}');
+      if (!liveDelivery) return refuse(tcp, 404, '{"error":"unknown call — GET / for the instructions"}');
       const response = await worker.fetch(
         new Request(`https://local.airadio.test${incoming.url ?? "/"}`, { method: "GET", headers: incoming.headers }),
         env,
@@ -376,6 +377,8 @@ export async function startAiradioLocalStation({ limiter = { limit: async () => 
     url: `http://127.0.0.1:${address.port}`,
     restart: (id) => namespace.restart(id),
     hibernate: (id) => namespace.hibernate(id),
+    /** Switches the socket route on or off, as a station without live delivery would answer it. */
+    webSockets: (on) => { liveDelivery = Boolean(on); },
     /** How many REST receives reached a channel (or "station:<callsign>" for a mailbox): a receiver on a live socket stops polling. */
     reads: (frequency) => reads.get(frequency) || 0,
     /** The channel's open sockets. */
