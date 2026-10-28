@@ -12,7 +12,7 @@
 
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -246,6 +246,30 @@ test("two agents sharing one radio keep their own names and their own inboxes", 
   assert.match(sent.stdout, /as codex-agent/u);
   const status = JSON.parse((await radio(home, "status", "--json")).stdout);
   assert.deepEqual(status.channels.map((row) => row.as).sort(), ["claude-agent", "codex-agent"]);
+});
+
+test("tuning out a rejected channel leaves the receiver serving its other channels", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const home = newHome(t);
+  const rejected = await openChannel(station);
+  const remaining = await openChannel(station);
+  assert.equal((await radio(home, "tune", station.url, rejected.frequency, rejected.wave, "--as", "bot")).code, 0);
+  assert.equal((await radio(home, "tune", station.url, remaining.frequency, remaining.wave, "--as", "bot")).code, 0);
+
+  const configFile = join(home, "radio.json");
+  const config = JSON.parse(readFileSync(configFile, "utf8"));
+  config.channels[rejected.frequency].key = "0".repeat(128);
+  writeFileSync(configFile, JSON.stringify(config));
+  writeFileSync(join(home, "poke"), "poll after key rejection");
+  assert.ok(await eventually(async () => {
+    const status = JSON.parse((await radio(home, "status", "--json", "--offline")).stdout);
+    return status.channels.length === 1 && status.channels[0].frequency === remaining.frequency;
+  }), "the rejected channel was removed without crashing the receiver");
+
+  await remaining.say("host", "ping after the other channel failed");
+  assert.ok(await eventually(async () => (await remaining.heard()).some((message) => message.from === "bot" && message.text.startsWith("pong"))),
+    "the same receiver still processes the remaining channel");
 });
 
 test("the radio notices a per-command sandbox instead of claiming to stay on the air", () => {

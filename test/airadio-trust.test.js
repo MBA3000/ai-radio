@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, sign as cryptoSign } from "node:crypto";
 import { createServer } from "node:http";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -163,6 +163,31 @@ test("agents sign with a private home key and only a locally pinned callsign ver
   assert.doesNotMatch(inbox, /OPERATOR[^\n]*signed hello/u, "an agent signature never carries operator authority");
 
   const sent = (await channel.heard()).find((message) => message.text === "signed hello");
+  const stranger = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const wrongPrivateText = "signed by the wrong private key";
+  const wrongTs = Date.now();
+  const wrongSig = cryptoSign("sha256", Buffer.from(agentSignedPayload({ frequency: channel.frequency, from: "alice", ts: wrongTs, text: wrongPrivateText })),
+    { key: stranger.privateKey, dsaEncoding: "ieee-p1363" }).toString("base64url");
+  const alicePrivate = JSON.parse(readFileSync(join(alice.home, "agent-key.json"), "utf8")).privateKey;
+  const otherFrequencyText = "signature bound to another frequency";
+  const otherFrequencyTs = Date.now();
+  const otherFrequencySig = cryptoSign("sha256", Buffer.from(agentSignedPayload({ frequency: "fm-00000000deadbeef", from: "alice", ts: otherFrequencyTs, text: otherFrequencyText })),
+    { key: alicePrivate, dsaEncoding: "ieee-p1363" }).toString("base64url");
+  await channel.post({ from: "alice", text: wrongPrivateText, agentSig: { v: 1, key: aliceStatus.agentKey.publicKey, ts: wrongTs, sig: wrongSig } });
+  await channel.post({ from: "alice", text: "tampered signed text", agentSig: sent.agentSig });
+  await channel.post({ from: "mallory", text: sent.text, agentSig: sent.agentSig });
+  await channel.post({ from: "alice", text: otherFrequencyText, agentSig: { v: 1, key: aliceStatus.agentKey.publicKey, ts: otherFrequencyTs, sig: otherFrequencySig } });
+  const rejected = await eventually(async () => {
+    const got = (await bob.radio("inbox", channel.frequency, "--peek")).stdout;
+    return got.includes(otherFrequencyText) ? got : null;
+  });
+  for (const text of [wrongPrivateText, "tampered signed text", otherFrequencyText]) {
+    assert.match(rejected, new RegExp("AGENT SIGNATURE REJECTED \\(bad signature\\) alice: " + text), text);
+    assert.doesNotMatch(rejected, new RegExp("✓ AGENT-[^\\n]*: " + text), "a forgery has no verified mark");
+  }
+  assert.match(rejected, /UNVERIFIED AGENT mallory: signed hello/u, "changing from cannot borrow alice's pinned identity");
+  assert.doesNotMatch(rejected, /✓ AGENT-[^\n]* mallory: signed hello/u);
+
   await channel.post({ from: sent.from, text: sent.text, agentSig: sent.agentSig });
   const replay = await eventually(async () => {
     const got = await bob.radio("inbox", channel.frequency, "--peek");

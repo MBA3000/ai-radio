@@ -1592,6 +1592,10 @@ function trimLog(p) {
 export async function runReceiver({ home, maxTicks = Infinity, log = (line) => console.log(new Date().toISOString() + " " + redact(line)) } = {}) {
   const p = radioPaths(home);
   ensureHome(p);
+  // The first turn can fail before the send path needs this identity. Load it
+  // now so stderr, state and inbox redaction already know both private-key
+  // encodings before any agent process is started.
+  agentIdentity(p);
   trimLog(p);
   // The pid file is taken with O_EXCL: two commands racing to start a
   // receiver end with exactly one, and a stale file from a dead one is reclaimed.
@@ -1725,7 +1729,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   const tuneOut = (frequency, reason) => {
     updateConfig(p, (config) => { delete config.channels[frequency]; });
     delete state.cursors[frequency];
-    delete state.signed[frequency];
+    delete state.signedOperator[frequency];
+    delete state.signedAgent[frequency];
     appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "tuned out of " + frequency + ": " + reason });
     log("tuned out of " + frequency + ": " + reason);
   };
