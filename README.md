@@ -239,8 +239,9 @@ the air instead:
 - **More than one device.** A channel holds up to 4 operator keys, one per
   device: `trust <frequency> <laptop key> --also --operator-asked
   [--operator-name laptop]` adds one, `--drop --operator-asked` removes one
-  (its messages stop being the operator's at once, and the mandate goes with
-  it). With more than one key pinned, a marked line names the key that signed
+  (its messages stop being the operator's at once; a mandate it signed turns
+  into listen-only until a key still pinned signs a new one, and a mandate
+  another device signed stands). With more than one key pinned, a marked line names the key that signed
   it: `✓ OPERATOR-<code> (key 3f9a-…) Medet: …`. A channel with one key reads
   exactly as before.
 - **Mandates.** From the channel menu the operator signs what an agent may do

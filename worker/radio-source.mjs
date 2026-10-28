@@ -1088,7 +1088,7 @@ export function mandateLine(channel) {
 
 export function describeMandate(mandate) {
   if (!mandate) return "listen only (no mandate)";
-  if (mandate.scope === "revoke") return "revoked: listen only";
+  if (mandate.scope === "revoke") return mandate.dropped ? "revoked: the key " + mandate.dropped + " that signed it was dropped; listen only" : "revoked: listen only";
   if (mandate.scope === "expired") return "expired at " + mandate.until + ": listen only";
   return (mandate.scope === "tools" ? "talk and use tools" : "talk (no tools)") + " until " + mandate.until
     + (mandate.perHour ? ", at most " + mandate.perHour + " replies an hour" : "") + (mandate.note ? "; note: " + mandate.note : "");
@@ -1254,7 +1254,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     // the operator signed for someone else is not addressed to it.
     if (!allowance(channel).talk && !(message.operator && !message.forOther)) return;
     const current = agentState(frequency, channel.agent);
-    current.pending.push({ seq: message.seq, at: message.at, from: String(message.from), text: String(message.text), ...(message.form ? { form: message.form } : {}), ...(message.operator ? { operator: true } : {}), ...(message.operatorKey ? { operatorKey: message.operatorKey } : {}), ...(message.forOther ? { forOther: true } : {}) });
+    current.pending.push({ seq: message.seq, at: message.at, from: String(message.from), text: String(message.text), ...(message.form ? { form: message.form } : {}), ...(message.operator ? { operator: true } : {}), ...(message.operator && message.operatorKey ? { operatorKey: message.operatorKey } : {}), ...(message.forOther ? { forOther: true } : {}) });
     if (current.pending.length > AGENT_MAX_BATCH) {
       current.dropped = (current.dropped || 0) + current.pending.length - AGENT_MAX_BATCH;
       current.pending = current.pending.slice(-AGENT_MAX_BATCH);
@@ -1290,7 +1290,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       const held = target.mandate;
       if (held && (Number.isSafeInteger(held.signedTs) ? held.signedTs >= message.sig.ts : Number.isSafeInteger(held.seq) && held.seq >= message.seq)) return null;
       if (mandate.scope === "revoke") {
-        target.mandate = { scope: "revoke", seq: message.seq, signedTs: message.sig.ts, by: String(message.from), at: message.at };
+        target.mandate = { scope: "revoke", seq: message.seq, signedTs: message.sig.ts, by: String(message.from), at: message.at, signer: keyFingerprint(message.sig.key) };
         // A signed revoke also releases a session the operator had not tied to mandates.
         if (target.agent && !target.agent.onMandate) {
           delete target.agent;
@@ -1298,7 +1298,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         }
         return "revoked the mandate: listen only";
       }
-      target.mandate = { ...mandate, seq: message.seq, signedTs: message.sig.ts, by: String(message.from), grantedAt: message.at };
+      target.mandate = { ...mandate, seq: message.seq, signedTs: message.sig.ts, by: String(message.from), grantedAt: message.at, signer: keyFingerprint(message.sig.key) };
       return "mandate from " + String(message.from) + ": " + describeMandate(mandate);
     });
     if (!outcome) return;
@@ -1559,7 +1559,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       }
       // A revoke addressed to this agent is the operator's "enough": it wakes no one.
       if (!(mandate && mandateFor(mandate, me) && mandate.scope === "revoke")) {
-        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, ...(operator && signedWith ? { operatorKey: signedWith } : {}), form, forOther });
+        // The key named on the line is the one verified here, never one the transport carried.
+        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, operatorKey: operator && signedWith ? signedWith : null, form, forOther });
       }
     }
     return true;
@@ -1987,7 +1988,7 @@ async function tuneIn(p, station, frequency, key, flags, out) {
       // The first copy of signed words is the operator's; a later one is a replay.
       const signed = Boolean(check && check.ok && !heard.has(check.digest));
       if (check && check.ok) heard.add(check.digest);
-      return "  [" + shortTime(message.at) + "] " + (signed ? mark + " " : "") + untrustedName(message.from) + ": " + redact(String(message.text)).slice(0, 300).replace(/\r?\n/g, " \u23ce ");
+      return "  [" + shortTime(message.at) + "] " + (signed ? mark + (keys.length > 1 ? " (key " + check.fingerprint + ")" : "") + " " : "") + untrustedName(message.from) + ": " + redact(String(message.text)).slice(0, 300).replace(/\r?\n/g, " \u23ce ");
     });
     if (lines.some((line) => line.includes(mark))) out("  (" + mark + " marks your operator's verified signature; the code is new with every listing)");
     for (const line of lines) out(line);
@@ -2368,8 +2369,13 @@ function trustDevice(p, frequency, channel, raw, flags, out) {
       const target = latest.channels[frequency];
       if (!target) return;
       const left = operatorKeys(target).filter((entry) => entry.key !== key);
-      // A mandate may have been signed by the dropped device: it goes with it.
-      delete target.mandate;
+      // A mandate the dropped device signed (or one whose signer is unknown) ends here,
+      // but the channel stays governed: listen only, ordered by the same signature time,
+      // until a key still pinned signs a newer one. Any other mandate stands as it is.
+      const held = target.mandate;
+      if (held && (held.scope === "talk" || held.scope === "tools") && (!held.signer || held.signer === keyFingerprint(key))) {
+        target.mandate = { scope: "revoke", seq: held.seq, signedTs: held.signedTs, by: held.by, at: new Date().toISOString(), dropped: keyFingerprint(key) };
+      }
       delete target.devices;
       if (left.length === 0) delete target.operator;
       else {
@@ -2378,7 +2384,8 @@ function trustDevice(p, frequency, channel, raw, flags, out) {
       }
     });
     poke(p);
-    out("dropped the operator key " + keyFingerprint(key) + " from " + frequency + ": its messages are no longer marked OPERATOR, and the mandate is gone"
+    const after = loadConfig(p).channels[frequency];
+    out("dropped the operator key " + keyFingerprint(key) + " from " + frequency + ": its messages are no longer marked OPERATOR; mandate: " + mandateLine(after)
       + (rest.length === 0 ? "; no operator key is pinned now" : ""));
     return;
   }

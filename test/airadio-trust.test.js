@@ -20,7 +20,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { agentPrompt, canonicalMandate, describeMandate, formatEntry, keyFingerprint, mandateActive, normalizeMandate, operatorKeyValid, operatorMark, signedPayload, verifySigned } from "../scripts/airadio-radio.mjs";
+import { agentPrompt, allowance, canonicalMandate, describeMandate, formatEntry, keyFingerprint, mandateActive, normalizeMandate, operatorKeyValid, operatorMark, signedPayload, verifySigned } from "../scripts/airadio-radio.mjs";
 import { startAiradioLocalStation } from "./helpers/airadio-local-station.js";
 
 const RADIO = fileURLToPath(new URL("../scripts/airadio-radio.mjs", import.meta.url));
@@ -514,4 +514,82 @@ test("a second device is pinned and dropped only because the operator asked, and
   inbox = await inboxWith("after the drop");
   assert.match(inbox, new RegExp("Medet \\(signed by another key " + keyFingerprint(laptop.key) + "\\): after the drop", "u"), "a dropped key is closed at once");
   assert.match((await radio("trust", channel.frequency)).stdout, new RegExp("operator of fm-[a-f0-9]+: Medet, key " + keyFingerprint(phone.key) + "\\n"));
+});
+
+test("dropping a device ends only the mandate it signed, and never leaves the channel ungoverned", { timeout: 90_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const config = () => JSON.parse(readFileSync(join(home, "radio.json"), "utf8")).channels[channel.frequency];
+  const grant = async (who, text, scope) => channel.post({ from: "Medet", text, sig: await who.sign({ frequency: channel.frequency, from: "Medet", text,
+    mandate: { to: "Solnze", scope, until: new Date(Date.now() + 3_600_000).toISOString() } }) });
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key, "--operator-name", "Medet")).code, 0);
+  // Not tied to mandates, with this machine's tools: only a mandate narrows it.
+  assert.equal((await radio("agent", channel.frequency, "--exec", "true", "--tools")).code, 0);
+  const trust = (who, how) => radio("trust", channel.frequency, who.key, how, "--operator-asked");
+  assert.equal((await trust(laptop, "--also")).code, 0);
+
+  // The phone's chat-only mandate outlives dropping the laptop.
+  await grant(phone, "talk, no tools", "talk");
+  assert.ok(await eventually(() => config().mandate && config().mandate.scope === "talk"));
+  assert.equal(config().mandate.signer, keyFingerprint(phone.key));
+  assert.deepEqual(allowance(config()), { talk: true, tools: false });
+  assert.equal((await trust(laptop, "--drop")).code, 0);
+  assert.equal(config().mandate.scope, "talk", "a mandate another device signed stands");
+  assert.deepEqual(allowance(config()), { talk: true, tools: false }, "and still narrows the tools");
+
+  // The laptop's own mandate ends with it, and the channel stays governed.
+  assert.equal((await trust(laptop, "--also")).code, 0);
+  await grant(laptop, "tools from the laptop", "tools");
+  assert.ok(await eventually(() => config().mandate && config().mandate.scope === "tools"));
+  const signedTs = config().mandate.signedTs;
+  const dropped = await trust(laptop, "--drop");
+  assert.equal(dropped.code, 0);
+  assert.match(dropped.stdout, new RegExp("mandate: revoked: the key " + keyFingerprint(laptop.key) + " that signed it was dropped; listen only"));
+  assert.equal(config().mandate.scope, "revoke");
+  assert.equal(config().mandate.signedTs, signedTs, "ordered by the same signature time");
+  assert.equal(JSON.parse((await radio("status", "--json", "--offline")).stdout).channels[0].governed, true);
+  assert.deepEqual(allowance(config()), { talk: false, tools: false }, "never back to this machine's --tools");
+
+  // An expired mandate, and one written before devices (no signer), stay restrictive too.
+  for (const held of [{ scope: "expired", seq: 1, signedTs: 1, until: new Date(Date.now() - 1_000).toISOString() },
+    { scope: "talk", to: "Solnze", note: "", perHour: null, until: new Date(Date.now() + 3_600_000).toISOString(), seq: 1, signedTs: 1, by: "Medet" }]) {
+    assert.equal((await trust(laptop, "--also")).code, 0);
+    const file = JSON.parse(readFileSync(join(home, "radio.json"), "utf8"));
+    file.channels[channel.frequency].mandate = held;
+    writeFileSync(join(home, "radio.json"), JSON.stringify(file));
+    assert.equal((await trust(laptop, "--drop")).code, 0);
+    assert.equal(config().mandate.scope, held.scope === "expired" ? "expired" : "revoke");
+    assert.deepEqual(allowance(config()), { talk: false, tools: false });
+  }
+
+  // A key still pinned signs a newer mandate, and it counts.
+  await grant(phone, "talk again", "talk");
+  assert.ok(await eventually(() => config().mandate && config().mandate.scope === "talk" && config().mandate.signer === keyFingerprint(phone.key)));
+});
+
+test("tune's recent traffic names which pinned device signed each marked line", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { radio } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const tune = () => radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key);
+  const signed = async (who, text) => channel.post({ from: "Medet", text, sig: await who.sign({ frequency: channel.frequency, from: "Medet", text }) });
+  assert.equal((await tune()).code, 0);
+  await signed(phone, "from the phone");
+  await signed(laptop, "from the laptop");
+  const single = (await tune()).stdout;
+  const mark = /\(((✓ OPERATOR-[0-9a-f]{6})) marks/u.exec(single)[1];
+  assert.ok(single.includes(mark + " Medet: from the phone"), "one key: the line reads as before");
+  assert.ok(single.includes("] Medet: from the laptop"), "an unpinned device is not the operator");
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  const both = (await tune()).stdout;
+  const marked = /\(((✓ OPERATOR-[0-9a-f]{6})) marks/u.exec(both)[1];
+  assert.ok(both.includes(marked + " (key " + keyFingerprint(phone.key) + ") Medet: from the phone"));
+  assert.ok(both.includes(marked + " (key " + keyFingerprint(laptop.key) + ") Medet: from the laptop"));
 });
