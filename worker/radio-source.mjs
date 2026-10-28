@@ -1254,7 +1254,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     // the operator signed for someone else is not addressed to it.
     if (!allowance(channel).talk && !(message.operator && !message.forOther)) return;
     const current = agentState(frequency, channel.agent);
-    current.pending.push({ seq: message.seq, at: message.at, from: String(message.from), text: String(message.text), ...(message.form ? { form: message.form } : {}), ...(message.operator ? { operator: true } : {}), ...(message.operator && message.operatorKey ? { operatorKey: message.operatorKey } : {}), ...(message.forOther ? { forOther: true } : {}) });
+    current.pending.push({ seq: message.seq, at: message.at, from: String(message.from), text: String(message.text), ...(message.form ? { form: message.form } : {}), ...(message.operator ? { operator: true } : {}), ...(message.operator && message.operatorKey ? { operatorKey: message.operatorKey } : {}), ...(message.operator && message.signer ? { signer: message.signer } : {}), ...(message.forOther ? { forOther: true } : {}) });
     if (current.pending.length > AGENT_MAX_BATCH) {
       current.dropped = (current.dropped || 0) + current.pending.length - AGENT_MAX_BATCH;
       current.pending = current.pending.slice(-AGENT_MAX_BATCH);
@@ -1264,13 +1264,18 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   // The agent turn running on each channel, and what it was allowed when it began.
   const working = new Map();
 
+  /** Fingerprints of the operator keys pinned for a channel now. */
+  const pinnedFingerprints = (channel) => operatorKeys(channel).map((entry) => keyFingerprint(entry.key));
+
   /** A turn the operator's latest word no longer allows is stopped, and its answer never sent. */
   const recheckWork = (frequency) => {
     const work = working.get(frequency);
     if (!work || work.stopped) return;
     const channel = loadConfig(p).channels[frequency];
     const allowed = channel && channel.agent ? allowance(channel) : { talk: false, tools: false };
-    const reason = !work.operatorOnly && !allowed.talk ? "its mandate ended" : work.tools && !allowed.tools ? "its mandate no longer allows tools" : null;
+    const pinned = pinnedFingerprints(channel);
+    const reason = !work.operatorOnly && !allowed.talk ? "its mandate ended" : work.tools && !allowed.tools ? "its mandate no longer allows tools"
+      : work.operatorOnly && !work.signers.some((signer) => pinned.includes(signer)) ? "the operator key that signed its words was dropped" : null;
     if (!reason) return;
     work.stopped = reason;
     if (work.kill) {
@@ -1337,6 +1342,15 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     }
     const active = mandateActive(channel);
     const allowed = allowance(channel);
+    // A queued line is the operator's only while the key that signed it is still pinned:
+    // a key dropped since (or a line queued before signers were kept) speaks for no one.
+    const pinned = pinnedFingerprints(channel);
+    current.pending = current.pending.map((message) => {
+      if (!message.operator) return message;
+      const { operator, operatorKey, ...rest } = message;
+      if (!pinned.includes(message.signer)) return rest;
+      return { ...rest, operator, ...(pinned.length > 1 ? { operatorKey: message.signer } : {}) };
+    });
     // Without a valid mandate a governed session may still answer its operator's
     // own signed words (the page's rule), chat-only and to them alone.
     const operatorOnly = !allowed.talk;
@@ -1387,7 +1401,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       : preset.stdinJson ? JSON.stringify({ station: channel.station, frequency, as: me, session, first: !current.briefed, prompt, messages }) + "\n"
       : "";
     log("waking " + agentLabel(agent) + " for " + frequency + " (" + messages.length + " new message" + (messages.length === 1 ? "" : "s") + "): " + commandLine(preset.binary, args, prompt));
-    const work = { tools, operatorOnly, kill: null, stopped: null };
+    const work = { tools, operatorOnly, signers: messages.filter((message) => message.operator).map((message) => message.signer), kill: null, stopped: null };
     working.set(frequency, work);
     let result;
     try {
@@ -1560,7 +1574,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       // A revoke addressed to this agent is the operator's "enough": it wakes no one.
       if (!(mandate && mandateFor(mandate, me) && mandate.scope === "revoke")) {
         // The key named on the line is the one verified here, never one the transport carried.
-        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, operatorKey: operator && signedWith ? signedWith : null, form, forOther });
+        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, operatorKey: operator && signedWith ? signedWith : null, signer: operator ? signature.fingerprint : null, form, forOther });
       }
     }
     return true;
@@ -1698,6 +1712,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         await pollMailbox(loadConfig(p));
         if (socket && !state.errors.mailbox) socket.handled = handling;
       }
+      // The owner may have narrowed a running turn locally (a dropped key ends its mandate).
+      if (!stopping) for (const frequency of working.keys()) recheckWork(frequency);
       if (!stopping) expireMandates(loadConfig(p));
       if (!stopping) scheduleWakes(loadConfig(p));
       state.intervalMs = Date.now() - lastActivity < ACTIVE_WINDOW_MS ? ACTIVE_POLL_MS : IDLE_POLL_MS;

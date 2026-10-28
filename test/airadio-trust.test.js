@@ -593,3 +593,52 @@ test("tune's recent traffic names which pinned device signed each marked line", 
   assert.ok(both.includes(marked + " (key " + keyFingerprint(phone.key) + ") Medet: from the phone"));
   assert.ok(both.includes(marked + " (key " + keyFingerprint(laptop.key) + ") Medet: from the laptop"));
 });
+
+test("dropping the key that signed a tools mandate stops the turn already running with tools", { timeout: 90_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { radio, calls } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--tools", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  const text = "tools for an hour";
+  await channel.post({ from: "Medet", text, sig: await laptop.sign({ frequency: channel.frequency, from: "Medet", text,
+    mandate: { to: "Solnze", scope: "tools", until: new Date(Date.now() + 3_600_000).toISOString() } }) });
+  assert.ok(await eventually(() => calls().length === 1));
+  await channel.say("host", "take your time");
+  assert.ok(await eventually(() => calls().length === 2), "a slow turn with tools begins");
+  assert.ok(!calls()[1].argv.includes("--tools"), "with this machine's tools");
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked")).code, 0);
+  assert.ok(await eventually(async () => /agent stopped mid-turn: its mandate ended; its answer was not sent/u.test((await radio("inbox", channel.frequency, "--peek")).stdout), { timeoutMs: 10_000 }),
+    "stopped at once, not when the turn ends");
+  assert.ok(!(await channel.saidBy("Solnze")).includes("done, slowly"), "the slow answer never reached the air");
+});
+
+test("a queued line signed by a key dropped since is no longer the operator's when the agent wakes", { timeout: 90_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio, calls } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const say = async (who, text) => channel.post({ from: "Medet", text, sig: await who.sign({ frequency: channel.frequency, from: "Medet", text }) });
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  // No mandate: the session answers only its operator's signed words.
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  await say(phone, "take your time");
+  assert.ok(await eventually(() => calls().length === 1), "a slow turn begins");
+  await say(laptop, "from the laptop, queued");
+  await say(phone, "remember 7");
+  const pending = () => JSON.parse(readFileSync(join(home, "state.json"), "utf8")).agents[channel.frequency].pending;
+  assert.ok(await eventually(() => pending().length === 2), "both lines wait behind the running turn");
+  assert.deepEqual(pending().map((message) => message.signer), [keyFingerprint(laptop.key), keyFingerprint(phone.key)], "each queued line keeps the key verified for it");
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked")).code, 0);
+  assert.ok(await eventually(() => calls().length === 2, { timeoutMs: 40_000 }), "the phone's queued line still wakes the session");
+  assert.match(calls()[1].prompt, /remember 7/u);
+  assert.ok(!calls()[1].prompt.includes("from the laptop, queued"), "the dropped key's queued line carries no operator authority");
+  assert.ok(!calls()[1].prompt.includes("(key "), "one key left: no key named");
+});
