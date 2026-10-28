@@ -1375,3 +1375,69 @@ test("a late escalation never signals a group that is gone", async () => {
   }
   assert.deepEqual(sent, [], "no signal after the group is confirmed gone");
 });
+
+test("a /proc scan proves a turn's processes gone only when it could read or rule out every one", () => {
+  const since = Date.parse("2026-10-28T12:00:00Z");
+  const bootSeconds = since / 1000 - 3_600;
+  // Ticks since boot (100 a second) for a process started this many ms after the turn's record.
+  const startedAfter = (ms) => String(Math.round((since + ms - bootSeconds * 1000) / 10));
+  const proc = {
+    "/proc/stat": "cpu 1 2 3\nbtime " + bootSeconds + "\n",
+    "/proc/10/environ": "PATH=/bin\u0000AIRADIO_TURN=t-1\u0000",
+    "/proc/10/stat": "10 (agent) S 1 10 10 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 " + startedAfter(500) + " 0",
+    "/proc/11/status": "Name:\tsshd\nUid:\t0\t0\t0\t0\n",
+    "/proc/12/status": "Name:\tagent\nUid:\t1000\t1000\t1000\t1000\n",
+    "/proc/12/stat": "12 (agent) S 1 12 12 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 " + startedAfter(-60_000) + " 0",
+    "/proc/13/status": "Name:\tagent\nUid:\t1000\t1000\t1000\t1000\n",
+    "/proc/13/stat": "13 (agent) S 1 13 13 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 " + startedAfter(800) + " 0",
+  };
+  const unreadable = new Set(["/proc/11/environ", "/proc/12/environ", "/proc/13/environ"]);
+  const read = (pids) => (file) => {
+    if (unreadable.has(file)) throw Object.assign(new Error("denied"), { code: "EACCES" });
+    if (!(file in proc) || !pids.some((pid) => file.startsWith("/proc/" + pid + "/") || file === "/proc/stat")) throw Object.assign(new Error("gone"), { code: "ENOENT" });
+    return proc[file];
+  };
+  const scan = (pids) => radioModule.turnProcesses("t-1", { since, uid: 1000, list: () => pids.map(String), read: read(pids) });
+  assert.deepEqual(scan([10]), { pids: [10], complete: true }, "a marked process is found");
+  assert.deepEqual(scan([11]), { pids: [], complete: true }, "another user's unreadable process is ruled out");
+  assert.deepEqual(scan([12]), { pids: [], complete: true }, "one of ours started long before the turn is ruled out");
+  assert.deepEqual(scan([14]), { pids: [], complete: true }, "one that vanished mid-scan is ruled out");
+  assert.deepEqual(scan([13]), { pids: [], complete: false }, "one of ours started after the turn that cannot be read proves nothing");
+});
+
+test("an orphan whose environment cannot be read keeps its record, and --drop says it cannot confirm the stop", { timeout: 90_000 }, async (t) => {
+  const python = await new Promise((ok) => execFile("python3", ["-c", "import ctypes"], (error) => ok(!error)));
+  if (!python) {
+    t.skip("python3 with ctypes is needed to make a non-dumpable process");
+    return;
+  }
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio } = sandbox(t, () => ({ AIRADIO_DROP_WAIT_MS: "2000" }));
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  assert.equal((await radio("stop", "--operator-asked")).code, 0);
+  const id = "orphan-" + Date.now();
+  const dead = await new Promise((ok) => { const child = execFile(process.execPath, ["-e", ""], () => ok(child.pid)); });
+  const record = join(home, "turns", channel.frequency + "-" + id + ".json");
+  mkdirSync(join(home, "turns"), { recursive: true });
+  writeFileSync(record, JSON.stringify({ id, receiver: dead, frequency: channel.frequency, signers: [keyFingerprint(laptop.key)], pgid: null, start: null, at: new Date().toISOString() }));
+  // Spawned for the turn, then made non-dumpable: its environ reads EACCES even for its own user.
+  const orphan = spawn("python3", ["-c", "import ctypes, signal, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
+    { detached: true, stdio: "ignore", env: { ...process.env, AIRADIO_TURN: id } });
+  orphan.unref();
+  t.after(() => { try { process.kill(orphan.pid, "SIGKILL"); } catch {} });
+  await sleep(500);
+  assert.throws(() => readFileSync("/proc/" + orphan.pid + "/environ"), /EACCES|EPERM/u, "its environment cannot be read");
+  assert.equal((await radio("up")).code, 0);
+  await sleep(1_500);
+  assert.ok(existsSync(record), "recovery keeps a record it cannot account for");
+  const dropped = await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked");
+  assert.equal(dropped.code, 4, dropped.stdout);
+  assert.match(dropped.stdout, /could not be confirmed stopped/u);
+  assert.ok(existsSync(record));
+});

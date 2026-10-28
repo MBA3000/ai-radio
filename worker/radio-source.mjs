@@ -1275,46 +1275,87 @@ function signalGroup(pgid, signal, start = null) {
 
 /**
  * The processes that carry a turn's AIRADIO_TURN, by /proc/<pid>/environ (Linux):
- * an array of pids, or null when this system cannot tell (no /proc).
+ * { pids, complete }, or null when this system cannot tell (no /proc). The scan
+ * is complete only when every process was either read or ruled out for certain:
+ * gone meanwhile (ENOENT/ESRCH), owned by other users only (none of its uids is
+ * ours; an agent's own processes run as us, and we could not signal those anyway),
+ * or started well before the turn was put on record. A process of ours that we
+ * cannot read (EACCES, EPERM: made non-dumpable, say) makes the scan incomplete:
+ * absence is then not proven, and the turn cannot be confirmed stopped.
  */
-function turnProcesses(id) {
+export function turnProcesses(id, { since = null, read = (file) => readFileSync(file, "latin1"), list = () => readdirSync("/proc"), uid = typeof process.getuid === "function" ? process.getuid() : null } = {}) {
   if (typeof id !== "string" || id === "") return null;
   let pids;
-  try { pids = readdirSync("/proc").filter((name) => /^\d+$/.test(name)); } catch { return null; }
+  try { pids = list().filter((name) => /^\d+$/.test(name)); } catch { return null; }
   const wanted = "AIRADIO_TURN=" + id;
   const found = [];
+  let complete = true;
+  let bootMs;
+  const startedMs = (pid) => {
+    if (bootMs === undefined) {
+      try { bootMs = Number(/^btime (\d+)$/m.exec(read("/proc/stat"))[1]) * 1000; } catch { bootMs = null; }
+    }
+    if (bootMs === null) return null;
+    try {
+      const stat = read("/proc/" + pid + "/stat");
+      // Field 22, in clock ticks since boot; Linux reports it in USER_HZ, 100 a second.
+      const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
+      return Number.isFinite(ticks) ? bootMs + ticks * 10 : null;
+    } catch {
+      return null;
+    }
+  };
+  const ruledOut = (pid) => {
+    try {
+      const line = /^Uid:\s+(.*)$/m.exec(read("/proc/" + pid + "/status"));
+      const uids = line ? line[1].trim().split(/\s+/).map(Number) : [];
+      if (uid !== null && uids.length > 0 && uids.every((value) => value !== uid)) return true;
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) return true;
+    }
+    const started = startedMs(pid);
+    return Number.isFinite(since) && started !== null && started < since - 2_000;
+  };
   for (const pid of pids) {
     let environ;
-    try { environ = readFileSync("/proc/" + pid + "/environ", "latin1"); } catch { continue; }
+    try {
+      environ = read("/proc/" + pid + "/environ");
+    } catch (error) {
+      if (error && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+      if (!ruledOut(pid)) complete = false;
+      continue;
+    }
     if (environ.split("\u0000").includes(wanted)) found.push(Number(pid));
   }
-  return found;
+  return { pids: found, complete };
 }
 
-/** Stops every process carrying the turn's mark; true once none is left, null when this system cannot tell. */
-async function stopTurnProcesses(id, { graceMs = 500, waitMs = 3_000 } = {}) {
-  let left = turnProcesses(id);
-  if (left === null) return null;
-  if (left.length === 0) return true;
-  for (const pid of left) { try { process.kill(pid, "SIGTERM"); } catch {} }
-  const term = Date.now() + graceMs;
-  while ((left = turnProcesses(id) || []).length > 0 && Date.now() < term) await new Promise((ok) => setTimeout(ok, 50));
-  for (const pid of left) { try { process.kill(pid, "SIGKILL"); } catch {} }
-  const kill = Date.now() + waitMs;
-  while ((left = turnProcesses(id) || []).length > 0 && Date.now() < kill) await new Promise((ok) => setTimeout(ok, 50));
-  return left.length === 0;
+/** Stops every process carrying the turn's mark: true once none is left (proven), false if one is, null when it cannot be told. */
+async function stopTurnProcesses(id, { since = null, graceMs = 500, waitMs = 3_000 } = {}) {
+  let scan = turnProcesses(id, { since });
+  if (scan === null) return null;
+  if (scan.pids.length > 0) {
+    for (const pid of scan.pids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+    const term = Date.now() + graceMs;
+    while ((scan = turnProcesses(id, { since }) || { pids: [], complete: false }).pids.length > 0 && Date.now() < term) await new Promise((ok) => setTimeout(ok, 50));
+    for (const pid of scan.pids) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    const kill = Date.now() + waitMs;
+    while ((scan = turnProcesses(id, { since }) || { pids: [], complete: false }).pids.length > 0 && Date.now() < kill) await new Promise((ok) => setTimeout(ok, 50));
+  }
+  if (scan.pids.length > 0) return false;
+  return scan.complete ? true : null;
 }
 
 /**
  * A turn's processes: alive (true), gone (false), or unknown (null). A record
  * with a process group asks that group (and the turn's marked processes); one
  * without asks /proc for processes carrying its AIRADIO_TURN, and is unknown
- * where /proc cannot tell.
+ * when that scan cannot prove them absent.
  */
 function turnGroupAlive(turn) {
-  const marked = turnProcesses(turn.id);
-  if (marked !== null && marked.length > 0) return true;
-  if (!Number.isSafeInteger(turn.pgid)) return marked === null ? null : false;
+  const scan = turnProcesses(turn.id, { since: Date.parse(turn.at) });
+  if (scan !== null && scan.pids.length > 0) return true;
+  if (!Number.isSafeInteger(turn.pgid)) return scan === null || !scan.complete ? null : false;
   return sameGroup(turn.pgid, turn.start);
 }
 
@@ -1334,7 +1375,9 @@ async function stopGroup(pgid, { graceMs = 500, waitMs = 3_000, start = null } =
 /** Stops a turn on record: its process group, then any process still carrying its mark. True, false, or null (cannot tell). */
 async function stopTurn(turn) {
   if (Number.isSafeInteger(turn.pgid) && !(await stopGroup(turn.pgid, { start: turn.start }))) return false;
-  const marked = await stopTurnProcesses(turn.id);
+  const marked = await stopTurnProcesses(turn.id, { since: Date.parse(turn.at) });
+  // With its process group recorded and gone, a scan that cannot prove absence does not undo
+  // that proof; without one, only a complete scan may say the turn is gone.
   if (marked === null) return Number.isSafeInteger(turn.pgid) ? true : null;
   return marked;
 }

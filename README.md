@@ -278,7 +278,9 @@ the air instead:
   itself, and exits 4 when it cannot confirm within 15 s. A receiver that
   starts stops what an earlier one left running and does not resume that
   session; a record whose processes cannot be accounted for (no process
-  group recorded and no `/proc` to find its mark) is never removed, so
+  group recorded, and no `/proc` scan that read or ruled out every process:
+  one of ours started after the turn whose environment cannot be read, a
+  non-dumpable one say, leaves the scan incomplete) is never removed, so
   `--drop` keeps exiting 4 until the operator has checked and removed it
   from `turns/` by hand. Process groups are POSIX: on Windows only the agent process
   itself is checked and signalled.
