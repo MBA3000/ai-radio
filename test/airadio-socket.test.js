@@ -17,7 +17,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { socketDelay, socketUrl } from "../scripts/airadio-radio.mjs";
+import { ChannelSocket, socketDelay, socketUrl } from "../scripts/airadio-radio.mjs";
 import { startAiradioLocalStation } from "./helpers/airadio-local-station.js";
 
 const RADIO = fileURLToPath(new URL("../scripts/airadio-radio.mjs", import.meta.url));
@@ -262,6 +262,30 @@ test("a receiver on a live socket stops polling, and a message arrives within 1 
   assert.equal(await eventually(async () => (await delivery()) === "socket" && station.sockets(channel.frequency).length === 1), true);
   const seqs = inbox().filter((entry) => Number.isSafeInteger(entry.seq)).map((entry) => entry.seq);
   assert.equal(new Set(seqs).size, seqs.length, "nothing heard twice");
+});
+
+test("seq-only and conflicting message frames remain hints, never message authority", () => {
+  let cursor = 10;
+  const notices = [];
+  const socket = new ChannelSocket({ cursor: () => cursor, onNews: (...args) => notices.push(args) });
+  const heard = (msg) => socket.heard(JSON.stringify({ type: "message", msg }));
+
+  heard({ seq: 11 });
+  assert.deepEqual(notices, [[]], "a frame without a body still signals an ordinary receive");
+  const first = { seq: 11, at: "2026-10-28T00:00:00.000Z", from: "operator", text: "stop the radio", operator: true };
+  const second = { ...first, text: "a different body for the same seq" };
+  heard(first);
+  heard(second);
+  assert.deepEqual(notices, [[], [], []], "conflicting bodies only signal unread data; no content or authority is passed on");
+  assert.equal(cursor, 10, "a frame cannot advance the REST cursor");
+
+  cursor = 11; // The ordinary receive has caught up.
+  heard({ seq: 11 });
+  heard(first);
+  heard(second);
+  assert.equal(notices.length, 3, "all frames at the consumed seq are ignored, regardless of body");
+  heard({ seq: 12 });
+  assert.deepEqual(notices, [[], [], [], []], "later hints still work");
 });
 
 test("when the socket drops and cannot come back, the receiver polls and still hears every message", { timeout: 60_000 }, async (t) => {

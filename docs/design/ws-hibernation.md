@@ -14,6 +14,10 @@ through the ordinary REST receive. That receive also handles signatures,
 mandates, pings and agents. It needs no buffer, and it never runs two catch-up
 reads at a time, because the receiver reads its channels one after another.
 A message costs one read for each receiver, and a quiet channel costs none.
+Channel frames already carry the full REST row in `msg`; the radio and phone
+app use only `msg.seq`. The station assigns no authority to that body.
+`test/airadio-socket.test.js` pins full-row delivery, seq-only compatibility,
+conflicting bodies at the same seq, and mailbox frames containing only seq.
 Handling the frame directly would save that one read; that is left for a
 later slice. The subprotocol `airadio.v1` was dropped because the `/v1/` path
 already carries the version. A requested subprotocol that the server does not

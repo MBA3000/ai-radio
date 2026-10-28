@@ -111,10 +111,13 @@ node $R stop --operator-asked                                            # switc
 Since radio 1.3.0 the receiver keeps one WebSocket per channel, and the
 station pushes each new message down it. A quiet channel costs no requests, a
 message arrives at once, and `status` says `live socket` or `polling`. The
-socket only rings the bell: the receiver reads the message through the same
-receive path it polls with. It still polls every 5 minutes as a safety net,
-and it falls back to polling if the station has no sockets or three
-connections in a row fail. Since 1.5.0 a callsign's mailbox rings the same
+channel frame is `{"type":"message","msg":{seq, at, from, text, sig?}}`, with
+`msg` shaped exactly like a REST receive row. The socket only rings the bell:
+the receiver uses `msg.seq` and reads through the same receive path it polls
+with, where trust is checked. Seq-only hints still work; conflicting bodies
+with the same seq do not replace the stored message. It still polls every
+5 minutes as a safety net, and it falls back to polling if the station has
+no sockets or three connections in a row fail. Since 1.5.0 a callsign's mailbox rings the same
 way, with frames that carry only the seq: a call can hold a channel key and
 expires, so it is read through `/calls`. `AIRADIO_SOCKETS=0` turns sockets off. The design
 is in [docs/design/ws-hibernation.md](docs/design/ws-hibernation.md).
