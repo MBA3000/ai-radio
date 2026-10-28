@@ -309,6 +309,44 @@ export function parseAnswer(text) {
   return { request: body.request, decision: body.decision === "grant" ? "grant" : "deny" };
 }
 
+/** Every modal managed by the app. Kept outside the browser script so tests pin it. */
+export const APP_SHEETS = ["sheet-new", "sheet-add", "sheet-settings", "sheet-channel", "sheet-pair", "sheet-paired"];
+
+/** Accept only complete, inert channel records from a decrypted pairing package. */
+export function pairedChannels(value, known) {
+  var seen = new Set(Array.isArray(known) ? known : []);
+  if (!value || !Array.isArray(value.channels) || !value.channels.length || !Number.isFinite(value.expiresAt) || value.expiresAt < Date.now()) return null;
+  var valid = true;
+  var out = value.channels.reduce(function (accepted, channel) {
+    if (!channel || typeof channel !== "object" || !/^fm-[a-f0-9]{8,64}$/.test(channel.frequency) || !/^[a-f0-9]{16,128}$/.test(channel.key)) { valid = false; return accepted; }
+    if (seen.has(channel.frequency)) return accepted;
+    seen.add(channel.frequency);
+    accepted.push({ frequency: channel.frequency, key: channel.key, label: String(channel.label || "").slice(0, 40) });
+    return accepted;
+  }, []);
+  return valid ? out : null;
+}
+
+/** Commands are made exclusively from records which passed pairedChannels(). */
+export function pairingTrustCommands(channels, key, name) {
+  if (!/^[-_A-Za-z0-9]{20,200}$/.test(String(key)) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(String(name))) return "";
+  return channels.filter(function (channel) { return channel && /^fm-[a-f0-9]{8,64}$/.test(channel.frequency); }).map(function (channel) {
+    return "node radio.mjs trust " + channel.frequency + " " + key + " --also --operator-asked --operator-name " + name;
+  }).join("\n\n");
+}
+
+/** Derive the one-use relay encryption key without making it extractable. */
+export function pairingKey(secret, id) {
+  return crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveKey"]).then(function (base) {
+    return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode(id), info: new TextEncoder().encode("airadio pairing v1") }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  });
+}
+
+/** A receiving device always creates its own private, non-extractable key. */
+export function generateOperatorPair() {
+  return crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
+}
+
 const SCRIPT = `
 (function () {
   "use strict";
@@ -407,11 +445,10 @@ const SCRIPT = `
     return out;
   }
   function randomBytes(size) { var out = new Uint8Array(size); crypto.getRandomValues(out); return out; }
-  function pairingKey(secret, id) {
-    return crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveKey"]).then(function (base) {
-      return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode(id), info: new TextEncoder().encode("airadio pairing v1") }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-    });
-  }
+  ${pairingKey.toString()}
+  ${generateOperatorPair.toString()}
+  ${pairedChannels.toString()}
+  ${pairingTrustCommands.toString()}
 
   // Dependency-free QR Model 2, fixed at version 6-L. Pairing URLs fit in its
   // 134-byte payload; the much larger encrypted channel list stays at the relay.
@@ -448,7 +485,7 @@ const SCRIPT = `
     var format = 0x77c4;
     var a = [[8,0],[8,1],[8,2],[8,3],[8,4],[8,5],[8,7],[8,8],[7,8],[5,8],[4,8],[3,8],[2,8],[1,8],[0,8]];
     var c = [[size-1,8],[size-2,8],[size-3,8],[size-4,8],[size-5,8],[size-6,8],[size-7,8],[8,size-8],[8,size-7],[8,size-6],[8,size-5],[8,size-4],[8,size-3],[8,size-2],[8,size-1]];
-    for (var i = 0; i < 15; i += 1) { put(a[i][0], a[i][1], (format >>> i) & 1); put(c[i][0], c[i][1], (format >>> i) & 1); }
+    for (var i = 0; i < 15; i += 1) { put(a[i][0], a[i][1], (format >>> (14 - i)) & 1); put(c[i][0], c[i][1], (format >>> (14 - i)) & 1); }
     put(size - 8, 8, true);
     var payload = []; stream.forEach(function (word) { for (var n = 7; n >= 0; n -= 1) payload.push((word >>> n) & 1); });
     var cursor = 0, upward = true;
@@ -464,7 +501,7 @@ const SCRIPT = `
   }
   var operatorReady = (window.indexedDB && window.crypto && crypto.subtle ? idbDo("readonly", function (keys) { return keys.get("operator"); }).then(function (pair) {
     if (pair && pair.privateKey) return pair;
-    return crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]).then(function (made) {
+    return generateOperatorPair().then(function (made) {
       return idbDo("readwrite", function (keys) { return keys.put(made, "operator"); }).then(function () { return made; });
     });
   }).then(function (pair) {
@@ -904,7 +941,7 @@ const SCRIPT = `
 
   // ---------------------------------------------------------------- sheets
   function sheet(id) {
-    ["sheet-new", "sheet-add", "sheet-settings", "sheet-channel"].forEach(function (name) { $(name).classList.toggle("hidden", name !== id); });
+    ${JSON.stringify(APP_SHEETS)}.forEach(function (name) { $(name).classList.toggle("hidden", name !== id); });
     $("backdrop").classList.toggle("hidden", !id);
   }
   $("backdrop").addEventListener("click", function (event) { if (event.target === $("backdrop")) sheet(null); });
@@ -1036,13 +1073,14 @@ const SCRIPT = `
     }).then(function (plain) {
       var shared = JSON.parse(new TextDecoder().decode(plain));
       if (!shared || !Array.isArray(shared.channels) || shared.expiresAt < Date.now()) throw new Error("This pairing code expired.");
-      shared.channels.forEach(function (channel) {
-        if (!FREQUENCY.test(channel.frequency) || !/^[a-f0-9]{16,128}$/u.test(channel.key) || find(channel.frequency)) return;
+      var accepted = pairedChannels(shared, store.channels.map(function (channel) { return channel.frequency; }));
+      if (!accepted) throw new Error("This pairing package is invalid.");
+      accepted.forEach(function (channel) {
         store.channels.push({ frequency: channel.frequency, key: channel.key, label: String(channel.label || "").slice(0, 40), lastSeq: 0, readSeq: 0, addedAt: new Date().toISOString() });
       });
       save(); renderList();
       return operatorReady.then(function (op) {
-        var commands = shared.channels.map(function (channel) { return "node radio.mjs trust " + channel.frequency + " " + op.key + " --also --operator-asked --operator-name " + store.name; }).join("\\n\\n");
+        var commands = pairingTrustCommands(accepted, op.key, store.name);
         $("paired-key").textContent = op.key; $("paired-commands").textContent = commands; sheet("sheet-paired");
       });
     }).catch(function (error) { toast(error.message || "Pairing failed."); });
