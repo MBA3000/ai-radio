@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { APP_SHEETS, generateOperatorPair, pairedChannels, pairingKey, pairingSendHandlers, pairingTrustCommands, renderApp } from "../worker/app.mjs";
+import { APP_SHEETS, applyReceivedPairing, generateOperatorPair, pairedChannels, pairingKey, pairingSendHandlers, pairingTrustCommands, receivePairing, renderApp } from "../worker/app.mjs";
 
 test("pairing sheets open and close with every other modal", () => {
   const elements = new Map(APP_SHEETS.map((id) => [id, { hidden: true }]));
@@ -76,6 +77,50 @@ test("an existing channel still gets a trust command but is not duplicated", () 
   assert.match(pairingTrustCommands(verified, "B".repeat(86), "phone-2"), /trust fm-1234abcd/u);
 });
 
+test("the real receiver imports channels and shows its own key and trust commands", async () => {
+  const id = "12".repeat(16), secret = new Uint8Array(32).fill(7), nonce = new Uint8Array(12).fill(8);
+  const channel = { frequency: "fm-1234abcd", key: "a".repeat(32), label: "ops" };
+  const plain = new TextEncoder().encode(JSON.stringify({ expiresAt: Date.now() + 60_000, channels: [channel] }));
+  const sealed = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, await pairingKey(secret, id), plain);
+  const packed = new Uint8Array(12 + sealed.byteLength); packed.set(nonce); packed.set(new Uint8Array(sealed), 12);
+  let cleared = 0, accepted;
+  const done = new Promise((resolve, reject) => {
+    assert.equal(receivePairing({
+      hash: () => "#pair=" + id + "." + Buffer.from(secret).toString("base64url"),
+      unb64url: (text) => new Uint8Array(Buffer.from(text, "base64url")), clearHash: () => { cleared += 1; },
+      get: async (url) => ({ status: 200, body: { ciphertext: Buffer.from(packed).toString("base64url") }, url }),
+      pairingKey, pairedChannels, accept: (channels) => { accepted = channels; resolve(); }, failed: reject,
+    }), true);
+  });
+  await done;
+  assert.equal(cleared, 1);
+  assert.deepEqual(accepted, [channel], "the production receiver validates and delivers the decrypted channels");
+  const receiver = await generateOperatorPair();
+  const key = Buffer.from(await crypto.subtle.exportKey("raw", receiver.publicKey)).toString("base64url");
+  const stored = [], shown = [];
+  const result = await applyReceivedPairing(accepted, {
+    channels: () => stored, add: (value) => stored.push(value), save() {}, render() {},
+    operatorReady: async () => ({ key }), commands: pairingTrustCommands, name: () => "phone-2",
+    show: (shownKey, commands) => shown.push({ key: shownKey, commands }),
+  });
+  const command = "node radio.mjs trust fm-1234abcd " + key + " --also --operator-asked --operator-name phone-2";
+  assert.equal(stored[0].key, channel.key, "the actual receiver storage path imports the channel");
+  assert.deepEqual(shown, [{ key, commands: command }], "the actual UI path reveals the key and exact command");
+  assert.deepEqual(result, { key, commands: command });
+});
+
+test("routing can receive a newly changed pairing hash once, while malformed secrets do not stop startup", () => {
+  const html = renderApp({ nonce: "0".repeat(32) });
+  assert.match(html, /function route\(\) \{[\s\S]*receivePairing\(pairingReceiver\)/u,
+    "hashchange's route invokes the receiver");
+  let gets = 0, cleared = 0;
+  const deps = { hash: () => "#pair=" + "1".repeat(32) + ".A", unb64url() { throw new DOMException("bad", "InvalidCharacterError"); },
+    clearHash() { cleared += 1; }, get() { gets += 1; }, failed() {} };
+  assert.doesNotThrow(() => receivePairing(deps));
+  assert.equal(receivePairing(deps), false);
+  assert.equal(gets, 0); assert.equal(cleared, 0);
+});
+
 test("the QR's two format copies are independently readable as level L, mask 0", () => {
   const html = renderApp({ nonce: "0".repeat(32) });
   const source = /function drawQr\(canvas, text\) \{[\s\S]*?\n  \}\n  function fingerprintOf/u.exec(html)[0].replace(/\n  function fingerprintOf$/u, "");
@@ -103,4 +148,26 @@ test("a long workers.dev pairing URL uses a larger QR", () => {
   assert.ok(new TextEncoder().encode(url).length > 134);
   drawQr(canvas, url);
   assert.equal(canvas.width, 57, "version 8-L is selected for the longer hostname");
+});
+
+test("both complete QR matrices match independent Model 2 reference fixtures", () => {
+  const html = renderApp({ nonce: "0".repeat(32) });
+  const source = /function drawQr\(canvas, text\) \{[\s\S]*?\n  \}\n  function fingerprintOf/u.exec(html)[0].replace(/\n  function fingerprintOf$/u, "");
+  const drawQr = Function("TextEncoder", "return (" + source + ")")(TextEncoder);
+  const cases = [
+    ["https://airadio.example/app#pair=" + "1".repeat(32) + "." + "A".repeat(43), 49, "92d94aa100ae55d7d52661c6266133b3f26234b50a53948faaba756355348aec"],
+    ["https://" + "staging-".repeat(6) + "account.workers.dev/app#pair=" + "1".repeat(32) + "." + "A".repeat(43), 57, "dca04a07159d737379a338d4e515e1a358dc30d24fcb717086b7f9f041f54912"],
+  ];
+  for (const [url, expectedSize, referenceDigest] of cases) {
+    const dark = new Set();
+    const canvas = { getContext: () => ({ fillStyle: "", fillRect(x, y, width, height) {
+      if (this.fillStyle === "black" && width === 1 && height === 1) dark.add(x + "," + y);
+    } }) };
+    drawQr(canvas, url);
+    let matrix = "";
+    for (let y = 0; y < canvas.height; y += 1) for (let x = 0; x < canvas.width; x += 1) matrix += dark.has(x + "," + y) ? "1" : "0";
+    assert.equal(canvas.width, expectedSize);
+    assert.equal(createHash("sha256").update(matrix).digest("hex"), referenceDigest,
+      "every module, including payload and error correction, matches the independent reference");
+  }
 });

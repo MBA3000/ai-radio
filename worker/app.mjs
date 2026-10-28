@@ -378,6 +378,47 @@ export function generateOperatorPair() {
   return crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
 }
 
+/** Consume a pairing fragment and apply its authenticated package. */
+export function receivePairing(deps) {
+  var match = /^#pair=([a-f0-9]{32})\.([-_A-Za-z0-9]{43})$/u.exec(deps.hash());
+  if (!match) return false;
+  var secret;
+  try {
+    secret = deps.unb64url(match[2]);
+    if (secret.length !== 32) return false;
+  } catch (error) { return false; }
+  deps.clearHash();
+  var id = match[1];
+  deps.get("/v1/pair/" + id).then(function (got) {
+    if (got.status !== 200 || !got.body) throw new Error(got.status === 410 ? "This pairing code expired." : "This pairing code was already used or is unknown.");
+    var packed = deps.unb64url(got.body.ciphertext);
+    if (packed.length < 29) throw new Error("This pairing package is invalid.");
+    var nonce = packed.slice(0, 12), sealed = packed.slice(12);
+    return deps.pairingKey(secret, id).then(function (key) { return crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, sealed); });
+  }).then(function (plain) {
+    var shared = JSON.parse(new TextDecoder().decode(plain));
+    if (!shared || !Array.isArray(shared.channels) || shared.expiresAt < Date.now()) throw new Error("This pairing code expired.");
+    var verified = deps.pairedChannels(shared);
+    if (!verified) throw new Error("This pairing package is invalid.");
+    deps.accept(verified);
+  }).catch(function (error) { deps.failed(error.message || "Pairing failed."); });
+  return true;
+}
+
+/** Store received channels and reveal the new device's public identity. */
+export function applyReceivedPairing(verified, deps) {
+  var known = new Set(deps.channels().map(function (channel) { return channel.frequency; }));
+  verified.filter(function (channel) { return !known.has(channel.frequency); }).forEach(function (channel) {
+    deps.add({ frequency: channel.frequency, key: channel.key, label: String(channel.label || "").slice(0, 40), lastSeq: 0, readSeq: 0, addedAt: new Date().toISOString() });
+  });
+  deps.save(); deps.render();
+  return deps.operatorReady().then(function (op) {
+    var commands = deps.commands(verified, op.key, deps.name());
+    deps.show(op.key, commands);
+    return { key: op.key, commands: commands };
+  });
+}
+
 const SCRIPT = `
 (function () {
   "use strict";
@@ -481,6 +522,8 @@ const SCRIPT = `
   ${pairedChannels.toString()}
   ${pairingTrustCommands.toString()}
   ${pairingSendHandlers.toString()}
+  ${receivePairing.toString()}
+  ${applyReceivedPairing.toString()}
 
   // Dependency-free QR Model 2. Use compact version 6-L normally and version
   // 8-L for longer staging workers.dev hostnames.
@@ -725,6 +768,7 @@ const SCRIPT = `
   }
   function route() {
     stopTimers();
+    if (receivePairing(pairingReceiver)) { showHome(); return; }
     var frequency = (location.hash.match(FREQUENCY) || [])[0];
     if (frequency && find(frequency)) openChannel(find(frequency));
     else showHome();
@@ -1091,32 +1135,22 @@ const SCRIPT = `
   $("pair-start").addEventListener("click", pairingSender.confirm);
   $("pair-copy").addEventListener("click", function () { navigator.clipboard.writeText($("pair-link").value).then(function () { toast("Pairing link copied."); }); });
 
-  function receivePairing() {
-    var match = /^#pair=([a-f0-9]{32})\.([-_A-Za-z0-9]+)$/u.exec(location.hash);
-    if (!match) return;
-    history.replaceState(null, "", location.pathname + location.search);
-    var id = match[1], secret = unb64url(match[2]);
-    api("/v1/pair/" + id).then(function (got) {
-      if (got.status !== 200 || !got.body) throw new Error(got.status === 410 ? "This pairing code expired." : "This pairing code was already used or is unknown.");
-      var packed = unb64url(got.body.ciphertext), nonce = packed.slice(0, 12), sealed = packed.slice(12);
-      return pairingKey(secret, id).then(function (key) { return crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, sealed); });
-    }).then(function (plain) {
-      var shared = JSON.parse(new TextDecoder().decode(plain));
-      if (!shared || !Array.isArray(shared.channels) || shared.expiresAt < Date.now()) throw new Error("This pairing code expired.");
-      var verified = pairedChannels(shared);
-      if (!verified) throw new Error("This pairing package is invalid.");
-      var known = new Set(store.channels.map(function (channel) { return channel.frequency; }));
-      verified.filter(function (channel) { return !known.has(channel.frequency); }).forEach(function (channel) {
-        store.channels.push({ frequency: channel.frequency, key: channel.key, label: String(channel.label || "").slice(0, 40), lastSeq: 0, readSeq: 0, addedAt: new Date().toISOString() });
+  var pairingReceiver = {
+    hash: function () { return location.hash; }, unb64url: unb64url,
+    clearHash: function () { history.replaceState(null, "", location.pathname + location.search); },
+    get: api, pairingKey: pairingKey, pairedChannels: pairedChannels,
+    accept: function (verified) {
+      return applyReceivedPairing(verified, {
+        channels: function () { return store.channels; }, add: function (channel) { store.channels.push(channel); },
+        save: save, render: renderList, operatorReady: function () { return operatorReady; },
+        commands: pairingTrustCommands, name: function () { return store.name; },
+        show: function (key, commands) {
+          $("paired-key").textContent = key; $("paired-commands").textContent = commands; sheet("sheet-paired");
+        }
       });
-      save(); renderList();
-      return operatorReady.then(function (op) {
-        var commands = pairingTrustCommands(verified, op.key, store.name);
-        $("paired-key").textContent = op.key; $("paired-commands").textContent = commands; sheet("sheet-paired");
-      });
-    }).catch(function (error) { toast(error.message || "Pairing failed."); });
-  }
-  receivePairing();
+    }, failed: function (message) { toast(message); }
+  };
+  receivePairing(pairingReceiver);
 
   var mandateScope = "talk";
   var untilUtc = store.untilZone === "utc";

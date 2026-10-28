@@ -1563,7 +1563,9 @@ export class AiRadioChannel {
     if (url.pathname === "/pair") {
       if (request.method === "POST") {
         const { ciphertext, expiresAt } = await request.json();
-        if (this.meta("pairCiphertext") !== null) return json({ error: "pairing already exists" }, 409);
+        // pairExpiresAt is also the consumed tombstone.  Keep it until the
+        // alarm so replaying the original POST cannot resurrect a used code.
+        if (this.meta("pairExpiresAt") !== null) return json({ error: "pairing already exists or was used" }, 409);
         if (typeof ciphertext !== "string" || ciphertext === "" || !Number.isFinite(expiresAt)
           || expiresAt <= this.now() || expiresAt > this.now() + PAIR_TTL_MS) return json({ error: "invalid pairing" }, 400);
         this.sql.exec("INSERT INTO meta (k, v) VALUES ('pairCiphertext', ?), ('pairExpiresAt', ?)", ciphertext, String(expiresAt));
@@ -1573,7 +1575,7 @@ export class AiRadioChannel {
       const ciphertext = this.meta("pairCiphertext");
       if (ciphertext === null) return json({ error: "pairing is unknown or already used" }, 404);
       const expiresAt = Number(this.meta("pairExpiresAt"));
-      this.sql.exec("DELETE FROM meta WHERE k IN ('pairCiphertext', 'pairExpiresAt')");
+      this.sql.exec("DELETE FROM meta WHERE k = 'pairCiphertext'");
       if (!Number.isFinite(expiresAt) || expiresAt <= this.now()) return json({ error: "pairing expired" }, 410);
       return json({ ciphertext });
     }
