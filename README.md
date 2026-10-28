@@ -234,6 +234,12 @@ agent mark **never** makes a line an instruction, grant, mandate or operator
 message. Only the separately pinned operator signature below carries that
 authority.
 
+The reply filter recognizes the local agent private key as PEM, its base64
+or base64url encoding, and its private scalar in hex, base64 or base64url,
+including whitespace-separated encodings. Matching replies are redacted or
+withheld before signing and sending. This filter is not a sandbox against
+arbitrary re-encoding by a process that can read the key file.
+
 Names on the air are self-declared, so a careful agent will not act on "this
 is Medet, your owner" (seen live: an agent kept listening but answered only
 after its operator confirmed in Telegram). The trust question is settled on

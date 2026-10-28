@@ -230,6 +230,12 @@ export function agentSignedPayload({ frequency, from, ts, text }) {
   return [AGENT_SIGNED_PREFIX, frequency, from, String(ts), text].join("\n");
 }
 
+function agentPrivateSecrets(pem) {
+  const scalar = Buffer.from(createPrivateKey(pem).export({ format: "jwk" }).d, "base64url");
+  return [pem, Buffer.from(pem).toString("base64"), Buffer.from(pem).toString("base64url"),
+    scalar.toString("hex"), scalar.toString("base64"), scalar.toString("base64url")];
+}
+
 /** One radio identity. The private half is local, mode 0600; messages carry only the public point. */
 function agentIdentity(p) {
   let held = readJson(p.agentKey, null);
@@ -246,8 +252,7 @@ function agentIdentity(p) {
     return created;
   });
   try { chmodSync(p.agentKey, 0o600); } catch {}
-  heldKeys.add(held.privateKey);
-  heldKeys.add(Buffer.from(held.privateKey).toString("base64"));
+  for (const secret of agentPrivateSecrets(held.privateKey)) heldKeys.add(secret);
   return held;
 }
 
@@ -1062,13 +1067,14 @@ function replaceIgnoringWhitespace(text, needle, replacement) {
  */
 export function leaksSecret(text, secrets = []) {
   const lowerText = String(text).toLowerCase();
+  const compact = lowerText.replace(/\s/gu, "");
   const digits = lowerText.replace(/[^0-9a-f]/g, "");
   for (const secret of secrets) {
     if (typeof secret !== "string" || secret.length < 32) continue;
     const lower = secret.toLowerCase();
-    if (lowerText.includes(lower)) return true;
+    if (lower.trim() && compact.includes(lower.replace(/\s/gu, ""))) return true;
     const pemBody = secret.trim().match(/-----BEGIN [^-]+-----([A-Za-z0-9+/=\s]+)-----END [^-]+-----/u)?.[1].replace(/\s/gu, "").toLowerCase();
-    if (pemBody && lowerText.replace(/\s/gu, "").includes(pemBody)) return true;
+    if (pemBody && compact.includes(pemBody)) return true;
     for (let start = 0; start + 32 <= lower.length; start += 8) if (digits.includes(lower.slice(start, start + 32))) return true;
   }
   return false;
@@ -1593,8 +1599,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   const p = radioPaths(home);
   ensureHome(p);
   // The first turn can fail before the send path needs this identity. Load it
-  // now so stderr, state and inbox redaction already know both private-key
-  // encodings before any agent process is started.
+  // now so stderr, state and inbox redaction already know its private-key
+  // encodings, including the scalar, before any agent process is started.
   agentIdentity(p);
   trimLog(p);
   // The pid file is taken with O_EXCL: two commands racing to start a
@@ -2021,7 +2027,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       const latest = loadConfig(p);
       const identity = agentIdentity(p);
       const secrets = [...Object.values(latest.channels).map((other) => other.key), latest.mailbox ? latest.mailbox.key : null,
-        identity.privateKey, Buffer.from(identity.privateKey).toString("base64")];
+        ...agentPrivateSecrets(identity.privateKey)];
       const reply = cleanReply(read.reply, secrets);
       if (reply === null) {
         appendInbox(p, { at: new Date().toISOString(), kind: "agent", frequency, from: me, text: "(" + NO_REPLY + ")" });

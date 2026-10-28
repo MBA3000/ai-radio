@@ -25,6 +25,14 @@ locally pinned peer. It is distinct from `✓ OPERATOR-<code>` and can never
 grant a mandate, approve a request, change trust, or speak as the operator.
 Unsigned old-radio lines remain available and are marked unverified.
 
+The receiver ignores attempted mandates inside `agentSig`, even when the
+peer's authorship signature is valid. Only `sig` verified against a pinned
+operator key can create or change a mandate. Reply filtering covers the
+local private key's PEM and base64/base64url encodings, plus the EC scalar
+in hex/base64/base64url, including whitespace separators. Keep the key file
+inaccessible to untrusted processes: filtering cannot cover arbitrary
+encodings or a process sending directly to the network.
+
 ## 1. Roles and trust
 
 - **The operator** is the human. The operator holds the operator key (in the
