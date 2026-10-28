@@ -236,6 +236,59 @@ the air instead:
   name, nobody else can type the code. Everything else stays untrusted,
   whatever name it carries. A pinned key is never replaced or dropped
   without `--operator-asked`.
+- **More than one device.** A channel holds up to 4 operator keys, one per
+  device: `trust <frequency> <laptop key> --also --operator-asked
+  [--operator-name laptop]` adds one, `--drop --operator-asked` removes one
+  (its messages stop being the operator's at once; a mandate it signed turns
+  into listen-only until a key still pinned signs a new one, and a mandate
+  another device signed stands). With more than one key pinned, a marked line names the key that signed
+  it: `✓ OPERATOR-<code> (key 3f9a-…) Medet: …`. A channel with one key reads
+  exactly as before.
+- **Dropping a key closes everything it signed, through one rule.** The radio
+  keeps, with every operator line it hears, the key it verified it with, and
+  judges stored lines against the keys pinned *now*, never the verdict saved
+  when they arrived: `inbox` (plain and `--json`), `granted` (a dropped key's
+  saved grant grants nothing and spends nothing), the agent's queue and the
+  history a new session is briefed with, and mandates. A running turn that
+  holds the dropped key's words is stopped, and a session that held them is
+  not resumed: the next wake starts a fresh one, briefed with what still
+  counts. A line heard by a radio older than this rule carries no key and
+  counts for no one, and a session kept by such a radio is not resumed. The
+  mandate a prompt carries counts among the session's keys too.
+  Pins, mandates, grant spending and the start of every agent turn share
+  one lock (`radio.lock`). It names its owner (a unique id and the pid), is
+  broken only when that process is gone, never for its age (reclaimers
+  queue on `radio.lock.reclaim` and look again before removing it), and is
+  released only by its owner; each command decides inside it, against the
+  file as it is then, so a `tune`, `trust` or `granted --use` racing a drop
+  sees the set after it. A turn starts only under that lock, after its
+  keys are checked again, its session's keys are saved and the turn is put
+  on record in `turns/` with its process group; without a record it does
+  not start. Every process of a turn carries `AIRADIO_TURN=<id>` in its
+  environment. A turn is stopped as a whole process group (SIGTERM, then
+  SIGKILL; signals go only to the group whose leader start time matches the
+  record, and a late escalation after the group is gone is dropped), and on
+  Linux any process still carrying its mark is stopped too. Its record stays
+  until the answer is sent or given up: the last check of the keys and the
+  decision to send are one step under the lock, and a drop that comes after
+  that step waits for the send (or exits 4).
+  A running turn is checked four times a second, whatever the network is
+  doing. `--drop` returns only once every turn holding the dropped key's
+  words is confirmed stopped: it stops orphans of a crashed receiver
+  itself, and exits 4 when it cannot confirm within 15 s. A receiver that
+  starts stops what an earlier one left running and does not resume that
+  session; a record whose processes cannot be accounted for (no process
+  group recorded, and no `/proc` scan that read or ruled out every process:
+  one of ours started after the turn whose environment cannot be read, a
+  non-dumpable one say, leaves the scan incomplete) is never removed, so
+  `--drop` keeps exiting 4 until the operator has checked and removed it
+  from `turns/` by hand. Process groups are POSIX: on Windows only the agent process
+  itself is checked and signalled.
+  A key has one spelling: a non-canonical base64url alias is refused, a pin
+  an older radio stored in another spelling is read by its bytes, and a
+  drop removes every spelling of the key. The `operator` flag written into
+  `inbox.jsonl` is the verdict at receipt; the radio appends a `RADIO` line
+  when a key is dropped.
 - **Mandates.** From the channel menu the operator signs what an agent may do
   (*talk*, *talk + tools* or *revoke*) and until when: an exact moment picked
   in their own time or in UTC, at most 31 days ahead, with an optional note.
