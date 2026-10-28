@@ -218,6 +218,47 @@ Take the first item not yet ticked in `todos.md`, unless the owner names one.
     and that no response or log contains a KEY.
 - **Out of scope:** operator signing from connectors; A2A.
 
+### Owner decisions and order (2026-10-29)
+
+The owner delegated the open questions to the lead; these are binding.
+
+- **Order** (one slice per task; slices that touch the same files never run
+  at the same time): **a** and **c** first (they may run in parallel),
+  then **d2**, then **b1**, **b2**, then **d1**.
+- **b is split.**
+  - **b1, derived auth (before any encryption):** clients stop sending the
+    raw channel KEY. They send `X-Wave-Auth` = base64url of
+    HKDF-SHA-256(KEY, salt = UTF-8 frequency, info `airadio auth v1`, 32
+    bytes). The station stores a digest of that token. Migration is lazy: a
+    request that still carries the old `X-Wave` and matches the stored KEY
+    digest is served and lets the station record the token digest at that
+    moment; once a channel has a token digest, a per-channel flag
+    `auth_only` (set by the operator from the app or `radio.mjs`) makes the
+    station refuse the raw KEY. Old radios keep working until the flag is
+    set. Tests: no request after the flag carries the KEY; the station never
+    persists the KEY.
+  - **b2, encryption:** as written in b above, with the encryption key
+    derived under the different info `airadio e2e v1`. The operator
+    signature binds the **plaintext** (so old signed messages stay
+    verifiable and signatures survive re-encryption); the envelope carries
+    the signature inside the ciphertext.
+- **d is split.**
+  - **d2 first** (local, read-only inbox tool; the "exactly ten tools" test
+    becomes eleven, and the PR says so).
+  - **d1, remote MCP, auth model approved:** OAuth 2.1 with the station as
+    authorization server: PKCE (S256) required, dynamic client registration
+    (connectors need it), consent shown and signed in the operator's app
+    with the operator key, tokens scoped to named channels, access tokens 1
+    hour, refresh tokens 30 days and rotated on use, stored only as
+    digests, revocable from the app. No KEY is ever given to a connector.
+- **c:** a receiver learns a peer's key only by a local pin command
+  (`radio.mjs trust-agent <frequency> <callsign> <key>`), no
+  trust-on-first-use.
+- **Running in Codex Cloud:** the cloud task cannot push or open a PR. End
+  the task with the finished diff and the section 7 report; the lead's
+  flywheel applies it, runs the owner's CI, opens and merges the PR, then
+  starts the next slice. Tick the item in `todos.md` in the same diff.
+
 ## 6. How to work
 
 - Small PRs, one item (or one named slice) each, on a branch; never push to
