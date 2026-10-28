@@ -389,7 +389,10 @@ export function receivePairing(deps) {
   } catch (error) { return false; }
   deps.clearHash();
   var id = match[1];
-  deps.get("/v1/pair/" + id).then(function (got) {
+  Promise.resolve().then(function () { return deps.operatorReady(); }).then(function (op) {
+    if (!op) throw new Error("Could not create this device's operator key.");
+    return deps.get("/v1/pair/" + id);
+  }).then(function (got) {
     if (got.status !== 200 || !got.body) throw new Error(got.status === 410 ? "This pairing code expired." : "This pairing code was already used or is unknown.");
     var packed = deps.unb64url(got.body.ciphertext);
     if (packed.length < 29) throw new Error("This pairing package is invalid.");
@@ -400,19 +403,20 @@ export function receivePairing(deps) {
     if (!shared || !Array.isArray(shared.channels) || shared.expiresAt < Date.now()) throw new Error("This pairing code expired.");
     var verified = deps.pairedChannels(shared);
     if (!verified) throw new Error("This pairing package is invalid.");
-    deps.accept(verified);
+    return deps.accept(verified);
   }).catch(function (error) { deps.failed(error.message || "Pairing failed."); });
   return true;
 }
 
 /** Store received channels and reveal the new device's public identity. */
 export function applyReceivedPairing(verified, deps) {
-  var known = new Set(deps.channels().map(function (channel) { return channel.frequency; }));
-  verified.filter(function (channel) { return !known.has(channel.frequency); }).forEach(function (channel) {
-    deps.add({ frequency: channel.frequency, key: channel.key, label: String(channel.label || "").slice(0, 40), lastSeq: 0, readSeq: 0, addedAt: new Date().toISOString() });
-  });
-  deps.save(); deps.render();
   return deps.operatorReady().then(function (op) {
+    if (!op) throw new Error("Could not create this device's operator key.");
+    var known = new Set(deps.channels().map(function (channel) { return channel.frequency; }));
+    verified.filter(function (channel) { return !known.has(channel.frequency); }).forEach(function (channel) {
+      deps.add({ frequency: channel.frequency, key: channel.key, label: String(channel.label || "").slice(0, 40), lastSeq: 0, readSeq: 0, addedAt: new Date().toISOString() });
+    });
+    deps.save(); deps.render();
     var commands = deps.commands(verified, op.key, deps.name());
     deps.show(op.key, commands);
     return { key: op.key, commands: commands };

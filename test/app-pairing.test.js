@@ -88,6 +88,7 @@ test("the real receiver imports channels and shows its own key and trust command
     assert.equal(receivePairing({
       hash: () => "#pair=" + id + "." + Buffer.from(secret).toString("base64url"),
       unb64url: (text) => new Uint8Array(Buffer.from(text, "base64url")), clearHash: () => { cleared += 1; },
+      operatorReady: async () => ({ key: "ready" }),
       get: async (url) => ({ status: 200, body: { ciphertext: Buffer.from(packed).toString("base64url") }, url }),
       pairingKey, pairedChannels, accept: (channels) => { accepted = channels; resolve(); }, failed: reject,
     }), true);
@@ -107,6 +108,52 @@ test("the real receiver imports channels and shows its own key and trust command
   assert.equal(stored[0].key, channel.key, "the actual receiver storage path imports the channel");
   assert.deepEqual(shown, [{ key, commands: command }], "the actual UI path reveals the key and exact command");
   assert.deepEqual(result, { key, commands: command });
+});
+
+test("a receiver without operator key storage does not consume the one-time package", async () => {
+  let gets = 0, accepts = 0;
+  const failure = new Promise((resolve) => {
+    assert.equal(receivePairing({
+      hash: () => "#pair=" + "12".repeat(16) + "." + "A".repeat(43),
+      unb64url: () => new Uint8Array(32), clearHash() {}, operatorReady: async () => null,
+      get: async () => { gets += 1; return { status: 500 }; }, accept: async () => { accepts += 1; },
+      failed: resolve,
+    }), true);
+  });
+  assert.match(await failure, /operator key/i);
+  assert.equal(gets, 0, "the relay package remains unconsumed");
+  assert.equal(accepts, 0, "no channels are imported");
+});
+
+test("operator key creation failure is reported without consuming or importing", async () => {
+  const creationError = new Error("IndexedDB write failed");
+  let gets = 0, accepts = 0;
+  const failure = new Promise((resolve) => {
+    receivePairing({
+      hash: () => "#pair=" + "34".repeat(16) + "." + "B".repeat(43),
+      unb64url: () => new Uint8Array(32), clearHash() {}, operatorReady: async () => { throw creationError; },
+      get: async () => { gets += 1; return { status: 500 }; }, accept: async () => { accepts += 1; },
+      failed: resolve,
+    });
+  });
+  assert.equal(await failure, creationError.message);
+  assert.equal(gets, 0, "the one-shot GET waits for successful key creation");
+  assert.equal(accepts, 0);
+});
+
+test("a rejected channel import is reported by the pairing receiver", async () => {
+  const id = "56".repeat(16), secret = new Uint8Array(32).fill(9), nonce = new Uint8Array(12).fill(4);
+  const shared = { expiresAt: Date.now() + 60_000, channels: [{ frequency: "fm-1234abcd", key: "a".repeat(32) }] };
+  const sealed = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, await pairingKey(secret, id), new TextEncoder().encode(JSON.stringify(shared)));
+  const packed = new Uint8Array(12 + sealed.byteLength); packed.set(nonce); packed.set(new Uint8Array(sealed), 12);
+  const importError = new Error("storage unavailable");
+  const failure = new Promise((resolve) => receivePairing({
+    hash: () => "#pair=" + id + "." + Buffer.from(secret).toString("base64url"),
+    unb64url: (text) => new Uint8Array(Buffer.from(text, "base64url")), clearHash() {}, operatorReady: async () => ({ key: "ready" }),
+    get: async () => ({ status: 200, body: { ciphertext: Buffer.from(packed).toString("base64url") } }),
+    pairingKey, pairedChannels, accept: async () => { throw importError; }, failed: resolve,
+  }));
+  assert.equal(await failure, importError.message);
 });
 
 test("routing can receive a newly changed pairing hash once, while malformed secrets do not stop startup", () => {
