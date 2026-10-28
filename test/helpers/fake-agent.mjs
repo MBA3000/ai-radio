@@ -10,6 +10,7 @@
  * env:   FAKE_AGENT_DIR  where sessions and the call log live
  */
 
+import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -84,6 +85,12 @@ if (/fail/i.test(newest)) {
   reply = "NO_REPLY";
 } else if (/take your time/i.test(newest)) {
   // A long turn, for tests that stop one midway.
+  if (process.env.FAKE_AGENT_CHILD_ACT) {
+    // A tool it started: in the agent's process group, deaf to SIGTERM, acting on its own a while later.
+    const [file, ms] = process.env.FAKE_AGENT_CHILD_ACT.split(",");
+    spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => require('fs').writeFileSync(" + JSON.stringify(file) + ", 'acted'), " + Number(ms) + ");"], { stdio: "ignore" });
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+  }
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_AGENT_SLOW_MS) || 15_000);
   reply = "done, slowly";
 } else if (/drop my key and answer/i.test(newest) && process.env.FAKE_AGENT_DROP_KEY && process.env.FAKE_AGENT_RADIO_JSON) {

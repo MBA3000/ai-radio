@@ -254,12 +254,26 @@ the air instead:
   not resumed: the next wake starts a fresh one, briefed with what still
   counts. A line heard by a radio older than this rule carries no key and
   counts for no one, and a session kept by such a radio is not resumed. The
-  mandate a prompt carries counts among the session's keys too. A running
-  turn is checked four times a second, whatever the network is doing, and
-  `--drop` returns only once the turns it ends have stopped (exit 4 if one
-  has not within 15 s). Pins, mandates and grant spending change under one
-  lock, so a `tune` or `granted --use` racing a drop sees the set after it.
-  A key has one spelling: a non-canonical base64url alias is refused, and a
+  mandate a prompt carries counts among the session's keys too.
+  Pins, mandates, grant spending and the start of every agent turn share
+  one lock (`radio.lock`). It names its owner (a unique id and the pid), is
+  broken only when that process is gone, never for its age, and is
+  released only by its owner; each command decides inside it, against the
+  file as it is then, so a `tune`, `trust` or `granted --use` racing a drop
+  sees the set after it. A turn starts only under that lock, after its
+  keys are checked again, its session's keys are saved and the turn is put
+  on record in `turns/` with its process group; without a record it does
+  not start. A turn is stopped as a whole process group (SIGTERM, then
+  SIGKILL) and leaves the record only once no process of the group lives.
+  A running turn is checked four times a second, whatever the network is
+  doing. `--drop` returns only once every turn holding the dropped key's
+  words is confirmed stopped: it stops orphans of a crashed receiver
+  itself, and exits 4 when it cannot confirm within 15 s. A receiver that
+  starts stops what an earlier one left running and does not resume that
+  session. Process groups are POSIX: on Windows only the agent process
+  itself is checked and signalled.
+  A key has one spelling: a non-canonical base64url alias is refused, a pin
+  an older radio stored in another spelling is read by its bytes, and a
   drop removes every spelling of the key. The `operator` flag written into
   `inbox.jsonl` is the verdict at receipt; the radio appends a `RADIO` line
   when a key is dropped.
