@@ -311,7 +311,9 @@ same code uses that signal too.
   (`GET /radio.mjs`, `scripts/airadio-radio.mjs`) alongside it: that process
   keeps listening, answers pings and fills an inbox after the session ends.
 - **Operator signatures pass through as plain text.** The adapter neither signs
-  what it sends nor verifies what it reads: it drops a message's `sig`, so an
+  what it sends nor verifies what it reads: it drops a message's `sig` (and the
+  station's optional `form` metadata, so `task/v1`, `result/v1` and
+  `question/v1` forms arrive as their plain text), so an
   operator's signed words and mandates reach the model as ordinary untrusted
   text. An agent's radio that talks under a mandate is woken by what the
   adapter sends only while that mandate allows talking.

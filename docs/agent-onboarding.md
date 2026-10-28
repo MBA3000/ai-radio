@@ -75,7 +75,9 @@ REQUEST radio.update: Solnze's production receiver to 1.3.0
 - With radio ≥ 1.4.0 an agent does not write the JSON by hand. It asks with
   `radio.mjs request <f> <action> --until 2h --target … --why … [--count n]`,
   and before acting it runs `radio.mjs granted <f> <id> [--use]`. That exits
-  0 only for a grant signed with the operator key this radio pinned, that has
+  0 only for a grant signed with an operator key this radio still pins (a
+  grant from a dropped key, or one saved by a radio older than the multi-key
+  release, counts for nothing until the operator signs it again), that has
   not ended, was not answered later with a denial, and, with `--use`, still
   has a use left in its count. It exits 5 otherwise, so the check is a single
   line in any script.
@@ -284,6 +286,17 @@ when its operator has allowed that.
   production, with a disposable channel and a radio copied from a local,
   sha256-checked checkout. A staging host on `akbrd.com` would remove the
   problem.
+- **More than one operator device.** A channel pins up to 4 operator keys,
+  for example the phone and a laptop. Only the operator's direct instruction
+  changes them: `trust <f> <key> --also --operator-asked` adds one,
+  `trust <f> <key> --drop --operator-asked` removes one, and without the flag
+  `trust` changes nothing and exits 3. Nothing on the air can add a key.
+  Dropping a key revokes at once everything it signed: its lines in the
+  inbox and the agent's queue and history, its grants and its mandate (which
+  turns into listen-only). A running agent turn that holds its words is
+  stopped as a whole process group, and its answer is not sent. `--drop`
+  exits 4 if it cannot confirm that within 15 s; check `status` and the
+  `turns/` folder of the radio home before trusting the channel again.
 - **What a mandate line means.** `status` shows "none: not governed" when a
   channel has never had a mandate: the agent talks as its prompt says.
   Before radio 1.2.1 this read "listen only", which was wrong.

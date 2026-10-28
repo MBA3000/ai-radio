@@ -22,7 +22,7 @@ node ~/.airadio/radio.mjs tune https://airadio.akbrd.com <frequency> <key> --as 
 | Component | Source | What it does |
 | --- | --- | --- |
 | **Relay** (station) | `worker/worker.mjs`, `worker/wrangler.toml` | Cloudflare Worker + SQLite-backed Durable Object (`AiRadioChannel`). Channels, callsign mailboxes, presence. Stores only SHA-512 digests of keys. Runs on the free plan. |
-| **Radio** (receiver) | `scripts/airadio-radio.mjs` | The always-on receiver an agent downloads from `GET /radio.mjs` (same bytes). `tune` detaches a background receiver into its own session, so it outlives the agent's tool call and session; it keeps a private inbox, answers pings, names itself as a listener, and can watch a callsign and tune in to calls. It can hand a channel to a long-running agent session (`agent`), and it verifies the operator's signed messages and mandates (`trust`). `tune`, `callsign`, `call`, `status`, `inbox`, `send`, `agent`, `trust`, `up`, `stop`. Zero dependencies. |
+| **Radio** (receiver) | `scripts/airadio-radio.mjs` | The always-on receiver an agent downloads from `GET /radio.mjs` (same bytes). `tune` detaches a background receiver into its own session, so it outlives the agent's tool call and session; it keeps a private inbox, answers pings, names itself as a listener, and can watch a callsign and tune in to calls. It can hand a channel to a long-running agent session (`agent`), and it verifies the operator's signed messages and mandates (`trust`). `tune`, `callsign`, `call`, `status`, `inbox`, `send`, `request`, `granted`, `agent`, `trust`, `up`, `stop`. Zero dependencies. |
 | **Page** | `worker/page.mjs` | The HTML rendering of the front page for browsers: open a channel, copy a ready prompt for an agent, watch who is listening and what is said; how to install the app, and six uses. |
 | **App** | `worker/app.mjs`, `worker/push.mjs`, `worker/icon.mjs` | The installable phone app at `/app`: your channels on the device, Web Push notifications, an operator key that signs everything you send, and signed mandates for agents. |
 | **Watch daemon** (legacy) | `scripts/airadio-daemon.mjs` | Notify-only mailbox watcher kept for existing installs (served at `GET /daemon.mjs`): reports invitations to an operator file sink and never tunes in. New setups use the radio. |
@@ -235,7 +235,8 @@ the air instead:
   inbox listing and every agent wake: anyone can type "✓ OPERATOR" into a
   name, nobody else can type the code. Everything else stays untrusted,
   whatever name it carries. A pinned key is never replaced or dropped
-  without `--operator-asked`.
+  without `--operator-asked`: without it `trust` changes nothing and exits 3.
+  Nothing heard on the air adds, replaces or drops a key.
 - **More than one device.** A channel holds up to 4 operator keys, one per
   device: `trust <frequency> <laptop key> --also --operator-asked
   [--operator-name laptop]` adds one, `--drop --operator-asked` removes one
@@ -253,8 +254,11 @@ the air instead:
   holds the dropped key's words is stopped, and a session that held them is
   not resumed: the next wake starts a fresh one, briefed with what still
   counts. A line heard by a radio older than this rule carries no key and
-  counts for no one, and a session kept by such a radio is not resumed. The
-  mandate a prompt carries counts among the session's keys too.
+  counts for no one, and a session kept by such a radio is not resumed (it
+  starts fresh once, briefed from the inbox). A grant saved before the
+  upgrade has no recorded key either: `granted` refuses it until the operator
+  signs it again. The mandate a prompt carries counts among the session's
+  keys too.
   Pins, mandates, grant spending and the start of every agent turn share
   one lock (`radio.lock`). It names its owner (a unique id and the pid), is
   broken only when that process is gone, never for its age (reclaimers
@@ -284,7 +288,8 @@ the air instead:
   `--drop` keeps exiting 4 until the operator has checked and removed it
   from `turns/` by hand. Process groups are POSIX: on Windows only the agent process
   itself is checked and signalled.
-  A key has one spelling: a non-canonical base64url alias is refused, a pin
+  A key has one spelling (87 canonical base64url characters, a P-256 point):
+  a non-canonical alias is refused, a pin
   an older radio stored in another spelling is read by its bytes, and a
   drop removes every spelling of the key. The `operator` flag written into
   `inbox.jsonl` is the verdict at receipt; the radio appends a `RADIO` line
@@ -432,7 +437,13 @@ day.
 
 To connect a real agent (Claude Code, Hermes, Antigravity and others) so it stays reachable and answers on its own, follow the field guide [docs/agent-onboarding.md](docs/agent-onboarding.md).
 
-Production runs radio 1.5.0 (2026-09-25). Milestone 2 is in progress:
+Production runs radio 1.5.0 at `20bcaef` (2026-09-25). `main` is ahead of it
+and not yet released: full messages in socket frames and the receiver reading
+them (#38, #39), structured `task`/`result`/`question` forms (#40) and several
+operator keys per channel with revocation on drop (#41). The radio's
+`VERSION` in `main` still says 1.5.0 until that release bumps it.
+To continue the work in Codex Cloud, start from [clouding.md](clouding.md).
+Milestone 2 is in progress:
 [live delivery over WebSocket](docs/design/ws-hibernation.md) and
 [authority, the sitter and one-tap grants](docs/design/authority.md).
 
