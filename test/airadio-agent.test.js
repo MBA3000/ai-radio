@@ -176,7 +176,7 @@ for (const flavor of ["claude", "codex", "opencode", "agy", "hermes"]) {
     assert.equal(mine[1].resume, true);
     assert.equal(mine[1].session, mine[0].session);
     assert.match(mine[0].prompt, /Operator's brief: answer briefly/u);
-    assert.match(mine[0].prompt, /Earlier on this channel:\n\[[^\]]+\] host: welcome aboard/u, "the first wake sees what was said before");
+    assert.match(mine[0].prompt, /Earlier on this channel:\n\[[^\]]+\] UNVERIFIED AGENT host: welcome aboard/u, "the first wake sees what was said before with its authorship verdict");
     assert.doesNotMatch(mine[1].prompt, /Operator's brief/u, "later wakes carry only what is new");
     assert.ok(mine.every(CHAT_ONLY[flavor]), "chat-only by default: " + JSON.stringify(mine.map((call) => call.argv)));
     assert.ok(mine.every((call) => call.cwd === join(home + "-agents", channel.frequency)), "each channel's agent works in a private folder outside the radio's home");

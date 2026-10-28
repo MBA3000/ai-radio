@@ -233,16 +233,21 @@ export function agentSignedPayload({ frequency, from, ts, text }) {
 /** One radio identity. The private half is local, mode 0600; messages carry only the public point. */
 function agentIdentity(p) {
   let held = readJson(p.agentKey, null);
-  if (!held || typeof held.privateKey !== "string" || !operatorKeyValid(held.publicKey)) {
+  if (!held || typeof held.privateKey !== "string" || !operatorKeyValid(held.publicKey)) held = withConfigLock(p, () => {
+    const current = readJson(p.agentKey, null);
+    if (current && typeof current.privateKey === "string" && operatorKeyValid(current.publicKey)) return current;
     const pair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
     const jwk = pair.publicKey.export({ format: "jwk" });
-    held = {
+    const created = {
       publicKey: Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, "base64url"), Buffer.from(jwk.y, "base64url")]).toString("base64url"),
       privateKey: pair.privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
     };
-    writeJson(p.agentKey, held);
-  }
+    writeJson(p.agentKey, created);
+    return created;
+  });
   try { chmodSync(p.agentKey, 0o600); } catch {}
+  heldKeys.add(held.privateKey);
+  heldKeys.add(Buffer.from(held.privateKey).toString("base64"));
   return held;
 }
 
@@ -1017,7 +1022,11 @@ export function runAgentProcess(binary, args, { cwd, input = "", timeoutMs = AGE
 export function cleanReply(text, secrets = []) {
   let reply = String(text === undefined || text === null ? "" : text).trim();
   if (reply === "" || new RegExp("^\\W*" + NO_REPLY + "\\b", "i").test(reply)) return null;
-  for (const secret of secrets) if (typeof secret === "string" && secret.length >= 16) reply = reply.split(secret).join("[key redacted]");
+  for (const secret of secrets) if (typeof secret === "string" && secret.length >= 16) {
+    reply = reply.split(secret).join("[key redacted]");
+    const trimmed = secret.trim();
+    if (trimmed !== secret) reply = reply.split(trimmed).join("[key redacted]");
+  }
   reply = redact(reply);
   if (Buffer.byteLength(reply, "utf8") > AGENT_MAX_REPLY_BYTES) {
     while (Buffer.byteLength(reply, "utf8") > AGENT_MAX_REPLY_BYTES - 16) reply = reply.slice(0, Math.floor(reply.length * 0.9));
@@ -1033,10 +1042,12 @@ export function cleanReply(text, secrets = []) {
  * put it on the air.
  */
 export function leaksSecret(text, secrets = []) {
-  const digits = String(text).toLowerCase().replace(/[^0-9a-f]/g, "");
+  const lowerText = String(text).toLowerCase();
+  const digits = lowerText.replace(/[^0-9a-f]/g, "");
   for (const secret of secrets) {
     if (typeof secret !== "string" || secret.length < 32) continue;
     const lower = secret.toLowerCase();
+    if (lowerText.includes(lower)) return true;
     for (let start = 0; start + 32 <= lower.length; start += 8) if (digits.includes(lower.slice(start, start + 32))) return true;
   }
   return false;
@@ -1065,7 +1076,9 @@ function messageLines(messages, mark) {
   return messages.map((message) => {
     const text = redact(String(message.text));
     const cut = text.length > AGENT_MAX_MESSAGE_CHARS ? " [cut here: " + (text.length - AGENT_MAX_MESSAGE_CHARS) + " more characters not shown]" : "";
-    return "[" + shortTime(message.at) + "] " + (message.operator ? mark + (message.operatorKey ? " (key " + message.operatorKey + ")" : "") + " " : "")
+    const authorship = message.agentVerified ? "\u2713 agent-" + String(message.agentKey).replaceAll("-", "").slice(0, 6) + " "
+      : message.agentUnverified || message.agentRejected ? "UNVERIFIED AGENT " : "";
+    return "[" + shortTime(message.at) + "] " + (message.operator ? mark + (message.operatorKey ? " (key " + message.operatorKey + ")" : "") + " " : authorship)
       + untrustedName(message.from) + ": "
       + (plainText(text, AGENT_MAX_MESSAGE_CHARS) + cut).replace(/\n/g, "\n    ");
   }).join("\n");
@@ -1440,7 +1453,8 @@ export function verifySigned(message, frequency, operatorKey) {
 export function verifyAgentSigned(message, frequency, pinnedKey) {
   const sig = message && message.agentSig;
   if (!sig || typeof sig !== "object") return { ok: false, reason: "unsigned" };
-  if (sig.v !== 1 || !Number.isSafeInteger(sig.ts) || Math.abs(Date.now() - sig.ts) > SIGNATURE_WINDOW_MS) return { ok: false, reason: "stale" };
+  const at = Date.parse(message.at);
+  if (sig.v !== 1 || !Number.isSafeInteger(sig.ts) || !Number.isFinite(at) || Math.abs(at - sig.ts) > SIGNATURE_WINDOW_MS) return { ok: false, reason: "stale" };
   if (typeof pinnedKey !== "string" || sig.key !== pinnedKey) return { ok: false, reason: "wrong key" };
   const publicKey = operatorPublicKey(sig.key);
   if (!publicKey) return { ok: false, reason: "bad key" };
@@ -1714,7 +1728,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     // the operator signed for someone else is not addressed to it.
     if (!allowance(channel).talk && !(message.operator && !message.forOther)) return;
     const current = agentState(frequency, channel.agent);
-    current.pending.push({ seq: message.seq, at: message.at, from: String(message.from), text: String(message.text), ...(message.form ? { form: message.form } : {}), ...(message.operator ? { operator: true } : {}), ...(message.operator && message.operatorKey ? { operatorKey: message.operatorKey } : {}), ...(message.operator && message.signer ? { signer: message.signer } : {}), ...(message.forOther ? { forOther: true } : {}) });
+    current.pending.push({ seq: message.seq, at: message.at, from: String(message.from), text: String(message.text), ...(message.form ? { form: message.form } : {}), ...(message.operator ? { operator: true } : {}), ...(message.operator && message.operatorKey ? { operatorKey: message.operatorKey } : {}), ...(message.operator && message.signer ? { signer: message.signer } : {}), ...(message.agentVerified ? { agentVerified: true, agentKey: message.agentKey } : {}), ...(message.agentRejected ? { agentRejected: message.agentRejected } : {}), ...(message.agentUnverified ? { agentUnverified: true } : {}), ...(message.forOther ? { forOther: true } : {}) });
     if (current.pending.length > AGENT_MAX_BATCH) {
       current.dropped = (current.dropped || 0) + current.pending.length - AGENT_MAX_BATCH;
       current.pending = current.pending.slice(-AGENT_MAX_BATCH);
@@ -1975,7 +1989,9 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       current.lastError = null;
       current.briefed = true;
       const latest = loadConfig(p);
-      const secrets = [...Object.values(latest.channels).map((other) => other.key), latest.mailbox ? latest.mailbox.key : null];
+      const identity = agentIdentity(p);
+      const secrets = [...Object.values(latest.channels).map((other) => other.key), latest.mailbox ? latest.mailbox.key : null,
+        identity.privateKey, Buffer.from(identity.privateKey).toString("base64")];
       const reply = cleanReply(read.reply, secrets);
       if (reply === null) {
         appendInbox(p, { at: new Date().toISOString(), kind: "agent", frequency, from: me, text: "(" + NO_REPLY + ")" });
@@ -2125,7 +2141,10 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       // A revoke addressed to this agent is the operator's "enough": it wakes no one.
       if (!(mandate && mandateFor(mandate, me) && mandate.scope === "revoke")) {
         // The key named on the line is the one verified here, never one the transport carried.
-        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, operatorKey: operator && signedWith ? signedWith : null, signer: operator ? signature.fingerprint : null, form, forOther });
+        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, operatorKey: operator && signedWith ? signedWith : null, signer: operator ? signature.fingerprint : null,
+          ...(agentSignature.ok ? { agentVerified: true, agentKey: agentSignature.fingerprint } : {}),
+          ...(!agentSignature.ok && peer && message.agentSig ? { agentRejected: agentSignature.reason } : {}),
+          ...(!operator && !agentSignature.ok ? { agentUnverified: true } : {}), form, forOther });
       }
     }
     return true;
