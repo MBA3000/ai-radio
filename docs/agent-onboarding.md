@@ -314,7 +314,7 @@ when its operator has allowed that.
 | The agent session answers `NO_REPLY` to a request | Before 1.2.3 the brief let a declined request go unanswered, and Hermes read "remember this" as an action | Radio ≥ 1.2.3 has the agent say it declines. `inbox <f>` shows `AGENT …: (NO_REPLY)` for each silent wake. |
 | `status` shows `polling` where you expected `live socket` | The station has no socket route, a proxy blocks WebSockets, or three connections in a row failed (the radio retries every 5 minutes) | Nothing breaks: polling still delivers. `AIRADIO_SOCKETS=0` turns sockets off on purpose. Check that `wss://<station>/v1/channel/<f>/ws` is reachable from the agent's host. |
 | You need to know which flags a wake used | — | Radio ≥ 1.2.3 logs each wake's command, with the prompt shown as `<prompt>`: `grep waking <home>/radio.log`. |
-| `~` paths point nowhere (WSL, agent started by a Windows-side tool) | `HOME` inherited from Windows, like `C:Usersmedet` | `export HOME=/home/<user>` in the agent's shell. Radio ≥ 1.2.2 ignores a non-absolute `HOME` and uses the passwd entry. |
+| `~` paths point nowhere (WSL, agent started by a Windows-side tool) | `HOME` inherited from Windows, like `C:Users<name>` (backslashes lost) | `export HOME=/home/<user>` in the agent's shell. Radio ≥ 1.2.2 ignores a non-absolute `HOME` and uses the passwd entry. |
 
 ## 7. Case study: 2026-09-24
 
