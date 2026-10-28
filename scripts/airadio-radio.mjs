@@ -45,7 +45,7 @@
 // Files live in $AIRADIO_HOME (default ~/.airadio), private to you (0700/0600).
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash, createPublicKey, randomBytes, randomUUID, verify as verifySignature } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, randomUUID, sign as makeSignature, verify as verifySignature } from "node:crypto";
 import { appendFileSync, chmodSync, closeSync, copyFileSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { createInterface } from "node:readline/promises";
@@ -203,6 +203,7 @@ export function radioPaths(home) {
     unit: join(dir, "radio.unit"),
     grants: join(dir, "grants.json"),
     turns: join(dir, "turns"),
+    agentKey: join(dir, "agent-key.json"),
   };
 }
 
@@ -219,6 +220,34 @@ function writeJson(file, value) {
   const temporary = file + ".tmp-" + process.pid;
   writeFileSync(temporary, JSON.stringify(value, null, 1) + "\n", { mode: 0o600 });
   renameSync(temporary, file);
+}
+
+const AGENT_SIGNED_PREFIX = "airadio-agent-signed-v1";
+
+export function agentSignedPayload({ frequency, from, ts, text }) {
+  return [AGENT_SIGNED_PREFIX, frequency, from, String(ts), text].join("\n");
+}
+
+/** One radio identity. The private half is local, mode 0600; messages carry only the public point. */
+function agentIdentity(p) {
+  let held = readJson(p.agentKey, null);
+  if (!held || typeof held.privateKey !== "string" || !operatorKeyValid(held.publicKey)) {
+    const pair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const jwk = pair.publicKey.export({ format: "jwk" });
+    held = {
+      publicKey: Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, "base64url"), Buffer.from(jwk.y, "base64url")]).toString("base64url"),
+      privateKey: pair.privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
+    };
+    writeJson(p.agentKey, held);
+  }
+  try { chmodSync(p.agentKey, 0o600); } catch {}
+  return held;
+}
+
+function signAgentMessage(p, frequency, from, text, ts = Date.now()) {
+  const identity = agentIdentity(p);
+  const payload = Buffer.from(agentSignedPayload({ frequency, from, ts, text }), "utf8");
+  return { v: 1, key: identity.publicKey, ts, sig: makeSignature("sha256", payload, { key: createPrivateKey(identity.privateKey), dsaEncoding: "ieee-p1363" }).toString("base64url") };
 }
 
 function sleepSync(ms) {
@@ -667,9 +696,10 @@ async function readPage(channel, frequency, listener, since) {
   return got.body;
 }
 
-async function sendText(channel, frequency, from, text) {
+async function sendText(p, channel, frequency, from, text) {
   if (Buffer.byteLength(text, "utf8") > MAX_TEXT_BYTES) throw new RadioError("a message is limited to 16 KB");
-  const sent = await http("POST", channel.station + "/v1/channel/" + frequency + "/send", { key: channel.key, body: { from, text } });
+  const agentSig = signAgentMessage(p, frequency, from, text);
+  const sent = await http("POST", channel.station + "/v1/channel/" + frequency + "/send", { key: channel.key, body: { from, text, agentSig } });
   if (sent.status !== 200 || !sent.body || !Number.isSafeInteger(sent.body.seq)) {
     const error = new RadioError(explain(sent.status, "sending on " + frequency));
     error.status = sent.status;
@@ -1404,6 +1434,23 @@ export function verifySigned(message, frequency, operatorKey) {
   return good ? { ok: true, digest: createHash("sha256").update(payload).digest("base64url"), fingerprint: keyFingerprint(sig.key) } : { ok: false, reason: "bad signature" };
 }
 
+/** Agent identity proves authorship only. It is deliberately separate from operator authority. */
+export function verifyAgentSigned(message, frequency, pinnedKey) {
+  const sig = message && message.agentSig;
+  if (!sig || typeof sig !== "object") return { ok: false, reason: "unsigned" };
+  if (sig.v !== 1 || !Number.isSafeInteger(sig.ts) || Math.abs(Date.now() - sig.ts) > SIGNATURE_WINDOW_MS) return { ok: false, reason: "stale" };
+  if (typeof pinnedKey !== "string" || sig.key !== pinnedKey) return { ok: false, reason: "wrong key" };
+  const publicKey = operatorPublicKey(sig.key);
+  if (!publicKey) return { ok: false, reason: "bad key" };
+  let payload;
+  let good = false;
+  try {
+    payload = Buffer.from(agentSignedPayload({ frequency, from: String(message.from), ts: sig.ts, text: String(message.text) }), "utf8");
+    good = verifySignature("sha256", payload, { key: publicKey, dsaEncoding: "ieee-p1363" }, Buffer.from(String(sig.sig), "base64url"));
+  } catch {}
+  return good ? { ok: true, digest: createHash("sha256").update(payload).digest("base64url"), fingerprint: keyFingerprint(sig.key) } : { ok: false, reason: "bad signature" };
+}
+
 /** A mandate as the radio keeps it, or null when it is malformed or unbounded. */
 export function normalizeMandate(raw, signedAt) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -1960,7 +2007,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         return;
       }
       try {
-        await sendText(channel, frequency, me, reply);
+        await sendText(p, channel, frequency, me, reply);
         current.lastReplyAt = new Date().toISOString();
         appendInbox(p, { at: current.lastReplyAt, kind: "agent", frequency, from: me, text: reply });
         lastActivity = Date.now();
@@ -2008,12 +2055,12 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   // A signature proves who wrote the words, once. Anyone holding the channel key
   // can post the same signed words again within the time window: that is a
   // replay, and it is neither the operator's voice nor a mandate.
-  const firstHearing = (frequency, message, digest) => {
+  const firstHearing = (frequency, message, digest, signedTs = message.sig.ts) => {
     const at = Date.parse(message.at);
     const heard = (Array.isArray(state.signed[frequency]) ? state.signed[frequency] : [])
       .filter((entry) => Array.isArray(entry) && entry[2] >= at - 3 * SIGNATURE_WINDOW_MS);
     const earlier = heard.find((entry) => entry[0] === digest);
-    if (!earlier) heard.push([digest, message.seq, message.sig.ts]);
+    if (!earlier) heard.push([digest, message.seq, signedTs]);
     state.signed[frequency] = heard.slice(-256);
     return earlier && earlier[1] !== message.seq ? { ok: false, reason: "replayed" } : { ok: true };
   };
@@ -2043,6 +2090,9 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     state.cursors[frequency] = message.seq;
     if (message.from === me) return true;
     const operator = Boolean(signature && signature.ok);
+    const peer = channel.agents && typeof channel.agents === "object" ? channel.agents[String(message.from)] : null;
+    let agentSignature = message.agentSig ? verifyAgentSigned(message, frequency, peer && peer.key) : { ok: false, reason: "unsigned" };
+    if (agentSignature.ok) agentSignature = { ...firstHearing(frequency, message, agentSignature.digest, message.agentSig.ts), fingerprint: agentSignature.fingerprint };
     const mandate = operator && message.sig.mandate ? normalizeMandate(message.sig.mandate, message.sig.ts) : null;
     // Reparse signed text locally; station/frame metadata is never trusted.
     const form = parseMessageForm(message.text);
@@ -2058,6 +2108,9 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       ...(mandate ? { mandate } : {}),
       ...(signature && !signature.ok && signature.reason === "another key" ? { signedBy: signature.fingerprint } : {}),
       ...(signature && !signature.ok && signature.reason !== "another key" && signature.reason !== "unsigned" ? { forged: signature.reason } : {}),
+      ...(agentSignature.ok ? { agentVerified: true, agentKey: agentSignature.fingerprint } : {}),
+      ...(!agentSignature.ok && peer && message.agentSig ? { agentRejected: agentSignature.reason } : {}),
+      ...(!operator && !agentSignature.ok ? { agentUnverified: true } : {}),
     });
     // A mandate counts whenever it was signed, even before this radio tuned in.
     if (mandate && mandateFor(mandate, me)) applyMandate(frequency, message, mandate);
@@ -2065,7 +2118,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       state.heard[frequency] = new Date().toISOString();
       lastActivity = Date.now();
       if (!form && isPing(message.text)) {
-        try { await sendText(channel, frequency, me, pongText(me)); } catch (error) { state.errors[frequency] = error.message; }
+        try { await sendText(p, channel, frequency, me, pongText(me)); } catch (error) { state.errors[frequency] = error.message; }
       }
       // A revoke addressed to this agent is the operator's "enough": it wakes no one.
       if (!(mandate && mandateFor(mandate, me) && mandate.scope === "revoke")) {
@@ -2120,7 +2173,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     }
     const channel = { station: config.mailbox.station, key: call.key, as: config.as || config.mailbox.callsign };
     try {
-      const baseline = await sendText(channel, call.frequency, channel.as, channel.as + " is on the air (answering a call from " + String(message.from).slice(0, 64) + ")");
+      const baseline = await sendText(p, channel, call.frequency, channel.as, channel.as + " is on the air (answering a call from " + String(message.from).slice(0, 64) + ")");
       updateConfig(p, (latest) => {
         latest.channels[call.frequency] = { ...channel, via: "call", from: String(message.from).slice(0, 64), note: call.note, tunedAt: new Date().toISOString(), baseline };
       });
@@ -2407,10 +2460,12 @@ export function formatEntry(entry, mark = "\u2713 OPERATOR") {
   if (entry.operator && entry.operatorKey) mark += " (key " + entry.operatorKey + ")";
   if (entry.mandate && entry.operator) return time + " " + entry.frequency + " " + mark + " " + from + " MANDATE for " + entry.mandate.to + ": " + describeMandate(entry.mandate);
   if (entry.operator) return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + " " + mark + " " + from + ": " + entry.text;
+  if (entry.agentVerified) return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + " \u2713 AGENT-" + String(entry.agentKey).replaceAll("-", "").slice(0, 6) + " " + from + ": " + entry.text;
+  if (entry.agentRejected) return time + " " + entry.frequency + " \u26a0 AGENT SIGNATURE REJECTED (" + entry.agentRejected + ") " + from + ": " + entry.text;
   if (entry.forged) return time + " " + entry.frequency + " \u26a0 SIGNATURE REJECTED (" + entry.forged + ") " + from + ": " + entry.text;
   if (entry.revoked) return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + " " + from + " (signed by " + entry.revoked + ", no longer pinned: not your operator's now): " + entry.text;
   if (entry.signedBy) return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + " " + from + " (signed by another key " + entry.signedBy + "): " + entry.text;
-  return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + " " + from + ": " + entry.text;
+  return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + (entry.agentUnverified ? " UNVERIFIED AGENT" : "") + " " + from + ": " + entry.text;
 }
 
 function defaultName() {
@@ -2476,7 +2531,7 @@ async function tuneIn(p, station, frequency, key, flags, out) {
   pinnedOperator(already, flags);
   const baseline = already && already.key === key && already.as === name && Number.isSafeInteger(already.baseline)
     ? already.baseline
-    : await sendText(channel, frequency, name, name + " is on the air");
+    : await sendText(p, channel, frequency, name, name + " is on the air");
   // The network waits above take time, and the operator may add or drop a device meanwhile:
   // the pins are judged against the channel as it is now, never the snapshot taken before them.
   const operator = updateConfig(p, (latest) => {
@@ -2621,7 +2676,7 @@ async function cmdSend(p, args, flags, out) {
     out("  " + command(p, "send " + frequency + " \"<your message>\" --" + OPERATOR_FLAG));
     return 3;
   }
-  const seq = await sendText(channel, frequency, name, text);
+  const seq = await sendText(p, channel, frequency, name, text);
   poke(p);
   out("sent on " + frequency + " as " + name + " (seq " + seq + ")");
 }
@@ -3112,13 +3167,14 @@ async function cmdAgent(p, args, flags, out) {
 
 async function cmdStatus(p, args, flags, out) {
   const config = loadConfig(p);
+  const identity = agentIdentity(p);
   const state = readJson(p.state, {});
   const pid = receiverPid(p);
   const beat = Date.parse(state.heartbeat || "");
   const fresh = Number.isFinite(beat) && Date.now() - beat < STALE_HEARTBEAT_MS;
   const power = pid === null ? "OFF" : fresh ? "ON THE AIR" : "STALLED";
   const unread = unreadFor(p, null);
-  const report = { power, pid, as: config.as || null, heartbeat: state.heartbeat || null, home: p.home, unit: pid === null ? null : unitOf(p), host: pid === null ? null : receiverHost(pid), inbox: { file: p.inbox, unread }, channels: [], mailbox: null };
+  const report = { power, pid, as: config.as || null, agentKey: { publicKey: identity.publicKey, fingerprint: keyFingerprint(identity.publicKey) }, heartbeat: state.heartbeat || null, home: p.home, unit: pid === null ? null : unitOf(p), host: pid === null ? null : receiverHost(pid), inbox: { file: p.inbox, unread }, channels: [], mailbox: null };
   for (const [frequency, channel] of Object.entries(config.channels)) {
     const agentRuntime = channel.agent ? (state.agents || {})[frequency] || {} : null;
     const agentPreset = channel.agent ? presetFor(channel.agent) : null;
@@ -3129,6 +3185,7 @@ async function cmdStatus(p, args, flags, out) {
         ...(operatorKeys(channel).length > 1 ? { devices: operatorKeys(channel).slice(1).map((entry) => ({ name: entry.name || null, fingerprint: entry.fingerprint || keyFingerprint(entry.key) })) } : {}) } : null,
       mandate: channel.mandate ? { ...channel.mandate, active: mandateActive(channel), text: describeMandate(channel.mandate) } : null,
       governed: governed(channel),
+      trustedAgents: Object.entries(channel.agents || {}).map(([callsign, entry]) => ({ callsign, fingerprint: keyFingerprint(entry.key) })),
       agent: channel.agent ? {
         run: channel.agent.exec ? "exec" : channel.agent.run,
         label: agentLabel(channel.agent) + (governed(channel) ? (mandateActive(channel) ? ", on mandate" : ", dormant until a mandate") : ""),
@@ -3155,6 +3212,7 @@ async function cmdStatus(p, args, flags, out) {
   const host = pid === null ? null : receiverHost(pid);
   out("AI RADIO " + power + (pid === null ? "" : " (pid " + pid + ", last poll " + ago(state.heartbeat) + ", every " + Math.round((state.intervalMs || IDLE_POLL_MS) / 1000) + "s)")
     + (unit ? " as systemd unit " + unit : ""));
+  out("  agent key: " + report.agentKey.publicKey + " (" + report.agentKey.fingerprint + "; private key stays in " + p.agentKey + ")");
   if (host) {
     out("  WARNING: the receiver lives inside " + host + ": restarting that service stops it. Move it out:");
     out("  " + command(p, "stop --" + OPERATOR_FLAG) + " && " + command(p, "up") + "   (up hands it to systemd as a unit of its own)");
@@ -3182,6 +3240,22 @@ async function cmdStatus(p, args, flags, out) {
     else out("The radio is OFF. Switch it on: " + command(p, "up"));
   }
   if (power === "STALLED") out("The receiver stopped polling. Restart it: " + command(p, "stop --" + OPERATOR_FLAG) + " && " + command(p, "up"));
+}
+
+async function cmdTrustAgent(p, args, flags, out) {
+  const [frequency, callsign, key] = args;
+  if (!FREQUENCY.test(frequency || "") || !NAME.test(callsign || "") || !operatorKeyValid(key)) {
+    throw new RadioError("usage: trust-agent <frequency> <callsign> <public-key>");
+  }
+  const result = updateConfig(p, (config) => {
+    const channel = config.channels[frequency];
+    if (!channel) return null;
+    if (!channel.agents || typeof channel.agents !== "object") channel.agents = {};
+    channel.agents[callsign] = { key, fingerprint: keyFingerprint(key) };
+    return channel.agents[callsign];
+  });
+  if (!result) throw new RadioError("this radio is not tuned to " + frequency + "; tune in first");
+  out("pinned agent " + callsign + " on " + frequency + ": key " + result.fingerprint + "; signatures prove authorship only and never operator authority");
 }
 
 async function cmdUp(p, args, flags, out) {
@@ -3266,6 +3340,7 @@ const USAGE = [
   "  agent <frequency> --exec <command> | --off      a custom agent command (wake JSON on stdin, reply on stdout), or release it",
   "  trust <frequency> [<operator-key>] [--operator-name <n>]  pin (or show) your operator's key; tune --operator does it too",
   "  trust <frequency> <operator-key> --also|--drop --operator-asked  add or drop another device of your operator (at most " + MAX_OPERATOR_KEYS + " keys)",
+  "  trust-agent <frequency> <callsign> <public-key>  locally pin an agent identity; never grants operator authority",
   "  agent <frequency> --run <cli> --on-mandate      a session that talks only while your operator's signed mandate is valid",
   "  run                                             the receiver itself, in the foreground (systemd)",
   "files: $AIRADIO_HOME or ~/.airadio (override with --home <dir>)",
@@ -3291,7 +3366,7 @@ export async function main(argv = process.argv.slice(2), { out = (line) => conso
   const { args, flags } = parseArgs(argv);
   const p = radioPaths(flags.home || home);
   const [name, ...rest] = args;
-  const commands = { tune: cmdTune, call: cmdCall, callsign: cmdCallsign, send: cmdSend, request: cmdRequest, granted: cmdGranted, inbox: cmdInbox, status: cmdStatus, up: cmdUp, stop: cmdStop, agent: cmdAgent, trust: cmdTrust };
+  const commands = { tune: cmdTune, call: cmdCall, callsign: cmdCallsign, send: cmdSend, request: cmdRequest, granted: cmdGranted, inbox: cmdInbox, status: cmdStatus, up: cmdUp, stop: cmdStop, agent: cmdAgent, trust: cmdTrust, "trust-agent": cmdTrustAgent };
   if (name === "run") {
     await runReceiver({ home: p.home });
     return 0;

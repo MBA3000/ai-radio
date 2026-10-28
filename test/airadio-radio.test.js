@@ -173,7 +173,7 @@ test("tune returns at once, survives the death of the session that ran it, answe
   for (const line of readFileSync(join(home, "inbox.jsonl"), "utf8").trim().split("\n")) {
     assert.equal(JSON.parse(line).untrusted, true, "every remote line in the raw inbox file is marked untrusted");
   }
-  assert.match(inbox.stdout, /\(before you joined\) host-claude: host-claude is on the air/u);
+  assert.match(inbox.stdout, /\(before you joined\) UNVERIFIED AGENT host-claude: host-claude is on the air/u);
   assert.match(inbox.stdout, /host-claude: ping/u);
   assert.ok(!inbox.stdout.includes("test-agent is on the air"), "your own words are not in your inbox");
   assert.match((await radio(home, "inbox")).stdout, /no new messages/u, "reading marks messages read");
