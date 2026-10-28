@@ -305,12 +305,12 @@ async function http(method, url, { key, listener, body } = {}) {
 //
 // Since 1.3.0 the receiver keeps one WebSocket per channel. The station sends
 // "hello" with the channel's newest seq when the socket opens, and a frame for
-// each new message. The socket never handles a message itself: it only says
-// that something is newer than what the receiver has read, and the receiver
-// reads the channel at once through the same REST path it polls with, where
-// signatures, mandates, pings and agents are handled. A quiet channel costs no
-// requests, and a message costs one read. While the socket is up the channel
-// is still polled every 5 minutes, as a safety net. After three failed
+// each new message. Full rows go through the same message handler as REST:
+// signatures, mandates, pings and agents are checked there. Missing bodies,
+// gaps and rejected frames fall back to REST. Three rejected frames drop the
+// socket and resume polling. A quiet channel and a live message cost no reads.
+// While the socket is up the channel is still polled every 5 minutes, as a
+// safety net. After three failed
 // connections in a row it is polled as before, and the socket is tried again
 // every 5 minutes. AIRADIO_SOCKETS=0 switches sockets off.
 
@@ -357,6 +357,9 @@ export class ChannelSocket {
     // Each frame that shows something unread counts up; the receiver reads until it has caught up with the count.
     this.news = 0;
     this.handled = 0;
+    this.messages = [];
+    this.needsRead = false;
+    this.invalidFrames = 0;
     this.ws = null;
     this.timer = null;
     this.pinger = null;
@@ -388,7 +391,7 @@ export class ChannelSocket {
       this.down();
       try { ws.close(); } catch {}
     };
-    ws.onmessage = (event) => this.heard(event.data);
+    ws.onmessage = (event) => { if (this.ws === ws) this.heard(event.data); };
     // Node 22's WebSocket reports a refused handshake with "error" and no "close", so either one counts.
     ws.onerror = lost;
     ws.onclose = lost;
@@ -416,9 +419,24 @@ export class ChannelSocket {
       seq = frame.msg.seq;
     }
     if (Number.isSafeInteger(seq) && seq > this.cursor()) {
+      if (frame.type === "message" && Object.hasOwn(frame.msg, "text") && this.messages.length < PAGE_LIMIT) {
+        this.messages.push(frame.msg);
+      } else {
+        // Old stations/mailboxes send seq alone. Overflow is caught up by REST.
+        this.needsRead = true;
+      }
       this.news += 1;
       this.onNews();
     }
+  }
+
+  rejectMessage() {
+    this.invalidFrames += 1;
+    if (this.invalidFrames < SOCKET_MAX_FAILURES) return;
+    this.failures = SOCKET_MAX_FAILURES;
+    const ws = this.ws;
+    this.down();
+    try { if (ws) ws.close(); } catch {}
   }
 
   ping() {
@@ -435,6 +453,8 @@ export class ChannelSocket {
 
   down() {
     this.ws = null;
+    this.messages = [];
+    this.needsRead = true;
     clearInterval(this.pinger);
     this.pinger = null;
     this.state = "down";
@@ -1452,6 +1472,53 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     return earlier && earlier[1] !== message.seq ? { ok: false, reason: "replayed" } : { ok: true };
   };
 
+  // One trust and delivery path for REST rows and full socket messages.
+  const receiveMessage = async (config, frequency, channel, message, fromSocket = false) => {
+    if (!Number.isSafeInteger(message.seq) || message.seq <= cursorOf(frequency)) return true;
+    if (fromSocket && (typeof message.from !== "string" || typeof message.text !== "string"
+      || typeof message.at !== "string" || !Number.isFinite(Date.parse(message.at))
+      || Buffer.byteLength(message.text, "utf8") > MAX_TEXT_BYTES)) return false;
+    const me = channel.as || config.as;
+    if (!fromSocket && message.from === me) {
+      state.cursors[frequency] = message.seq;
+      return true;
+    }
+    const history = Number.isSafeInteger(channel.baseline) && message.seq <= channel.baseline;
+    // Checked against the key pinned now: the owner may have replaced it since this tick began.
+    const pinned = message.sig ? (loadConfig(p).channels[frequency] || {}).operator || null : null;
+    let signature = message.sig ? (pinned ? verifySigned(message, frequency, pinned.key) : { ok: false, reason: "another key", fingerprint: typeof message.sig.key === "string" ? keyFingerprint(message.sig.key) : null }) : null;
+    if (signature && signature.ok) signature = firstHearing(frequency, message, signature.digest);
+    // A frame must not consume a seq or reach an inbox/agent on failed trust.
+    // REST keeps rejected signatures as marked, untrusted records as before.
+    if (fromSocket && signature && !signature.ok) return false;
+    state.cursors[frequency] = message.seq;
+    if (message.from === me) return true;
+    const operator = Boolean(signature && signature.ok);
+    const mandate = operator && message.sig.mandate ? normalizeMandate(message.sig.mandate, message.sig.ts) : null;
+    appendInbox(p, {
+      at: message.at, frequency, seq: message.seq, from: String(message.from), text: String(message.text),
+      ...(history ? { history: true } : {}),
+      ...(operator ? { operator: true } : {}),
+      ...(mandate ? { mandate } : {}),
+      ...(signature && !signature.ok && signature.reason === "another key" ? { signedBy: signature.fingerprint } : {}),
+      ...(signature && !signature.ok && signature.reason !== "another key" && signature.reason !== "unsigned" ? { forged: signature.reason } : {}),
+    });
+    // A mandate counts whenever it was signed, even before this radio tuned in.
+    if (mandate && mandateFor(mandate, me)) applyMandate(frequency, message, mandate);
+    if (!history) {
+      state.heard[frequency] = new Date().toISOString();
+      lastActivity = Date.now();
+      if (isPing(message.text)) {
+        try { await sendText(channel, frequency, me, pongText(me)); } catch (error) { state.errors[frequency] = error.message; }
+      }
+      // A revoke addressed to this agent is the operator's "enough": it wakes no one.
+      if (!(mandate && mandateFor(mandate, me) && mandate.scope === "revoke")) {
+        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, ...(mandate && !mandateFor(mandate, me) ? { forOther: true } : {}) });
+      }
+    }
+    return true;
+  };
+
   const pollChannel = async (config, frequency, channel) => {
     const me = channel.as || config.as;
     let since = Number.isSafeInteger(state.cursors[frequency]) ? state.cursors[frequency] : 0;
@@ -1465,40 +1532,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         return;
       }
       delete state.errors[frequency];
-      for (const message of body.messages) {
-        if (!Number.isSafeInteger(message.seq) || message.seq <= since) continue;
-        since = message.seq;
-        state.cursors[frequency] = since;
-        if (message.from === me) continue;
-        const history = Number.isSafeInteger(channel.baseline) && message.seq <= channel.baseline;
-        // Checked against the key pinned now: the owner may have replaced it since this tick began.
-        const pinned = message.sig ? (loadConfig(p).channels[frequency] || {}).operator || null : null;
-        let signature = message.sig ? (pinned ? verifySigned(message, frequency, pinned.key) : { ok: false, reason: "another key", fingerprint: typeof message.sig.key === "string" ? keyFingerprint(message.sig.key) : null }) : null;
-        if (signature && signature.ok) signature = firstHearing(frequency, message, signature.digest);
-        const operator = Boolean(signature && signature.ok);
-        const mandate = operator && message.sig.mandate ? normalizeMandate(message.sig.mandate, message.sig.ts) : null;
-        appendInbox(p, {
-          at: message.at, frequency, seq: message.seq, from: String(message.from), text: String(message.text),
-          ...(history ? { history: true } : {}),
-          ...(operator ? { operator: true } : {}),
-          ...(mandate ? { mandate } : {}),
-          ...(signature && !signature.ok && signature.reason === "another key" ? { signedBy: signature.fingerprint } : {}),
-          ...(signature && !signature.ok && signature.reason !== "another key" && signature.reason !== "unsigned" ? { forged: signature.reason } : {}),
-        });
-        // A mandate counts whenever it was signed, even before this radio tuned in.
-        if (mandate && mandateFor(mandate, me)) applyMandate(frequency, message, mandate);
-        if (!history) {
-          state.heard[frequency] = new Date().toISOString();
-          lastActivity = Date.now();
-          if (isPing(message.text)) {
-            try { await sendText(channel, frequency, me, pongText(me)); } catch (error) { state.errors[frequency] = error.message; }
-          }
-          // A revoke addressed to this agent is the operator's "enough": it wakes no one.
-          if (!(mandate && mandateFor(mandate, me) && mandate.scope === "revoke")) {
-            queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, ...(mandate && !mandateFor(mandate, me) ? { forOther: true } : {}) });
-          }
-        }
-      }
+      for (const message of body.messages) await receiveMessage(config, frequency, channel, message);
+      since = cursorOf(frequency);
       if (Number.isSafeInteger(body.nextSince) && body.nextSince > since) {
         since = body.nextSince;
         state.cursors[frequency] = since;
@@ -1583,8 +1618,28 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
         if (!due(frequency)) continue;
         const socket = sockets.get(frequency);
         const handling = socket ? socket.news : 0;
-        readAt[frequency] = Date.now();
-        await pollChannel(config, frequency, config.channels[frequency]);
+        let needsRead = !socket || !socket.live || socket.needsRead || Boolean(state.errors[frequency])
+          || Date.now() - (readAt[frequency] || 0) >= SOCKET_SAFETY_POLL_MS;
+        const messages = socket ? socket.messages.splice(0) : [];
+        if (socket) socket.needsRead = false;
+        for (const message of messages) {
+          if (!socket.live) break;
+          if (message.seq <= cursorOf(frequency)) continue;
+          if (message.seq !== cursorOf(frequency) + 1) {
+            needsRead = true;
+            continue;
+          }
+          if (await receiveMessage(config, frequency, config.channels[frequency], message, true)) {
+            socket.invalidFrames = 0;
+          } else {
+            socket.rejectMessage();
+            needsRead = true;
+          }
+        }
+        if (needsRead) {
+          readAt[frequency] = Date.now();
+          await pollChannel(config, frequency, config.channels[frequency]);
+        }
         // A read that failed leaves the news unhandled, so the next tick reads again.
         if (socket && !state.errors[frequency]) socket.handled = handling;
       }

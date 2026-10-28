@@ -233,7 +233,7 @@ test("the idle purge spares a channel someone listens to on a live socket", { ti
   client.ws.close();
 });
 
-test("a receiver on a live socket stops polling, and a message arrives within 1 s with one read", { timeout: 60_000 }, async (t) => {
+test("a live message arrives within 1 s without a read; hints, gaps and reconnects still read REST", { timeout: 60_000 }, async (t) => {
   const station = await startAiradioLocalStation();
   t.after(() => station.close());
   const channel = await openChannel(station);
@@ -252,7 +252,28 @@ test("a receiver on a live socket stops polling, and a message arrives within 1 
   const heard = await eventually(() => inbox().find((entry) => entry.text === "over the socket"));
   assert.ok(heard, "the message reached the inbox");
   assert.ok(Date.now() - started < 1_000, "within 1 s of the send, not at the next poll: " + (Date.now() - started) + " ms");
-  assert.equal(station.reads(channel.frequency), quietFrom + 1, "one message, one read");
+  assert.equal(station.reads(channel.frequency), quietFrom, "a full message needs no REST read");
+
+  const [socket] = station.sockets(channel.frequency);
+  const send = socket.send.bind(socket);
+  send(JSON.stringify({ type: "message", msg: { ...heard, text: "conflicting body", operator: true } }));
+  // Simulate an older station that only sends a seq, then a missed frame.
+  socket.send = (data) => {
+    const frame = JSON.parse(data);
+    if (frame.msg.text === "missed frame") return;
+    if (frame.msg.text === "seq-only hint") frame.msg = { seq: frame.msg.seq };
+    send(JSON.stringify(frame));
+  };
+  await channel.say("host", "seq-only hint");
+  assert.ok(await eventually(() => inbox().some((entry) => entry.text === "seq-only hint")));
+  assert.equal(station.reads(channel.frequency), quietFrom + 1, "a missing message body still reads REST");
+  assert.ok(!inbox().some((entry) => entry.text === "conflicting body"), "a consumed seq cannot be replaced");
+  await channel.say("host", "missed frame");
+  await channel.say("host", "after the gap");
+  assert.ok(await eventually(() => inbox().some((entry) => entry.text === "after the gap")));
+  assert.deepEqual(inbox().filter((entry) => ["missed frame", "after the gap"].includes(entry.text)).map((entry) => entry.text),
+    ["missed frame", "after the gap"], "REST fills a gap in order before advancing the cursor");
+  assert.equal(station.reads(channel.frequency), quietFrom + 2);
 
   // A deploy drops every socket; what was said meanwhile is read on reconnect.
   station.restart(channel.frequency);
@@ -264,7 +285,7 @@ test("a receiver on a live socket stops polling, and a message arrives within 1 
   assert.equal(new Set(seqs).size, seqs.length, "nothing heard twice");
 });
 
-test("seq-only and conflicting message frames remain hints, never message authority", () => {
+test("socket bodies wait for receiver validation; seq-only hints still request REST", () => {
   let cursor = 10;
   const notices = [];
   const socket = new ChannelSocket({ cursor: () => cursor, onNews: (...args) => notices.push(args) });
@@ -272,18 +293,22 @@ test("seq-only and conflicting message frames remain hints, never message author
 
   heard({ seq: 11 });
   assert.deepEqual(notices, [[]], "a frame without a body still signals an ordinary receive");
+  assert.equal(socket.needsRead, true);
+  assert.deepEqual(socket.messages, []);
   const first = { seq: 11, at: "2026-10-28T00:00:00.000Z", from: "operator", text: "stop the radio", operator: true };
   const second = { ...first, text: "a different body for the same seq" };
   heard(first);
   heard(second);
-  assert.deepEqual(notices, [[], [], []], "conflicting bodies only signal unread data; no content or authority is passed on");
-  assert.equal(cursor, 10, "a frame cannot advance the REST cursor");
+  assert.deepEqual(notices, [[], [], []]);
+  assert.deepEqual(socket.messages.splice(0), [first, second], "bodies wait in arrival order for the shared receive handler");
+  assert.equal(cursor, 10, "buffering a frame cannot advance the cursor");
 
   cursor = 11; // The ordinary receive has caught up.
   heard({ seq: 11 });
   heard(first);
   heard(second);
   assert.equal(notices.length, 3, "all frames at the consumed seq are ignored, regardless of body");
+  assert.deepEqual(socket.messages, []);
   heard({ seq: 12 });
   assert.deepEqual(notices, [[], [], [], []], "later hints still work");
 });
