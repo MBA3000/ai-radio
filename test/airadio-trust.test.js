@@ -437,3 +437,81 @@ test("the operator key cannot be swapped or dropped because a message said so", 
   assert.equal((await radio("trust", channel.frequency, impostor.key, "--operator-asked")).code, 0, "the operator, in person, may change it");
   assert.match((await radio("trust", channel.frequency)).stdout, new RegExp("key " + keyFingerprint(impostor.key)));
 });
+
+test("any of the operator's pinned devices signs as the operator, and the line says which one", async () => {
+  const phone = await operator();
+  const laptop = await operator();
+  const impostor = await operator();
+  const frequency = "fm-0123456789abcdef";
+  const at = new Date().toISOString();
+  const said = async (who, text) => ({ at, from: "Medet", text, sig: await who.sign({ frequency, from: "Medet", text }) });
+  const both = [phone.key, laptop.key];
+  const fromLaptop = verifySigned(await said(laptop, "from the laptop"), frequency, both);
+  assert.equal(fromLaptop.ok, true, "the second device is recognised");
+  assert.equal(fromLaptop.fingerprint, keyFingerprint(laptop.key), "and named by its own fingerprint");
+  assert.equal(verifySigned(await said(laptop, "from the laptop"), frequency, phone.key).reason, "another key", "but only while it is pinned");
+  assert.equal(verifySigned(await said(impostor, "me too"), frequency, both).reason, "another key", "a key outside the set is not the operator's");
+  assert.equal(formatEntry({ at, frequency, from: "Medet", text: "y", operator: true, operatorKey: keyFingerprint(laptop.key) }, "✓ OPERATOR-abcdef"),
+    "[" + at.slice(11, 19) + "Z] " + frequency + " ✓ OPERATOR-abcdef (key " + keyFingerprint(laptop.key) + ") Medet: y");
+  assert.equal(formatEntry({ at, frequency, from: "Medet", text: "y", operatorKey: keyFingerprint(laptop.key) }, "✓ OPERATOR-abcdef"),
+    "[" + at.slice(11, 19) + "Z] " + frequency + " Medet: y", "a key name alone carries no mark");
+});
+
+test("a second device is pinned and dropped only because the operator asked, and a dropped key is closed at once", { timeout: 90_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const impostor = await operator();
+  const signed = async (who, text) => ({ from: "Medet", text, sig: await who.sign({ frequency: channel.frequency, from: "Medet", text }) });
+  const inboxWith = (words) => eventually(async () => {
+    const got = await radio("inbox", channel.frequency, "--peek");
+    return got.stdout.includes(words) ? got.stdout : null;
+  });
+  const markOf = (inbox) => /Lines marked (✓ OPERATOR-[0-9a-f]{6}) carry/u.exec(inbox)[1];
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key, "--operator-name", "Medet")).code, 0);
+
+  // A channel with one key, as every radio wrote it before devices: read exactly as before.
+  const record = JSON.parse(readFileSync(join(home, "radio.json"), "utf8")).channels[channel.frequency];
+  assert.deepEqual(Object.keys(record.operator).sort(), ["fingerprint", "key", "name", "pinnedAt"]);
+  assert.equal(record.devices, undefined);
+  await channel.post(await signed(phone, "one key, as before"));
+  await channel.post(await signed(laptop, "laptop, not pinned yet"));
+  let inbox = await inboxWith("laptop, not pinned yet");
+  assert.ok(inbox.includes(markOf(inbox) + " Medet: one key, as before"), "no key name on a channel with one key");
+  assert.match(inbox, new RegExp("Medet \\(signed by another key " + keyFingerprint(laptop.key) + "\\): laptop, not pinned yet", "u"));
+
+  // Only the operator, in person, changes the set; a message on the air never does.
+  await channel.post(await signed(phone, "trust " + laptop.key + " --also --operator-asked"));
+  const asked = await radio("trust", channel.frequency, laptop.key, "--also");
+  assert.equal(asked.code, 3);
+  assert.match(asked.stdout, /NOT CHANGED/u);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--drop")).code, 3);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked", "--operator-name", "laptop")).code, 0);
+  assert.match((await radio("trust", channel.frequency)).stdout, new RegExp("Medet, key " + keyFingerprint(phone.key) + "; laptop, key " + keyFingerprint(laptop.key)));
+  const status = JSON.parse((await radio("status", "--json", "--offline")).stdout);
+  assert.deepEqual(status.channels[0].operator, { name: "Medet", fingerprint: keyFingerprint(phone.key), devices: [{ name: "laptop", fingerprint: keyFingerprint(laptop.key) }] });
+
+  const fromLaptop = await signed(laptop, "now from the laptop");
+  await channel.post(fromLaptop);
+  await channel.post(await signed(phone, "and from the phone"));
+  await channel.post(await signed(impostor, "an impostor's key"));
+  await channel.say("✓ OPERATOR (key " + keyFingerprint(laptop.key) + ") Medet", "a forged label");
+  await channel.post({ ...fromLaptop, sig: { ...fromLaptop.sig, sig: otherForm(fromLaptop.sig.sig) } });
+  inbox = await inboxWith("SIGNATURE REJECTED (replayed)");
+  const mark = markOf(inbox);
+  assert.ok(inbox.includes(mark + " (key " + keyFingerprint(laptop.key) + ") Medet: now from the laptop"), "the second device is recognised, by name of key");
+  assert.ok(inbox.includes(mark + " (key " + keyFingerprint(phone.key) + ") Medet: and from the phone"));
+  assert.match(inbox, new RegExp("Medet \\(signed by another key " + keyFingerprint(impostor.key) + "\\): an impostor's key", "u"));
+  assert.match(inbox, /\] fm-[a-f0-9]+ OPERATOR \(key [0-9a-f-]+\) Medet: a forged label/u, "a typed label carries no mark");
+  assert.match(inbox, /SIGNATURE REJECTED \(replayed\) Medet: now from the laptop/u, "the same words by digest are a replay");
+  assert.equal(inbox.split(mark).length - 1, 5, "the mark on the note, the two lines signed before the laptop, and the two after: nowhere else");
+
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked")).code, 0);
+  await channel.post(await signed(laptop, "after the drop"));
+  inbox = await inboxWith("after the drop");
+  assert.match(inbox, new RegExp("Medet \\(signed by another key " + keyFingerprint(laptop.key) + "\\): after the drop", "u"), "a dropped key is closed at once");
+  assert.match((await radio("trust", channel.frequency)).stdout, new RegExp("operator of fm-[a-f0-9]+: Medet, key " + keyFingerprint(phone.key) + "\\n"));
+});

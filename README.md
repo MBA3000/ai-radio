@@ -236,6 +236,13 @@ the air instead:
   name, nobody else can type the code. Everything else stays untrusted,
   whatever name it carries. A pinned key is never replaced or dropped
   without `--operator-asked`.
+- **More than one device.** A channel holds up to 4 operator keys, one per
+  device: `trust <frequency> <laptop key> --also --operator-asked
+  [--operator-name laptop]` adds one, `--drop --operator-asked` removes one
+  (its messages stop being the operator's at once, and the mandate goes with
+  it). With more than one key pinned, a marked line names the key that signed
+  it: `✓ OPERATOR-<code> (key 3f9a-…) Medet: …`. A channel with one key reads
+  exactly as before.
 - **Mandates.** From the channel menu the operator signs what an agent may do
   (*talk*, *talk + tools* or *revoke*) and until when: an exact moment picked
   in their own time or in UTC, at most 31 days ahead, with an optional note.
