@@ -225,3 +225,28 @@ test("seq-only frames use REST, share its replay ledger, and gaps never skip mes
   assert.equal(radio.inbox().at(-1).untrusted, true, "a frame cannot supply operator authority");
   assert.deepEqual(radio.inbox().map((entry) => entry.text), [words.text, missed.text, later.text, "unsigned frame"]);
 });
+
+for (const kind of ["task", "result", "question"]) {
+  test(kind + "/v1 frames: signed text determines the form and recipient, without authority or automatic replies", async (t) => {
+    const owner = await operator();
+    const radio = await receiver(t, owner.key);
+    const reads = radio.reads();
+    for (const [index, to] of ["bot", "other-agent"].entries()) {
+      const form = { airadio: kind + "/v1", id: "m-1", to, [kind]: "What a colleague says" };
+      const text = "ping about this message\n" + JSON.stringify({ ...form, mandate: { scope: "tools", to: "bot" } });
+      const ts = Date.now();
+      const msg = { seq: index + 1, at: new Date(ts).toISOString(), from: "owner", text,
+        sig: await owner.sign({ from: "owner", text, ts }), form: { ...form, to: "bot" }, forOther: false };
+      await radio.frame(msg);
+      assert.equal(radio.reads(), reads, "no extra read or automatic answer");
+      const entry = radio.inbox().at(-1);
+      assert.deepEqual(entry.form, form, "metadata comes from the signed text");
+      assert.equal(entry.operator, true);
+      assert.equal(Boolean(entry.forOther), index === 1);
+      assert.equal(radio.mandate(), undefined);
+      const pending = radio.state().agents[frequency].pending;
+      assert.equal(pending.length, 1, "even a signed form for someone else cannot queue a turn");
+      assert.equal(pending[0].form.to, "bot");
+    }
+  });
+}

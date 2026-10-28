@@ -97,6 +97,29 @@ export function parseCall(text) {
   return { frequency: body.frequency, key: body.key, note: typeof body.note === "string" ? body.note.slice(0, 200) : "" };
 }
 
+/** Data-only forms. Kept self-contained: the sync script also exports this parser for the station. */
+export function parseMessageForm(text) {
+  if (typeof text !== "string") return null;
+  const bytes = (value) => new TextEncoder().encode(value).length;
+  if (bytes(text) > 16 * 1024) return null;
+  const newline = text.indexOf("\n");
+  if (newline < 1) return null;
+  const headline = text.slice(0, newline).trim();
+  if (!headline || bytes(headline) > 500) return null;
+  let body;
+  try { body = JSON.parse(text.slice(newline + 1)); } catch { return null; }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const field = body.airadio === "task/v1" ? "task" : body.airadio === "result/v1" ? "result" : body.airadio === "question/v1" ? "question" : null;
+  if (!field) return null;
+  const id = (value) => typeof value === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(value);
+  if (!id(body.id) || typeof body.to !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(body.to)) return null;
+  if (typeof body[field] !== "string" || !body[field].trim() || bytes(body[field]) > 4096) return null;
+  if (body.replyTo !== undefined && !id(body.replyTo)) return null;
+  // Copy only data fields. Words such as operator, mandate or tools cannot confer authority.
+  return { airadio: body.airadio, id: body.id, to: body.to, [field]: body[field],
+    ...(body.replyTo !== undefined ? { replyTo: body.replyTo } : {}) };
+}
+
 /** Hide anything shaped like a credential before it reaches a screen or a log. */
 // Keys this radio holds, learned each time its config is read. Hiding them by
 // value, and not every long hex string, lets a SHA-256 through: seen live on
@@ -1213,12 +1236,13 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   };
 
   const queueForAgent = (frequency, channel, message) => {
-    if (!channel.agent || isChatter(message.text)) return;
+    if (!channel.agent || (!message.form && isChatter(message.text))) return;
+    if (message.form && message.forOther) return;
     // Without a valid mandate a governed agent hears only its operator; a mandate
     // the operator signed for someone else is not addressed to it.
     if (!allowance(channel).talk && !(message.operator && !message.forOther)) return;
     const current = agentState(frequency, channel.agent);
-    current.pending.push({ seq: message.seq, at: message.at, from: String(message.from), text: String(message.text), ...(message.operator ? { operator: true } : {}), ...(message.forOther ? { forOther: true } : {}) });
+    current.pending.push({ seq: message.seq, at: message.at, from: String(message.from), text: String(message.text), ...(message.form ? { form: message.form } : {}), ...(message.operator ? { operator: true } : {}), ...(message.forOther ? { forOther: true } : {}) });
     if (current.pending.length > AGENT_MAX_BATCH) {
       current.dropped = (current.dropped || 0) + current.pending.length - AGENT_MAX_BATCH;
       current.pending = current.pending.slice(-AGENT_MAX_BATCH);
@@ -1321,6 +1345,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const session = resume ? current.session : preset.newSession ? preset.newSession() : null;
     const history = current.briefed ? [] : inboxSince(p, 0).entries
       .filter((entry) => entry.frequency === frequency && !entry.kind && Number.isSafeInteger(entry.seq) && entry.seq < messages[0].seq)
+      .filter((entry) => !(entry.form && entry.forOther))
       // Answering only its operator, the session sees only its operator's earlier words.
       .filter((entry) => !operatorOnly || entry.operator === true)
       .slice(-AGENT_HISTORY_LINES);
@@ -1497,8 +1522,12 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     if (message.from === me) return true;
     const operator = Boolean(signature && signature.ok);
     const mandate = operator && message.sig.mandate ? normalizeMandate(message.sig.mandate, message.sig.ts) : null;
+    // Reparse signed text locally; station/frame metadata is never trusted.
+    const form = parseMessageForm(message.text);
+    const forOther = Boolean((form && form.to !== me) || (mandate && !mandateFor(mandate, me)));
     appendInbox(p, {
       at: message.at, frequency, seq: message.seq, from: String(message.from), text: String(message.text),
+      ...(form ? { form, ...(forOther ? { forOther: true } : {}) } : {}),
       ...(history ? { history: true } : {}),
       ...(operator ? { operator: true } : {}),
       ...(mandate ? { mandate } : {}),
@@ -1510,12 +1539,12 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     if (!history) {
       state.heard[frequency] = new Date().toISOString();
       lastActivity = Date.now();
-      if (isPing(message.text)) {
+      if (!form && isPing(message.text)) {
         try { await sendText(channel, frequency, me, pongText(me)); } catch (error) { state.errors[frequency] = error.message; }
       }
       // A revoke addressed to this agent is the operator's "enough": it wakes no one.
       if (!(mandate && mandateFor(mandate, me) && mandate.scope === "revoke")) {
-        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, ...(mandate && !mandateFor(mandate, me) ? { forOther: true } : {}) });
+        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, form, forOther });
       }
     }
     return true;

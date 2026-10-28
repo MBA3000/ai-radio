@@ -51,6 +51,14 @@ Socket tests also check a fresh rejection count after reconnect. The socket
 integration suite checks seq-only fallback and gap recovery; it needs loopback
 listeners. A sandbox denying `listen` cannot establish a green release gate.
 
+For structured messages (t5), `test/airadio-forms.test.js` covers task,
+result and question validation, REST/socket metadata, recipient isolation
+and unchanged authority with in-memory SQLite and mocked transport. The
+socket receiver suite checks signed forms through the actual receive loop.
+These tests need no network or loopback listener. Regenerate the served
+radio after source changes; the embedding also supplies the station's
+identical parser. No storage migration or signature change is needed.
+
 ## 2. Deploy staging through the workflow
 
 The workflow runs the tests, performs the deployment, reads `/health` back

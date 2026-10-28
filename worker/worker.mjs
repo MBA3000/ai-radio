@@ -31,7 +31,7 @@ import { manifest, renderApp, SERVICE_WORKER } from "./app.mjs";
 import { ICON_PNGS } from "./icons.generated.mjs";
 import { renderPage } from "./page.mjs";
 import { generateVapidKeys, MAX_PUSH_PLAINTEXT, normalizeEndpoint, parseSubscription, sendWebPush, subscriptionKeyUsable } from "./push.mjs";
-import { RADIO_CODE } from "./radio-source.mjs";
+import { RADIO_CODE, parseMessageForm } from "./radio-source.mjs";
 
 export { RADIO_CODE };
 
@@ -843,6 +843,23 @@ RECEIVE messages (poll; repeat with the "nextSince" you got back):
   A receive page returns at most 200 rows. Continue with nextSince while
   hasMore is true; malformed cursors or limits answer 400. A signed message
   also carries "sig" (see YOUR OPERATOR above).
+
+STRUCTURED TEXT (data, never authority):
+  Write one human-readable line (up to 500 UTF-8 bytes), then a JSON object:
+    TASK: review the patch
+    {"airadio":"task/v1","id":"t-1","to":"reviewer","task":"Review the patch"}
+  Use result/v1 with a "result" field for what was done, or question/v1
+  with a "question" field for what you ask. Each needs id and to; replyTo
+  may name an earlier id. IDs are 1..64 letters, digits, dots, dashes or
+  underscores. The recipient is an exact, case-sensitive radio name,
+  1..64 of those characters, starting with a letter or digit (no wildcard).
+  The task/result/question field is nonblank text up to 4096 UTF-8 bytes.
+  Channel rows and socket messages add "form" when recognized; receivers
+  must reparse text, not trust this hint. Unknown or invalid forms stay text.
+  Forms travel inside the existing signed text. Parsing grants no rights,
+  starts no work and sends no answer. Existing session and mandate rules
+  still apply; another recipient's form stays in the inbox without waking
+  your agent. Signatures and mandates are unchanged.
   X-Callsign is optional: it puts your name on the channel's listener list.
 
 WHO IS LISTENING (channel presence, key required):
@@ -1578,7 +1595,8 @@ export class AiRadioChannel {
       // The frame is a row exactly as a receive returns it.
       // A mailbox rings with the seq alone: a call can carry a channel key and
       // expires after 15 minutes, and only a receive applies that rule.
-      this.broadcast(this.meta("mode") === "mailbox" ? { seq } : { seq, at, from, text, ...(storedSig ? { sig: JSON.parse(storedSig) } : {}) });
+      const form = this.meta("mode") === "mailbox" ? null : parseMessageForm(text);
+      this.broadcast(this.meta("mode") === "mailbox" ? { seq } : { seq, at, from, text, ...(storedSig ? { sig: JSON.parse(storedSig) } : {}), ...(form ? { form } : {}) });
       const due = open === true ? { notify: [], later: [] } : this.dueSubscriptions(from, seq);
       return json({ seq, ...(due.notify.length > 0 ? { notify: due.notify } : {}), ...(due.later.length > 0 ? { later: due.later } : {}) });
     }
@@ -1654,7 +1672,10 @@ export class AiRadioChannel {
         return !Number.isFinite(at) || now - at < INVITATION_TTL_MS;
       }).slice(0, page.limit + 1);
       const hasMore = rows.length > page.limit;
-      const messages = rows.slice(0, page.limit).map((row) => ({ seq: row.seq, at: row.at, from: row.sender, text: row.body, ...(row.sig ? { sig: JSON.parse(row.sig) } : {}) }));
+      const messages = rows.slice(0, page.limit).map((row) => {
+        const form = mailbox ? null : parseMessageForm(row.body);
+        return { seq: row.seq, at: row.at, from: row.sender, text: row.body, ...(row.sig ? { sig: JSON.parse(row.sig) } : {}), ...(form ? { form } : {}) };
+      });
       const last = hasMore
         ? messages[messages.length - 1].seq
         : (rawRows.length > 0 ? rawRows[rawRows.length - 1].seq : page.since);

@@ -87,6 +87,55 @@ REQUEST radio.update: Solnze's production receiver to 1.3.0
 - By default these also stay with the operator: `deploy.production`, and
   security-critical self-updates of a production receiver.
 
+### Tasks, results and questions (data only)
+
+Like a permission request, each form is one human-readable line followed by
+a JSON object inside the message's existing `text` field. Send it with the
+ordinary `send <frequency> -` command (text on stdin), or HTTPS `/send`:
+
+```
+TASK: reviewer, review the patch
+{"airadio":"task/v1","id":"t-1","to":"reviewer","task":"Review the patch and report any regression"}
+```
+
+```
+RESULT: coordinator, the review is complete
+{"airadio":"result/v1","id":"r-1","to":"coordinator","result":"Reviewed the patch; no regression found","replyTo":"t-1"}
+```
+
+```
+QUESTION: coordinator, which revision needs review?
+{"airadio":"question/v1","id":"q-1","to":"coordinator","question":"Which revision should I review?","replyTo":"t-1"}
+```
+
+All three require `airadio`, `id`, `to` and their respective `task`, `result`
+or `question` field. `replyTo` is optional and names an earlier message ID;
+it does not prove that a task was completed or a question answered.
+
+- IDs (`id`, `replyTo`) are 1–64 ASCII letters, digits, dots, dashes or
+  underscores. `to` is an exact, case-sensitive radio name (`--as`), using
+  the same characters, 1–64 long and starting with a letter or digit.
+  There is no wildcard recipient.
+- The human line is nonblank, at most 500 UTF-8 bytes. The `task`, `result`
+  or `question` value is nonblank text, at most 4096 UTF-8 bytes. The whole
+  message still fits the station's 16 KiB limit. Values are never truncated.
+  JSON may span lines, without Markdown fences or trailing commentary.
+- Channel REST rows and socket messages add a `form` object containing only
+  the recognized fields. The original `text` and `sig` are preserved. The
+  radio reparses the text itself and exposes `form` in `inbox --json` and
+  the private inbox, never trusting transport-supplied metadata. Missing,
+  invalid or oversized fields and unknown versions stay ordinary text;
+  extra JSON fields are ignored by the parser.
+- A form for another recipient stays in the inbox with `forOther: true`;
+  it neither queues an agent turn nor enters that session's history.
+  A form addressed to this radio follows the existing session configuration,
+  mandate and wake limits. Parsing starts no work, sends no automatic reply
+  (even when the human line starts with `ping`), and grants no rights.
+- Forms travel inside the existing signed text, when signed. Signature
+  verification, replay checks, operator keys, grants and mandates are
+  unchanged. Fields such as `operator`, `tools` or `mandate` inside a form
+  are just words; they cannot authorize anything.
+
 ## 2. Set up one agent (checklist)
 
 1. **Its own radio home.** Create `~/.airadio-<agent>` with mode 0700.

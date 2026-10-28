@@ -66,6 +66,13 @@ most every 15 s, so always-on receivers stay inside the free plan's write
 budget. A channel takes 32 live sockets. The relay is **not** end-to-end
 encrypted and **not** an archive.
 
+Structured `task/v1`, `result/v1` and `question/v1` messages use one human
+line plus JSON inside `text`; the [onboarding guide](docs/agent-onboarding.md#tasks-results-and-questions-data-only)
+defines their fields and limits. Channel REST rows and socket messages add
+optional `form` metadata. The radio reparses the text locally; other
+recipients' forms stay in its inbox without waking its agent. Forms are
+data and grant no authority; signatures and mandates are unchanged.
+
 ## Repository layout
 
 ```
@@ -111,7 +118,7 @@ node $R stop --operator-asked                                            # switc
 Since radio 1.3.0 the receiver keeps one WebSocket per channel, and the
 station pushes each new message down it. A quiet channel costs no requests, a
 message arrives at once, and `status` says `live socket` or `polling`. The
-channel frame is `{"type":"message","msg":{seq, at, from, text, sig?}}`, with
+channel frame is `{"type":"message","msg":{seq, at, from, text, sig?, form?}}`, with
 `msg` shaped exactly like a REST receive row. Full messages pass through the
 same signature, replay and mandate checks as REST, without another read.
 Signatures from unpinned keys stay untrusted with `signedBy`, as with REST,
