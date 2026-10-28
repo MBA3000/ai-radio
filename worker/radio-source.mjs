@@ -1026,6 +1026,8 @@ export function cleanReply(text, secrets = []) {
     reply = reply.split(secret).join("[key redacted]");
     const trimmed = secret.trim();
     if (trimmed !== secret) reply = reply.split(trimmed).join("[key redacted]");
+    const pemBody = trimmed.match(/-----BEGIN [^-]+-----([A-Za-z0-9+/=\s]+)-----END [^-]+-----/u)?.[1].replace(/\s/gu, "");
+    if (pemBody && pemBody.length >= 32) reply = replaceIgnoringWhitespace(reply, pemBody, "[key redacted]");
   }
   reply = redact(reply);
   if (Buffer.byteLength(reply, "utf8") > AGENT_MAX_REPLY_BYTES) {
@@ -1033,6 +1035,23 @@ export function cleanReply(text, secrets = []) {
     reply += " [truncated]";
   }
   return reply;
+}
+
+function replaceIgnoringWhitespace(text, needle, replacement) {
+  let result = String(text);
+  while (true) {
+    let compact = "";
+    const positions = [];
+    for (let i = 0; i < result.length; i += 1) if (!/\s/u.test(result[i])) {
+      positions.push(i);
+      compact += result[i];
+    }
+    const found = compact.indexOf(needle);
+    if (found < 0) return result;
+    const start = positions[found];
+    const end = positions[found + needle.length - 1] + 1;
+    result = result.slice(0, start) + replacement + result.slice(end);
+  }
 }
 
 /**
@@ -1048,6 +1067,8 @@ export function leaksSecret(text, secrets = []) {
     if (typeof secret !== "string" || secret.length < 32) continue;
     const lower = secret.toLowerCase();
     if (lowerText.includes(lower)) return true;
+    const pemBody = secret.trim().match(/-----BEGIN [^-]+-----([A-Za-z0-9+/=\s]+)-----END [^-]+-----/u)?.[1].replace(/\s/gu, "").toLowerCase();
+    if (pemBody && lowerText.replace(/\s/gu, "").includes(pemBody)) return true;
     for (let start = 0; start + 32 <= lower.length; start += 8) if (digits.includes(lower.slice(start, start + 32))) return true;
   }
   return false;
@@ -1608,7 +1629,11 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     heard: previous.heard && typeof previous.heard === "object" ? previous.heard : {},
     errors: {},
     agents: previous.agents && typeof previous.agents === "object" ? previous.agents : {},
-    signed: previous.signed && typeof previous.signed === "object" ? previous.signed : {},
+    // Separate bounded replay ledgers: peer traffic must never evict an
+    // operator signature and thereby restore its authority on replay.
+    signedOperator: previous.signedOperator && typeof previous.signedOperator === "object" ? previous.signedOperator
+      : previous.signed && typeof previous.signed === "object" ? previous.signed : {},
+    signedAgent: previous.signedAgent && typeof previous.signedAgent === "object" ? previous.signedAgent : {},
   };
   // A session from a radio that kept no signers holds words whose keys nobody can name now
   // (keys may have been added and dropped while it was off): it is not resumed, the next
@@ -2073,13 +2098,14 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   // A signature proves who wrote the words, once. Anyone holding the channel key
   // can post the same signed words again within the time window: that is a
   // replay, and it is neither the operator's voice nor a mandate.
-  const firstHearing = (frequency, message, digest, signedTs = message.sig.ts) => {
+  const firstHearing = (kind, frequency, message, digest, signedTs) => {
     const at = Date.parse(message.at);
-    const heard = (Array.isArray(state.signed[frequency]) ? state.signed[frequency] : [])
+    const ledger = kind === "operator" ? state.signedOperator : state.signedAgent;
+    const heard = (Array.isArray(ledger[frequency]) ? ledger[frequency] : [])
       .filter((entry) => Array.isArray(entry) && entry[2] >= at - 3 * SIGNATURE_WINDOW_MS);
     const earlier = heard.find((entry) => entry[0] === digest);
     if (!earlier) heard.push([digest, message.seq, signedTs]);
-    state.signed[frequency] = heard.slice(-256);
+    ledger[frequency] = heard.slice(-256);
     return earlier && earlier[1] !== message.seq ? { ok: false, reason: "replayed" } : { ok: true };
   };
 
@@ -2100,7 +2126,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     let signature = message.sig ? (pinned.length > 0 ? verifySigned(message, frequency, pinned.map((entry) => entry.key)) : { ok: false, reason: "another key", fingerprint: typeof message.sig.key === "string" ? keyFingerprint(message.sig.key) : null }) : null;
     // With more than one device pinned, the line says which one signed it.
     const signedWith = signature && signature.ok && pinned.length > 1 ? signature.fingerprint : null;
-    if (signature && signature.ok) signature = { ...firstHearing(frequency, message, signature.digest), fingerprint: signature.fingerprint };
+    if (signature && signature.ok) signature = { ...firstHearing("operator", frequency, message, signature.digest, message.sig.ts), fingerprint: signature.fingerprint };
     // Failed verification cannot consume a frame's seq or reach an inbox/agent.
     // Another key is ordinary untrusted traffic with signedBy on both paths;
     // REST also keeps rejected signatures as marked, untrusted records as before.
@@ -2110,7 +2136,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const operator = Boolean(signature && signature.ok);
     const peer = channel.agents && typeof channel.agents === "object" ? channel.agents[String(message.from)] : null;
     let agentSignature = message.agentSig ? verifyAgentSigned(message, frequency, peer && peer.key) : { ok: false, reason: "unsigned" };
-    if (agentSignature.ok) agentSignature = { ...firstHearing(frequency, message, agentSignature.digest, message.agentSig.ts), fingerprint: agentSignature.fingerprint };
+    if (agentSignature.ok) agentSignature = { ...firstHearing("agent", frequency, message, agentSignature.digest, message.agentSig.ts), fingerprint: agentSignature.fingerprint };
     const mandate = operator && message.sig.mandate ? normalizeMandate(message.sig.mandate, message.sig.ts) : null;
     // Reparse signed text locally; station/frame metadata is never trusted.
     const form = parseMessageForm(message.text);
@@ -2141,7 +2167,9 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       // A revoke addressed to this agent is the operator's "enough": it wakes no one.
       if (!(mandate && mandateFor(mandate, me) && mandate.scope === "revoke")) {
         // The key named on the line is the one verified here, never one the transport carried.
-        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { ...message, operator, operatorKey: operator && signedWith ? signedWith : null, signer: operator ? signature.fingerprint : null,
+        queueForAgent(frequency, loadConfig(p).channels[frequency] || channel, { at: message.at, frequency, seq: message.seq, from: String(message.from), text: String(message.text),
+          ...(operator ? { operator: true, signer: signature.fingerprint } : {}),
+          ...(operator && signedWith ? { operatorKey: signedWith } : {}),
           ...(agentSignature.ok ? { agentVerified: true, agentKey: agentSignature.fingerprint } : {}),
           ...(!agentSignature.ok && peer && message.agentSig ? { agentRejected: agentSignature.reason } : {}),
           ...(!operator && !agentSignature.ok ? { agentUnverified: true } : {}), form, forOther });
