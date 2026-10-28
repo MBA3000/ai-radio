@@ -1272,8 +1272,10 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const channel = loadConfig(p).channels[frequency];
     const allowed = channel && channel.agent ? allowance(channel) : { talk: false, tools: false };
     const pinned = pinnedFingerprints(channel);
+    // A turn carrying any operator line whose key is dropped since carries that key's authority: it stops,
+    // whatever else the batch holds and whichever device signed the mandate it runs under.
     const reason = !work.operatorOnly && !allowed.talk ? "its mandate ended" : work.tools && !allowed.tools ? "its mandate no longer allows tools"
-      : work.operatorOnly && !work.signers.some((signer) => pinned.includes(signer)) ? "the operator key that signed its words was dropped" : null;
+      : work.signers.some((signer) => !pinned.includes(signer)) ? "an operator key that signed its words was dropped" : null;
     if (!reason) return;
     work.stopped = reason;
     if (work.kill) {
@@ -1343,12 +1345,13 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     // A queued line is the operator's only while the key that signed it is still pinned:
     // a key dropped since (or a line queued before signers were kept) speaks for no one.
     const pinned = pinnedFingerprints(channel);
-    current.pending = current.pending.map((message) => {
+    const stillOperator = (message) => {
       if (!message.operator) return message;
       const { operator, operatorKey, ...rest } = message;
       if (!pinned.includes(message.signer)) return rest;
       return { ...rest, operator, ...(pinned.length > 1 ? { operatorKey: message.signer } : {}) };
-    });
+    };
+    current.pending = current.pending.map(stillOperator);
     // Without a valid mandate a governed session may still answer its operator's
     // own signed words (the page's rule), chat-only and to them alone.
     const operatorOnly = !allowed.talk;
@@ -1370,6 +1373,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const history = current.briefed ? [] : inboxSince(p, 0).entries
       .filter((entry) => entry.frequency === frequency && !entry.kind && Number.isSafeInteger(entry.seq) && entry.seq < messages[0].seq)
       .filter((entry) => !(entry.form && entry.forOther))
+      // An earlier line is the operator's only while the key that signed it is still pinned, as a queued one.
+      .map(stillOperator)
       // Answering only its operator, the session sees only its operator's earlier words.
       .filter((entry) => !operatorOnly || entry.operator === true)
       .slice(-AGENT_HISTORY_LINES);
@@ -1399,7 +1404,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       : preset.stdinJson ? JSON.stringify({ station: channel.station, frequency, as: me, session, first: !current.briefed, prompt, messages }) + "\n"
       : "";
     log("waking " + agentLabel(agent) + " for " + frequency + " (" + messages.length + " new message" + (messages.length === 1 ? "" : "s") + "): " + commandLine(preset.binary, args, prompt));
-    const work = { tools, operatorOnly, signers: messages.filter((message) => message.operator).map((message) => message.signer), kill: null, stopped: null };
+    const work = { tools, operatorOnly, signers: [...history, ...messages].filter((message) => message.operator).map((message) => message.signer), kill: null, stopped: null };
     working.set(frequency, work);
     let result;
     try {
@@ -1466,6 +1471,12 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     // The operator's word may have changed while the agent worked.
     if (!operatorOnly && !allowance(still).talk) {
       appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply not sent: its mandate ended while it worked" });
+      return;
+    }
+    // Checked against the keys pinned now, not at the receiver's last look: one may be dropped since.
+    const pinnedNow = pinnedFingerprints(still);
+    if (work.signers.some((signer) => !pinnedNow.includes(signer))) {
+      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply not sent: an operator key that signed its words was dropped while it worked" });
       return;
     }
     try {
@@ -1557,6 +1568,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       ...(history ? { history: true } : {}),
       ...(operator ? { operator: true } : {}),
       ...(operator && signedWith ? { operatorKey: signedWith } : {}),
+      // The key verified for it, kept so a later drop closes this line too (agent history).
+      ...(operator ? { signer: signature.fingerprint } : {}),
       ...(mandate ? { mandate } : {}),
       ...(signature && !signature.ok && signature.reason === "another key" ? { signedBy: signature.fingerprint } : {}),
       ...(signature && !signature.ok && signature.reason !== "another key" && signature.reason !== "unsigned" ? { forged: signature.reason } : {}),

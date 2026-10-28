@@ -10,7 +10,7 @@
  * env:   FAKE_AGENT_DIR  where sessions and the call log live
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const [flavor, ...argv] = process.argv.slice(2);
@@ -86,6 +86,16 @@ if (/fail/i.test(newest)) {
   // A long turn, for tests that stop one midway.
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_AGENT_SLOW_MS) || 15_000);
   reply = "done, slowly";
+} else if (/drop my key and answer/i.test(newest) && process.env.FAKE_AGENT_DROP_KEY && process.env.FAKE_AGENT_RADIO_JSON) {
+  // The owner drops a device while the turn runs, right before it ends: no receiver
+  // tick sees the turn again before its answer would be sent (the file is changed, nobody is poked).
+  const config = JSON.parse(readFileSync(process.env.FAKE_AGENT_RADIO_JSON, "utf8"));
+  for (const channel of Object.values(config.channels)) {
+    if (Array.isArray(channel.devices)) channel.devices = channel.devices.filter((device) => device.key !== process.env.FAKE_AGENT_DROP_KEY);
+  }
+  writeFileSync(process.env.FAKE_AGENT_RADIO_JSON + ".tmp-fake", JSON.stringify(config));
+  renameSync(process.env.FAKE_AGENT_RADIO_JSON + ".tmp-fake", process.env.FAKE_AGENT_RADIO_JSON);
+  reply = "answered after the drop";
 } else if (/leak/i.test(newest)) {
   reply = "here it is: " + "c".repeat(128);
 } else {

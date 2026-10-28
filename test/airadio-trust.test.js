@@ -75,7 +75,7 @@ async function openChannel(station) {
   return { frequency, wave, post, say: (from, text) => post({ from, text }), heard, saidBy: async (name) => (await heard()).filter((m) => m.from === name).map((m) => m.text) };
 }
 
-function sandbox(t) {
+function sandbox(t, extraEnv = () => ({})) {
   const root = mkdtempSync(join(tmpdir(), "airadio-trust-"));
   const bin = join(root, "bin");
   const fake = join(root, "fake");
@@ -83,7 +83,7 @@ function sandbox(t) {
   for (const dir of [bin, fake, home]) mkdirSync(dir, { recursive: true });
   writeFileSync(join(bin, "claude"), "#!/bin/sh\nexec \"" + process.execPath + "\" \"" + FAKE + "\" claude \"$@\"\n");
   chmodSync(join(bin, "claude"), 0o755);
-  const env = { ...process.env, PATH: bin + ":" + process.env.PATH, FAKE_AGENT_DIR: fake, AIRADIO_AGENT_QUIET_MS: "0", AIRADIO_AGENT_TIMEOUT_MS: "20000", FAKE_AGENT_SLOW_MS: "15000" };
+  const env = { ...process.env, PATH: bin + ":" + process.env.PATH, FAKE_AGENT_DIR: fake, AIRADIO_AGENT_QUIET_MS: "0", AIRADIO_AGENT_TIMEOUT_MS: "20000", FAKE_AGENT_SLOW_MS: "15000", ...extraEnv(home) };
   const radio = (...args) => new Promise((resolve) => {
     execFile(process.execPath, [RADIO, ...args, "--home", home], { env, timeout: 30_000 }, (error, stdout, stderr) => {
       resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stdout, stderr });
@@ -641,4 +641,82 @@ test("a queued line signed by a key dropped since is no longer the operator's wh
   assert.match(calls()[1].prompt, /remember 7/u);
   assert.ok(!calls()[1].prompt.includes("from the laptop, queued"), "the dropped key's queued line carries no operator authority");
   assert.ok(!calls()[1].prompt.includes("(key "), "one key left: no key named");
+});
+
+test("a fresh session never sees a dropped key's earlier lines as its operator's", { timeout: 90_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio, calls } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const say = async (who, text) => channel.post({ from: "Medet", text, sig: await who.sign({ frequency: channel.frequency, from: "Medet", text }) });
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  await say(laptop, "laptop says: remember 9");
+  assert.ok(await eventually(() => calls().length === 1));
+  await say(phone, "phone says: remember 5");
+  assert.ok(await eventually(() => calls().length === 2));
+  const inbox = readFileSync(join(home, "inbox.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line)).filter((entry) => entry.operator);
+  assert.deepEqual(inbox.map((entry) => entry.signer), [keyFingerprint(laptop.key), keyFingerprint(phone.key)], "every operator line keeps the key verified for it");
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked")).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate", "--new-session")).code, 0);
+  await say(phone, "what number");
+  assert.ok(await eventually(() => calls().length === 3));
+  const prompt = calls()[2].prompt;
+  assert.equal(calls()[2].resume, false, "a fresh session, briefed from the inbox");
+  assert.match(prompt, /phone says: remember 5/u, "the key still pinned speaks in the history");
+  assert.ok(!prompt.includes("laptop says: remember 9"), "the dropped key's earlier words are not the operator's any more");
+});
+
+test("dropping one device stops a running turn that holds its words, whoever signed the mandate", { timeout: 120_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio, calls } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const config = () => JSON.parse(readFileSync(join(home, "radio.json"), "utf8")).channels[channel.frequency];
+  const say = async (who, text) => channel.post({ from: "Medet", text, sig: await who.sign({ frequency: channel.frequency, from: "Medet", text }) });
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--tools", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  // The phone signs the tools mandate; the laptop's words run under it.
+  const text = "tools for an hour";
+  await channel.post({ from: "Medet", text, sig: await phone.sign({ frequency: channel.frequency, from: "Medet", text,
+    mandate: { to: "Solnze", scope: "tools", until: new Date(Date.now() + 3_600_000).toISOString() } }) });
+  assert.ok(await eventually(() => config().mandate && config().mandate.scope === "tools"));
+  assert.ok(await eventually(() => calls().length === 1));
+  // With the receiver off, both devices' lines arrive together: one mixed batch.
+  assert.equal((await radio("stop", "--operator-asked")).code, 0);
+  await say(laptop, "from the laptop: use your tools");
+  await say(phone, "take your time");
+  assert.equal((await radio("up")).code, 0);
+  assert.ok(await eventually(() => calls().length === 2), "a slow mixed turn begins");
+  assert.match(calls()[1].prompt, /from the laptop: use your tools/u);
+  assert.match(calls()[1].prompt, /take your time/u);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked")).code, 0);
+  assert.equal(config().mandate.scope, "tools", "the phone's mandate stands");
+  assert.ok(await eventually(async () => /agent stopped mid-turn: an operator key that signed its words was dropped; its answer was not sent/u.test((await radio("inbox", channel.frequency, "--peek")).stdout), { timeoutMs: 10_000 }),
+    "stopped at once, though the phone's words and mandate remain");
+  assert.ok(!(await channel.saidBy("Solnze")).includes("done, slowly"));
+});
+
+test("a key dropped just before a turn ends still keeps that turn's answer off the air", { timeout: 90_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const laptop = await operator();
+  const { radio, calls } = sandbox(t, (home) => ({ FAKE_AGENT_DROP_KEY: laptop.key, FAKE_AGENT_RADIO_JSON: join(home, "radio.json") }));
+  const channel = await openChannel(station);
+  const phone = await operator();
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  const text = "drop my key and answer";
+  await channel.post({ from: "Medet", text, sig: await laptop.sign({ frequency: channel.frequency, from: "Medet", text }) });
+  assert.ok(await eventually(() => calls().length === 1));
+  assert.ok(await eventually(async () => /agent reply not sent: an operator key that signed its words was dropped while it worked/u.test((await radio("inbox", channel.frequency, "--peek")).stdout)),
+    "the answer is checked against the keys pinned when it would be sent");
+  assert.ok(!(await channel.saidBy("Solnze")).includes("answered after the drop"));
 });
