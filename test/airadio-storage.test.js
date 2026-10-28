@@ -54,6 +54,49 @@ test("SQLite-backed channel rejects invalid page bounds and wrong authentication
   assert.equal(refused.status, 403);
 });
 
+test("an encrypted device pairing is short-lived and can be read only once", async () => {
+  let now = Date.parse("2026-10-29T10:00:00Z");
+  const harness = sqliteContext({ now: () => now });
+  const { context, database } = harness;
+  const relay = new AiRadioChannel(context);
+  const ciphertext = "ciphertext-not-a-channel-key";
+  const stored = await relay.fetch(new Request("https://channel/pair", {
+    method: "POST",
+    body: JSON.stringify({ ciphertext, expiresAt: now + 120_000 }),
+  }));
+  assert.equal(stored.status, 201);
+  assert.equal(database.prepare("SELECT v FROM meta WHERE k = 'pairCiphertext'").get().v, ciphertext);
+
+  const first = await relay.fetch(new Request("https://channel/pair"));
+  assert.equal(first.status, 200);
+  assert.deepEqual(await first.json(), { ciphertext });
+  assert.equal((await relay.fetch(new Request("https://channel/pair"))).status, 404, "a second read fails");
+  assert.equal(harness.alarmAt(), now + 120_000, "the ciphertext deadline is armed even without a read");
+  const replay = await relay.fetch(new Request("https://channel/pair", {
+    method: "POST", body: JSON.stringify({ ciphertext, expiresAt: now + 120_000 }),
+  }));
+  assert.equal(replay.status, 409, "the consumed id cannot be resurrected before its deadline");
+  assert.equal((await relay.fetch(new Request("https://channel/pair"))).status, 404);
+
+  const unreadHarness = sqliteContext({ now: () => now });
+  const unread = new AiRadioChannel(unreadHarness.context);
+  await unread.fetch(new Request("https://channel/pair", {
+    method: "POST", body: JSON.stringify({ ciphertext, expiresAt: now + 120_000 }),
+  }));
+  now += 120_000;
+  await unread.alarm();
+  assert.equal(unreadHarness.database.prepare("SELECT COUNT(*) AS n FROM meta WHERE k = 'pairCiphertext'").get().n, 0,
+    "the alarm deletes unread ciphertext at the deadline without a GET");
+
+  const expired = new AiRadioChannel(sqliteContext({ now: () => now }).context);
+  await expired.fetch(new Request("https://channel/pair", {
+    method: "POST",
+    body: JSON.stringify({ ciphertext, expiresAt: now + 120_000 }),
+  }));
+  now += 120_001;
+  assert.equal((await expired.fetch(new Request("https://channel/pair"))).status, 410, "an expired pairing fails");
+});
+
 test("SQLite-backed channel paginates 201 ordered messages without drops", async () => {
   const { channel, wave } = await initializedChannel();
   for (let index = 1; index <= 201; index += 1) {

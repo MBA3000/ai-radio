@@ -117,6 +117,7 @@ body { overscroll-behavior-y: none; }
 button, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 .app { display: flex; flex-direction: column; min-height: 100%; max-width: 720px; margin: 0 auto; }
+.qr { display: block; width: min(82vw, 328px); height: min(82vw, 328px); margin: 16px auto; background: white; border: 12px solid white; image-rendering: pixelated; }
 .top { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px; padding: calc(var(--top) + 10px) 16px 10px;
   background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid var(--line); }
 .top h1 { font-size: 17px; margin: 0; font-weight: 750; letter-spacing: .02em; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -308,6 +309,120 @@ export function parseAnswer(text) {
   return { request: body.request, decision: body.decision === "grant" ? "grant" : "deny" };
 }
 
+/** Every modal managed by the app. Kept outside the browser script so tests pin it. */
+export const APP_SHEETS = ["sheet-new", "sheet-add", "sheet-settings", "sheet-channel", "sheet-pair", "sheet-paired"];
+
+/** Accept only complete, inert channel records from a decrypted pairing package. */
+export function pairedChannels(value, known) {
+  var seen = new Set();
+  if (!value || !Array.isArray(value.channels) || !value.channels.length || !Number.isFinite(value.expiresAt) || value.expiresAt < Date.now()) return null;
+  var valid = true;
+  var out = value.channels.reduce(function (accepted, channel) {
+    if (!channel || typeof channel !== "object" || !/^fm-[a-f0-9]{8,64}$/.test(channel.frequency) || !/^[a-f0-9]{16,128}$/.test(channel.key)) { valid = false; return accepted; }
+    if (seen.has(channel.frequency)) { valid = false; return accepted; }
+    seen.add(channel.frequency);
+    accepted.push({ frequency: channel.frequency, key: channel.key, label: String(channel.label || "").slice(0, 40) });
+    return accepted;
+  }, []);
+  return valid ? out : null;
+}
+
+/** Browser click handlers for the sending half of pairing. Tests drive these
+ * same handlers, rather than reconstructing the relay request themselves. */
+export function pairingSendHandlers(deps) {
+  return {
+    open: function () {
+      var names = deps.channels().map(function (channel) { return channel.label || "Channel " + deps.short(channel.frequency); });
+      if (!names.length) { deps.toast("There are no channels to share."); return; }
+      deps.showChannels(names.join("\n"));
+      deps.reset();
+      deps.showSheet();
+    },
+    confirm: function () {
+      deps.disable();
+      var id = Array.prototype.map.call(deps.randomBytes(16), function (byte) { return ("0" + byte.toString(16)).slice(-2); }).join("");
+      var secret = deps.randomBytes(32), nonce = deps.randomBytes(12), expiresAt = Date.now() + 120000;
+      var channels = deps.channels().map(function (channel) { return { frequency: channel.frequency, key: channel.key, label: channel.label || "" }; });
+      var plain = new TextEncoder().encode(JSON.stringify({ expiresAt: expiresAt, channels: channels }));
+      return deps.pairingKey(secret, id).then(function (key) { return crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, plain); }).then(function (sealed) {
+        var packageBytes = new Uint8Array(nonce.length + sealed.byteLength); packageBytes.set(nonce); packageBytes.set(new Uint8Array(sealed), nonce.length);
+        return deps.post("/v1/pair/" + id, JSON.stringify({ ciphertext: deps.b64url(packageBytes) }));
+      }).then(function (got) {
+        if (got.status !== 201) throw new Error("relay answered HTTP " + got.status);
+        var link = deps.origin() + "/app#pair=" + id + "." + deps.b64url(secret);
+        deps.showLink(link);
+        try { deps.drawQr(link); } catch (error) { deps.qrFailed(); }
+        return link;
+      }).catch(function (error) { deps.failed("Could not start pairing: " + error.message); });
+    }
+  };
+}
+
+/** Commands are made exclusively from records which passed pairedChannels(). */
+export function pairingTrustCommands(channels, key, name) {
+  if (!/^[-_A-Za-z0-9]{20,200}$/.test(String(key)) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(String(name))) return "";
+  return channels.filter(function (channel) { return channel && /^fm-[a-f0-9]{8,64}$/.test(channel.frequency); }).map(function (channel) {
+    return "node radio.mjs trust " + channel.frequency + " " + key + " --also --operator-asked --operator-name " + name;
+  }).join("\n\n");
+}
+
+/** Derive the one-use relay encryption key without making it extractable. */
+export function pairingKey(secret, id) {
+  return crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveKey"]).then(function (base) {
+    return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode(id), info: new TextEncoder().encode("airadio pairing v1") }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  });
+}
+
+/** A receiving device always creates its own private, non-extractable key. */
+export function generateOperatorPair() {
+  return crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
+}
+
+/** Consume a pairing fragment and apply its authenticated package. */
+export function receivePairing(deps) {
+  var match = /^#pair=([a-f0-9]{32})\.([-_A-Za-z0-9]{43})$/u.exec(deps.hash());
+  if (!match) return false;
+  var secret;
+  try {
+    secret = deps.unb64url(match[2]);
+    if (secret.length !== 32) return false;
+  } catch (error) { return false; }
+  deps.clearHash();
+  var id = match[1];
+  Promise.resolve().then(function () { return deps.operatorReady(); }).then(function (op) {
+    if (!op) throw new Error("Could not create this device's operator key.");
+    return deps.get("/v1/pair/" + id);
+  }).then(function (got) {
+    if (got.status !== 200 || !got.body) throw new Error(got.status === 410 ? "This pairing code expired." : "This pairing code was already used or is unknown.");
+    var packed = deps.unb64url(got.body.ciphertext);
+    if (packed.length < 29) throw new Error("This pairing package is invalid.");
+    var nonce = packed.slice(0, 12), sealed = packed.slice(12);
+    return deps.pairingKey(secret, id).then(function (key) { return crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, sealed); });
+  }).then(function (plain) {
+    var shared = JSON.parse(new TextDecoder().decode(plain));
+    if (!shared || !Array.isArray(shared.channels) || shared.expiresAt < Date.now()) throw new Error("This pairing code expired.");
+    var verified = deps.pairedChannels(shared);
+    if (!verified) throw new Error("This pairing package is invalid.");
+    return deps.accept(verified);
+  }).catch(function (error) { deps.failed(error.message || "Pairing failed."); });
+  return true;
+}
+
+/** Store received channels and reveal the new device's public identity. */
+export function applyReceivedPairing(verified, deps) {
+  return deps.operatorReady().then(function (op) {
+    if (!op) throw new Error("Could not create this device's operator key.");
+    var known = new Set(deps.channels().map(function (channel) { return channel.frequency; }));
+    verified.filter(function (channel) { return !known.has(channel.frequency); }).forEach(function (channel) {
+      deps.add({ frequency: channel.frequency, key: channel.key, label: String(channel.label || "").slice(0, 40), lastSeq: 0, readSeq: 0, addedAt: new Date().toISOString() });
+    });
+    deps.save(); deps.render();
+    var commands = deps.commands(verified, op.key, deps.name());
+    deps.show(op.key, commands);
+    return { key: op.key, commands: commands };
+  });
+}
+
 const SCRIPT = `
 (function () {
   "use strict";
@@ -399,6 +514,71 @@ const SCRIPT = `
     new Uint8Array(bytes).forEach(function (byte) { text += String.fromCharCode(byte); });
     return btoa(text).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
   }
+  function unb64url(text) {
+    var padded = text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4);
+    var raw = atob(padded); var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i += 1) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function randomBytes(size) { var out = new Uint8Array(size); crypto.getRandomValues(out); return out; }
+  ${pairingKey.toString()}
+  ${generateOperatorPair.toString()}
+  ${pairedChannels.toString()}
+  ${pairingTrustCommands.toString()}
+  ${pairingSendHandlers.toString()}
+  ${receivePairing.toString()}
+  ${applyReceivedPairing.toString()}
+
+  // Dependency-free QR Model 2. Use compact version 6-L normally and version
+  // 8-L for longer staging workers.dev hostnames.
+  function drawQr(canvas, text) {
+    var bytes = Array.from(new TextEncoder().encode(text));
+    var version = bytes.length <= 134 ? 6 : 8;
+    if (bytes.length > 192) throw new Error("pairing URL is too long");
+    var size = version * 4 + 17, dataWords = version === 6 ? 136 : 194, eccWords = version === 6 ? 18 : 24, blocks = 2;
+    var bits = [0,1,0,0];
+    for (var n = 7; n >= 0; n -= 1) bits.push((bytes.length >>> n) & 1);
+    bytes.forEach(function (byte) { for (var n = 7; n >= 0; n -= 1) bits.push((byte >>> n) & 1); });
+    for (var z = 0; z < 4 && bits.length < dataWords * 8; z += 1) bits.push(0);
+    while (bits.length % 8) bits.push(0);
+    var words = [];
+    for (var at = 0; at < bits.length; at += 8) words.push(bits.slice(at, at + 8).reduce(function (v, bit) { return v * 2 + bit; }, 0));
+    for (var pad = 0; words.length < dataWords; pad += 1) words.push(pad % 2 ? 0x11 : 0xec);
+    function mul(x, y) { var out = 0; while (y) { if (y & 1) out ^= x; y >>>= 1; x <<= 1; if (x & 0x100) x ^= 0x11d; } return out; }
+    function remainder(input) {
+      var gen = [1];
+      for (var i = 0, root = 1; i < eccWords; i += 1, root = mul(root, 2)) { var next = new Array(gen.length + 1).fill(0); gen.forEach(function (v, j) { next[j] ^= v; next[j + 1] ^= mul(v, root); }); gen = next; }
+      var rem = new Array(eccWords).fill(0);
+      input.forEach(function (value) { var factor = value ^ rem.shift(); rem.push(0); gen.slice(1).forEach(function (coefficient, j) { rem[j] ^= mul(coefficient, factor); }); });
+      return rem;
+    }
+    var blockWords = dataWords / blocks;
+    var data = [words.slice(0, blockWords), words.slice(blockWords)], ecc = data.map(remainder), stream = [];
+    for (var i = 0; i < blockWords; i += 1) for (var b = 0; b < blocks; b += 1) stream.push(data[b][i]);
+    for (var i = 0; i < eccWords; i += 1) for (var b = 0; b < blocks; b += 1) stream.push(ecc[b][i]);
+    var modules = Array.from({ length: size }, function () { return new Array(size).fill(false); });
+    var used = Array.from({ length: size }, function () { return new Array(size).fill(false); });
+    function put(row, col, dark) { if (row >= 0 && row < size && col >= 0 && col < size) { modules[row][col] = !!dark; used[row][col] = true; } }
+    function finder(row, col) { for (var y = -1; y <= 7; y += 1) for (var x = -1; x <= 7; x += 1) put(row + y, col + x, x >= 0 && x <= 6 && y >= 0 && y <= 6 && (x === 0 || x === 6 || y === 0 || y === 6 || (x >= 2 && x <= 4 && y >= 2 && y <= 4))); }
+    finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
+    var centers = version === 6 ? [6, 34] : [6, 24, 42];
+    centers.forEach(function (row) { centers.forEach(function (col) { if (used[row][col]) return; for (var y = -2; y <= 2; y += 1) for (var x = -2; x <= 2; x += 1) put(row + y, col + x, Math.max(Math.abs(x), Math.abs(y)) !== 1); }); });
+    for (var i = 8; i < size - 8; i += 1) { if (!used[6][i]) put(6, i, i % 2 === 0); if (!used[i][6]) put(i, 6, i % 2 === 0); }
+    var format = 0x77c4;
+    var a = [[8,0],[8,1],[8,2],[8,3],[8,4],[8,5],[8,7],[8,8],[7,8],[5,8],[4,8],[3,8],[2,8],[1,8],[0,8]];
+    var c = [[size-1,8],[size-2,8],[size-3,8],[size-4,8],[size-5,8],[size-6,8],[size-7,8],[8,size-8],[8,size-7],[8,size-6],[8,size-5],[8,size-4],[8,size-3],[8,size-2],[8,size-1]];
+    for (var i = 0; i < 15; i += 1) { put(a[i][0], a[i][1], (format >>> (14 - i)) & 1); put(c[i][0], c[i][1], (format >>> (14 - i)) & 1); }
+    put(size - 8, 8, true);
+    if (version >= 7) {
+      var versionBits = 0x085bc;
+      for (var i = 0; i < 18; i += 1) { var bit = (versionBits >>> i) & 1; put(Math.floor(i / 3), size - 11 + i % 3, bit); put(size - 11 + i % 3, Math.floor(i / 3), bit); }
+    }
+    var payload = []; stream.forEach(function (word) { for (var n = 7; n >= 0; n -= 1) payload.push((word >>> n) & 1); });
+    var cursor = 0, upward = true;
+    for (var right = size - 1; right >= 1; right -= 2) { if (right === 6) right -= 1; for (var step = 0; step < size; step += 1) { var row = upward ? size - 1 - step : step; for (var dx = 0; dx < 2; dx += 1) { var col = right - dx; if (!used[row][col]) modules[row][col] = !!((payload[cursor++] || 0) ^ ((row + col) % 2 === 0)); } } upward = !upward; }
+    canvas.width = canvas.height = size + 8; var context = canvas.getContext("2d"); context.fillStyle = "white"; context.fillRect(0, 0, canvas.width, canvas.height); context.fillStyle = "black";
+    modules.forEach(function (row, y) { row.forEach(function (dark, x) { if (dark) context.fillRect(x + 4, y + 4, 1, 1); }); });
+  }
   function fingerprintOf(key) {
     return crypto.subtle.digest("SHA-256", keyBytes(key)).then(function (hash) {
       var hex = Array.prototype.map.call(new Uint8Array(hash).slice(0, 8), function (byte) { return ("0" + byte.toString(16)).slice(-2); }).join("");
@@ -407,7 +587,7 @@ const SCRIPT = `
   }
   var operatorReady = (window.indexedDB && window.crypto && crypto.subtle ? idbDo("readonly", function (keys) { return keys.get("operator"); }).then(function (pair) {
     if (pair && pair.privateKey) return pair;
-    return crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]).then(function (made) {
+    return generateOperatorPair().then(function (made) {
       return idbDo("readwrite", function (keys) { return keys.put(made, "operator"); }).then(function () { return made; });
     });
   }).then(function (pair) {
@@ -592,6 +772,7 @@ const SCRIPT = `
   }
   function route() {
     stopTimers();
+    if (receivePairing(pairingReceiver)) { showHome(); return; }
     var frequency = (location.hash.match(FREQUENCY) || [])[0];
     if (frequency && find(frequency)) openChannel(find(frequency));
     else showHome();
@@ -847,7 +1028,7 @@ const SCRIPT = `
 
   // ---------------------------------------------------------------- sheets
   function sheet(id) {
-    ["sheet-new", "sheet-add", "sheet-settings", "sheet-channel"].forEach(function (name) { $(name).classList.toggle("hidden", name !== id); });
+    ${JSON.stringify(APP_SHEETS)}.forEach(function (name) { $(name).classList.toggle("hidden", name !== id); });
     $("backdrop").classList.toggle("hidden", !id);
   }
   $("backdrop").addEventListener("click", function (event) { if (event.target === $("backdrop")) sheet(null); });
@@ -941,6 +1122,39 @@ const SCRIPT = `
   $("op-copy").addEventListener("click", function () {
     navigator.clipboard.writeText(operator.key).then(function () { toast("Operator key copied."); }, function () { toast("Copy failed."); });
   });
+  var pairingSender = pairingSendHandlers({
+    channels: function () { return store.channels; }, short: short, toast: toast,
+    showChannels: function (text) { $("pair-list").textContent = text; },
+    reset: function () { $("pair-start").disabled = false; $("pair-result").classList.add("hidden"); $("pair-qr").classList.remove("hidden"); },
+    showSheet: function () { sheet("sheet-pair"); }, disable: function () { $("pair-start").disabled = true; },
+    randomBytes: randomBytes, pairingKey: pairingKey, b64url: b64url,
+    post: function (url, body) { return api(url, { method: "POST", headers: { "content-type": "application/json" }, body: body }); },
+    origin: function () { return location.origin; },
+    showLink: function (link) { $("pair-link").value = link; $("pair-result").classList.remove("hidden"); },
+    drawQr: function (link) { drawQr($("pair-qr"), link); },
+    qrFailed: function () { $("pair-qr").classList.add("hidden"); },
+    failed: function (message) { toast(message); $("pair-start").disabled = false; }
+  });
+  $("pair-open").addEventListener("click", pairingSender.open);
+  $("pair-start").addEventListener("click", pairingSender.confirm);
+  $("pair-copy").addEventListener("click", function () { navigator.clipboard.writeText($("pair-link").value).then(function () { toast("Pairing link copied."); }); });
+
+  var pairingReceiver = {
+    hash: function () { return location.hash; }, unb64url: unb64url,
+    clearHash: function () { history.replaceState(null, "", location.pathname + location.search); },
+    get: api, pairingKey: pairingKey, pairedChannels: pairedChannels,
+    accept: function (verified) {
+      return applyReceivedPairing(verified, {
+        channels: function () { return store.channels; }, add: function (channel) { store.channels.push(channel); },
+        save: save, render: renderList, operatorReady: function () { return operatorReady; },
+        commands: pairingTrustCommands, name: function () { return store.name; },
+        show: function (key, commands) {
+          $("paired-key").textContent = key; $("paired-commands").textContent = commands; sheet("sheet-paired");
+        }
+      });
+    }, failed: function (message) { toast(message); }
+  };
+  receivePairing(pairingReceiver);
 
   var mandateScope = "talk";
   var untilUtc = store.untilZone === "utc";
@@ -1255,8 +1469,28 @@ export function renderApp({ nonce }) {
     <h3>Your operator key</h3>
     <p class="keyline"><span class="mono" id="op-fp"></span><button class="btn small" id="op-copy" type="button">Copy key</button></p>
     <p>Made on this device and never leaves it. Agents you invite pin it, and it signs everything you send, so their radios know it is really you.</p>
+    <button class="btn wide" id="pair-open" type="button">Pair another device</button>
     <div class="row2"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="submit">Save</button></div>
   </form>
+  <div class="sheet hidden" id="sheet-pair" role="dialog" aria-label="Pair another device">
+    <div class="grab"></div>
+    <h2>Pair another device</h2>
+    <p>Confirm the channels that will be copied to the new device:</p>
+    <pre class="prompt" id="pair-list"></pre>
+    <p>The code is one-time and expires in 2 minutes. Anyone who scans it before the new device can take these channels.</p>
+    <button class="btn primary wide" id="pair-start" type="button">Confirm and show QR</button>
+    <div class="hidden" id="pair-result"><canvas class="qr" id="pair-qr" aria-label="One-time pairing QR code"></canvas><label class="field">OR OPEN THIS LINK<input id="pair-link" readonly></label><button class="btn wide" id="pair-copy" type="button">Copy pairing link</button></div>
+    <p></p><button class="btn wide" type="button" data-close>Done</button>
+  </div>
+  <div class="sheet hidden" id="sheet-paired" role="dialog" aria-label="Device paired">
+    <div class="grab"></div>
+    <h2>Device paired</h2>
+    <p>This device made its own non-extractable private key. Its public operator key is:</p>
+    <pre class="prompt" id="paired-key"></pre>
+    <p>Nothing is pinned automatically. Run each exact command on the corresponding agent machine:</p>
+    <pre class="prompt" id="paired-commands"></pre>
+    <button class="btn primary wide" type="button" data-close>Done</button>
+  </div>
   <form class="sheet hidden" id="sheet-channel" aria-label="Channel settings">
     <div class="grab"></div>
     <h2>This channel</h2>

@@ -297,6 +297,15 @@ when its operator has allowed that.
   stopped as a whole process group, and its answer is not sent. `--drop`
   exits 4 if it cannot confirm that within 15 s; check `status` and the
   `turns/` folder of the radio home before trusting the channel again.
+  To add a browser without hand-copying channel keys, use **Settings → Pair
+  another device** in the existing app, confirm the displayed channels, and
+  scan its QR within 2 minutes. The relay is one-use and stores only AES-GCM
+  ciphertext; the secret remains in the link fragment. The new browser makes
+  a separate non-extractable operator key and displays one exact
+  `trust <frequency> <key> --also --operator-asked --operator-name <device>`
+  command per channel. Run those commands locally; the QR never authorizes a
+  radio to pin anything. Treat an unused QR like a channel credential until
+  it expires.
 - **What a mandate line means.** `status` shows "none: not governed" when a
   channel has never had a mandate: the agent talks as its prompt says.
   Before radio 1.2.1 this read "listen only", which was wrong.

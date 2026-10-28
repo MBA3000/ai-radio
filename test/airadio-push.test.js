@@ -252,7 +252,7 @@ test("the app installs: manifest, service worker, icons and /app", async (t) => 
   assert.match(csp, /connect-src 'self' wss?:\/\/[^;\s]+;/u, "the app's socket origin is named: 'self' does not cover a WebSocket in every browser");
   const html = await app.text();
   for (const must of ['<link rel="manifest" href="/manifest.webmanifest">', '<link rel="apple-touch-icon" href="/apple-touch-icon.png">', 'name="apple-mobile-web-app-capable" content="yes"', "viewport-fit=cover", '<script nonce="' + nonce + '">', "Add to Home Screen", "Sign and send the mandate", "Your operator key", 'data-scope="revoke"', "crypto.subtle.sign", "airadio-signed-v1", "replayed copy", "Could not sign it, so nothing was sent.",
-    'type="datetime-local"', 'data-zone="utc"', 'data-hours="744"', "A mandate lasts at most 31 days."]) {
+    'type="datetime-local"', 'data-zone="utc"', 'data-hours="744"', "A mandate lasts at most 31 days.", "Pair another device", "Confirm and show QR", "one-time and expires in 2 minutes", "airadio pairing v1", "AES-GCM", "Nothing is pinned automatically", "--also --operator-asked --operator-name", "drawQr", 'generateKey({ name: "ECDSA", namedCurve: "P-256" }, false']) {
     assert.ok(html.includes(must), must);
   }
   assert.ok(!html.includes('id="m-for"'), "a mandate ends at a moment you pick, not after a fixed span");

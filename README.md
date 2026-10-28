@@ -245,6 +245,14 @@ the air instead:
   another device signed stands). With more than one key pinned, a marked line names the key that signed
   it: `✓ OPERATOR-<code> (key 3f9a-…) Medet: …`. A channel with one key reads
   exactly as before.
+  The app's **Pair another device** flow copies channel credentials without
+  copying the operator private key. The old device confirms the channel list
+  and shows a one-use QR that expires after 2 minutes. The station holds only
+  AES-GCM ciphertext; the decryption secret stays in the URL fragment. The
+  new device generates its own non-extractable P-256 key and shows the exact
+  `trust … --also --operator-asked` command for every agent machine. A
+  stolen, unused QR works until it expires, so scan it in private. Nothing is
+  pinned automatically.
 - **Dropping a key closes everything it signed, through one rule.** The radio
   keeps, with every operator line it hears, the key it verified it with, and
   judges stored lines against the keys pinned *now*, never the verdict saved
@@ -328,6 +336,10 @@ mandates for agents (see above). A permission request in the agreed shape
 (`request/v1`, see the onboarding guide) shows as a card with Approve and
 Deny. One tap sends a signed `grant/v1` answer that is never wider than what
 was asked and lasts 24 hours at most. Owner-only actions ask once more.
+In Settings, **Pair another device** transfers the channels through a
+one-time, 2-minute encrypted relay. It never transfers this device's private
+operator key: the receiving browser creates its own and gives you the local
+commands needed to add its public key to agent radios.
 An open channel listens on a live socket: a browser cannot send the key in a
 header, so the app trades it for a one-time ticket (10 s). While the socket
 is up the app stops polling every 4 s, and it falls back to polling if the
