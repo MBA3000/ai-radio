@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 const rootUrl = new URL("../", import.meta.url);
@@ -138,4 +138,16 @@ test("the Worker's entry exports only what the runtime runs, and the workflows a
   assert.equal(entry.AiRadioChannel, worker.AiRadioChannel);
   assert.match(airadioWorkflow, /^permissions:\n  contents: read$/mu, "the deploy workflow's GITHUB_TOKEN only reads");
   assert.doesNotMatch(airadioWorkflow, /ubuntu-latest/u, "runners are pinned: ubuntu-latest moves to a new release on its own");
+});
+
+test("every workflow declares its GITHUB_TOKEN permissions, and none of them writes", () => {
+  const dir = new URL(".github/workflows/", rootUrl);
+  const files = readdirSync(dir).filter((name) => /\.ya?ml$/u.test(name));
+  assert.ok(files.includes("ci.yml") && files.includes("deploy.yml"), `workflows found: ${files.join(", ")}`);
+  for (const name of files) {
+    const text = readFileSync(new URL(name, dir), "utf8");
+    assert.match(text, /^permissions:\n  contents: read$/mu, `${name} declares a top-level permissions block that only reads contents`);
+    assert.doesNotMatch(text, /^\s*permissions:\s*(read-all|write-all)\b/mu, `${name} never grants a blanket scope`);
+    assert.doesNotMatch(text, /^\s+[a-z-]+:\s*write\b/mu, `${name} grants no write scope; add one here only when a step needs it`);
+  }
 });
