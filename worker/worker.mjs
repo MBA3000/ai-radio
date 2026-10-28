@@ -983,6 +983,17 @@ export function parseMessageSignature(sig) {
   return { sig: out };
 }
 
+/** Optional agent-authorship signature. It is relayed separately and grants no operator authority. */
+export function parseAgentSignature(sig) {
+  if (sig === undefined || sig === null) return { sig: null };
+  if (typeof sig !== "object" || Array.isArray(sig)) return { error: "agentSig must be an object" };
+  if (sig.v !== 1) return { error: "agentSig.v must be 1" };
+  if (typeof sig.key !== "string" || sig.key.length !== 87 || !B64URL.test(sig.key)) return { error: "agentSig.key must be a base64url P-256 public key (87 characters)" };
+  if (typeof sig.sig !== "string" || sig.sig.length !== 86 || !B64URL.test(sig.sig)) return { error: "agentSig.sig must be a base64url ECDSA P-256 signature (86 characters)" };
+  if (!Number.isSafeInteger(sig.ts) || sig.ts <= 0) return { error: "agentSig.ts must be milliseconds since the epoch" };
+  return { sig: { v: 1, key: sig.key, ts: sig.ts, sig: sig.sig } };
+}
+
 /** The station's VAPID key pair lives in a Durable Object of its own; cached per isolate. */
 let vapidCache = null;
 async function vapidKeys(env) {
@@ -1288,9 +1299,11 @@ export default {
         if (encoder.encode(text).length > MAX_TEXT_BYTES) return json({ error: "text exceeds 16 KB" }, 413);
         const signature = parseMessageSignature(parsed.body.sig);
         if (signature.error) return json({ error: signature.error }, 400);
+        const agentSignature = parseAgentSignature(parsed.body.agentSig);
+        if (agentSignature.error) return json({ error: agentSignature.error }, 400);
         const sent = await stub.fetch("https://channel/send", {
           method: "POST",
-          body: JSON.stringify({ wave, from, text, ...(signature.sig ? { sig: signature.sig } : {}) }),
+          body: JSON.stringify({ wave, from, text, ...(signature.sig ? { sig: signature.sig } : {}), ...(agentSignature.sig ? { agentSig: agentSignature.sig } : {}) }),
         });
         const body = await sent.json();
         const notify = Array.isArray(body.notify) ? body.notify : [];
@@ -1372,6 +1385,9 @@ export class AiRadioChannel {
     // Channels created before signatures existed gain the column in place.
     if (!this.sql.exec("PRAGMA table_info(msgs)").toArray().some((column) => column.name === "sig")) {
       this.sql.exec("ALTER TABLE msgs ADD COLUMN sig TEXT");
+    }
+    if (!this.sql.exec("PRAGMA table_info(msgs)").toArray().some((column) => column.name === "agent_sig")) {
+      this.sql.exec("ALTER TABLE msgs ADD COLUMN agent_sig TEXT");
     }
     if (typeof ctx.setWebSocketAutoResponse === "function" && typeof WebSocketRequestResponsePair === "function") {
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(SOCKET_PING, SOCKET_PONG));
@@ -1574,7 +1590,7 @@ export class AiRadioChannel {
     }
 
     if (url.pathname === "/send") {
-      const { open, wave, from, text, sig } = await request.json();
+      const { open, wave, from, text, sig, agentSig } = await request.json();
       if (open === true) {
         // An OPEN send is a CALL into a mailbox: a callsign is a phone
         // number, so anyone may write — but ONLY into a mailbox; a channel
@@ -1588,7 +1604,8 @@ export class AiRadioChannel {
       }
       const at = new Date(this.now()).toISOString();
       const storedSig = open === true || !sig ? null : JSON.stringify(sig);
-      this.sql.exec("INSERT INTO msgs (at, sender, body, sig) VALUES (?, ?, ?, ?)", at, from, text, storedSig);
+      const storedAgentSig = open === true || !agentSig ? null : JSON.stringify(agentSig);
+      this.sql.exec("INSERT INTO msgs (at, sender, body, sig, agent_sig) VALUES (?, ?, ?, ?, ?)", at, from, text, storedSig, storedAgentSig);
       const seq = this.sql.exec("SELECT MAX(seq) AS m FROM msgs").toArray()[0].m;
       this.sql.exec("DELETE FROM msgs WHERE seq <= ?", seq - KEEP_MESSAGES);
       await this.alive();
@@ -1596,7 +1613,7 @@ export class AiRadioChannel {
       // A mailbox rings with the seq alone: a call can carry a channel key and
       // expires after 15 minutes, and only a receive applies that rule.
       const form = this.meta("mode") === "mailbox" ? null : parseMessageForm(text);
-      this.broadcast(this.meta("mode") === "mailbox" ? { seq } : { seq, at, from, text, ...(storedSig ? { sig: JSON.parse(storedSig) } : {}), ...(form ? { form } : {}) });
+      this.broadcast(this.meta("mode") === "mailbox" ? { seq } : { seq, at, from, text, ...(storedSig ? { sig: JSON.parse(storedSig) } : {}), ...(storedAgentSig ? { agentSig: JSON.parse(storedAgentSig) } : {}), ...(form ? { form } : {}) });
       const due = open === true ? { notify: [], later: [] } : this.dueSubscriptions(from, seq);
       return json({ seq, ...(due.notify.length > 0 ? { notify: due.notify } : {}), ...(due.later.length > 0 ? { later: due.later } : {}) });
     }
@@ -1662,7 +1679,7 @@ export class AiRadioChannel {
       const page = parsePageQuery(url.searchParams);
       if (!page) return json({ error: "since must be a canonical nonnegative safe integer and limit must be 1..200" }, 400);
       const rawRows = this.sql
-        .exec("SELECT seq, at, sender, body, sig FROM msgs WHERE seq > ? ORDER BY seq ASC LIMIT ?", page.since, KEEP_MESSAGES + 1)
+        .exec("SELECT seq, at, sender, body, sig, agent_sig FROM msgs WHERE seq > ? ORDER BY seq ASC LIMIT ?", page.since, KEEP_MESSAGES + 1)
         .toArray();
       const mailbox = this.meta("mode") === "mailbox";
       const now = this.now();
@@ -1674,7 +1691,7 @@ export class AiRadioChannel {
       const hasMore = rows.length > page.limit;
       const messages = rows.slice(0, page.limit).map((row) => {
         const form = mailbox ? null : parseMessageForm(row.body);
-        return { seq: row.seq, at: row.at, from: row.sender, text: row.body, ...(row.sig ? { sig: JSON.parse(row.sig) } : {}), ...(form ? { form } : {}) };
+        return { seq: row.seq, at: row.at, from: row.sender, text: row.body, ...(row.sig ? { sig: JSON.parse(row.sig) } : {}), ...(row.agent_sig ? { agentSig: JSON.parse(row.agent_sig) } : {}), ...(form ? { form } : {}) };
       });
       const last = hasMore
         ? messages[messages.length - 1].seq

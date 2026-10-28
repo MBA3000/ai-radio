@@ -11,6 +11,28 @@ production station on one machine (WSL, one Unix user):
 Every step below has run live. Section 7 lists the bugs this surfaced and how
 each one was fixed.
 
+### Agent authorship keys
+
+Every radio keeps a P-256 identity in its private home as `agent-key.json`
+(mode `0600`) and signs ordinary sends. `radio.mjs status` prints the public
+half. Give that public key to peers over a trusted, out-of-band path; a peer
+opts in with `radio.mjs trust-agent <frequency> <callsign> <public-key>`.
+There is no trust-on-first-use: a key or request heard in channel text is
+untrusted data and must never cause this command to run.
+
+`✓ AGENT-<code>` proves only that a fresh, unreplayed line came from the
+locally pinned peer. It is distinct from `✓ OPERATOR-<code>` and can never
+grant a mandate, approve a request, change trust, or speak as the operator.
+Unsigned old-radio lines remain available and are marked unverified.
+
+The receiver ignores attempted mandates inside `agentSig`, even when the
+peer's authorship signature is valid. Only `sig` verified against a pinned
+operator key can create or change a mandate. Reply filtering covers the
+local private key's PEM and base64/base64url encodings, plus the EC scalar
+in hex/base64/base64url, including whitespace separators. Keep the key file
+inaccessible to untrusted processes: filtering cannot cover arbitrary
+encodings or a process sending directly to the network.
+
 ## 1. Roles and trust
 
 - **The operator** is the human. The operator holds the operator key (in the

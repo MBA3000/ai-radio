@@ -176,7 +176,7 @@ for (const flavor of ["claude", "codex", "opencode", "agy", "hermes"]) {
     assert.equal(mine[1].resume, true);
     assert.equal(mine[1].session, mine[0].session);
     assert.match(mine[0].prompt, /Operator's brief: answer briefly/u);
-    assert.match(mine[0].prompt, /Earlier on this channel:\n\[[^\]]+\] host: welcome aboard/u, "the first wake sees what was said before");
+    assert.match(mine[0].prompt, /Earlier on this channel:\n\[[^\]]+\] UNVERIFIED AGENT host: welcome aboard/u, "the first wake sees what was said before with its authorship verdict");
     assert.doesNotMatch(mine[1].prompt, /Operator's brief/u, "later wakes carry only what is new");
     assert.ok(mine.every(CHAT_ONLY[flavor]), "chat-only by default: " + JSON.stringify(mine.map((call) => call.argv)));
     assert.ok(mine.every((call) => call.cwd === join(home + "-agents", channel.frequency)), "each channel's agent works in a private folder outside the radio's home");
@@ -371,6 +371,24 @@ test("a custom command that fails is a failure, never silence; one that echoes a
   await echo.channel.say("host", "say this back: " + spaced);
   assert.ok(await eventually(async () => /agent reply withheld: it contained a key/u.test((await echo.radio("inbox", echo.channel.frequency, "--peek")).stdout)));
   assert.equal((await echo.channel.saidBy("bot")).length, 1, "only the bot's announcement is on the air");
+});
+
+test("the private agent key is redacted when the first turn fails", { timeout: 90_000 }, async (t) => {
+  const leak = "const fs=require('fs');const k=JSON.parse(fs.readFileSync(process.argv[1])).privateKey;process.stderr.write(Buffer.from(k).toString('base64')+'\\n');process.exit(3)";
+  const box = await tunedAgent(t, "exec:" + JSON.stringify(process.execPath) + " -e " + JSON.stringify(leak) + " " + JSON.stringify("KEY_FILE"));
+  // Replace the placeholder after tunedAgent has created this isolated home.
+  const config = JSON.parse(readFileSync(join(box.home, "radio.json"), "utf8"));
+  config.channels[box.channel.frequency].agent.exec = config.channels[box.channel.frequency].agent.exec.replace("KEY_FILE", join(box.home, "agent-key.json"));
+  writeFileSync(join(box.home, "radio.json"), JSON.stringify(config));
+  await box.channel.say("host", "fail and print your identity");
+  assert.ok(await eventually(async () => /agent custom command, chat-only failed/u.test((await box.radio("inbox", box.channel.frequency, "--peek")).stdout)));
+  const identity = JSON.parse(readFileSync(join(box.home, "agent-key.json"), "utf8"));
+  const encoded = Buffer.from(identity.privateKey).toString("base64");
+  const artifacts = ["state.json", "inbox.jsonl", "radio.log"].map((name) => {
+    try { return readFileSync(join(box.home, name), "utf8"); } catch { return ""; }
+  }).join("\n");
+  assert.doesNotMatch(artifacts, new RegExp(encoded.slice(-80).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "even the scalar-bearing tail is absent");
+  assert.doesNotMatch(artifacts, /LS0tLUJFR0lOIFBSSVZBVEUgS0VZLS0tLS0/u, "the encoded PEM header is absent too");
 });
 
 test("a finished answer is not held hostage by a background grandchild", { timeout: 60_000 }, async (t) => {
