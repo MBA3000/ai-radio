@@ -23,7 +23,10 @@ environment's setup script, reads `AGENTS.md`, does one task and opens a PR.
 - **Secrets and variables:** none are needed. Never add Cloudflare tokens or
   account ids, VAPID keys, channel keys (KEY), station keys or operator keys
   to the environment, the code, test fixtures or the PR. Tests build any
-  key-shaped value at runtime.
+  key-shaped value at runtime. That includes PEM headers: write
+  `` `-----BEGIN ${["PRIVATE", "KEY"].join(" ")}-----` ``, never the literal
+  line. The flywheel's privacy scan refuses any diff containing a literal key
+  block, token or JWT, and the whole slice stops until a human fixes it.
 - **Internet:** not needed for tests. `npx wrangler@4` (`npm run worker:dev`,
   `npm run worker:dry-run`) needs the network; it is optional and never part
   of acceptance.
