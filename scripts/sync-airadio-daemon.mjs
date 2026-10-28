@@ -42,9 +42,12 @@ export function embeddedWorkerSource(workerSource, daemonSource) {
 
 export function radioModuleSource(radioSource) {
   refuseUnembeddable("radio", radioSource);
+  // This pure parser also runs in the Worker; the downloadable radio stays one file.
+  const parser = radioSource.match(/export function parseMessageForm\(text\) \{[\s\S]*?\n\}/);
+  if (!parser) throw new Error("radio message-form parser not found");
   return "// GENERATED from scripts/airadio-radio.mjs by `npm run airadio:sync-daemon -- --write`.\n"
     + "// Do not edit: GET /radio.mjs serves these exact bytes.\n"
-    + "export const RADIO_CODE = String.raw`" + radioSource + "`;\n";
+    + "export const RADIO_CODE = String.raw`" + radioSource + "`;\n\n" + parser[0] + "\n";
 }
 
 /** Width, height and RGB rows of a PNG this repository wrote (8-bit RGB, filter 0). */
