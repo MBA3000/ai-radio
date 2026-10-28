@@ -244,6 +244,17 @@ the air instead:
   another device signed stands). With more than one key pinned, a marked line names the key that signed
   it: `✓ OPERATOR-<code> (key 3f9a-…) Medet: …`. A channel with one key reads
   exactly as before.
+- **Dropping a key closes everything it signed, through one rule.** The radio
+  keeps, with every operator line it hears, the key it verified it with, and
+  judges stored lines against the keys pinned *now*, never the verdict saved
+  when they arrived: `inbox` (plain and `--json`), `granted` (a dropped key's
+  saved grant grants nothing and spends nothing), the agent's queue and the
+  history a new session is briefed with, and mandates. A running turn that
+  holds the dropped key's words is stopped, and a session that held them is
+  not resumed: the next wake starts a fresh one, briefed with what still
+  counts. A line heard by a radio older than this rule carries no key and
+  counts for no one. The `operator` flag written into `inbox.jsonl` is the
+  verdict at receipt; the radio appends a `RADIO` line when a key is dropped.
 - **Mandates.** From the channel menu the operator signs what an agent may do
   (*talk*, *talk + tools* or *revoke*) and until when: an exact moment picked
   in their own time or in UTC, at most 31 days ahead, with an optional note.

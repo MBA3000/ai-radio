@@ -1005,6 +1005,37 @@ export function operatorKeys(channel) {
     .filter((entry) => entry && typeof entry.key === "string").slice(0, MAX_OPERATOR_KEYS);
 }
 
+/** Fingerprints of the operator keys pinned for a channel now, computed from the keys themselves. */
+export function pinnedFingerprints(channel) {
+  return operatorKeys(channel).map((entry) => keyFingerprint(entry.key));
+}
+
+/**
+ * A stored line (inbox entry, queued message, earlier history) judged against
+ * the keys pinned NOW, never the verdict saved when it was heard: it is the
+ * operator's only while the key verified for it ("signer") is still pinned.
+ * A line without a signer (heard before signers were kept) speaks for no one.
+ * Every reader of stored operator authority goes through here: inbox, granted,
+ * the agent's queue and history, so dropping a key closes all of them at once.
+ */
+export function trustNow(entry, channel) {
+  if (!entry || typeof entry !== "object" || entry.kind) return entry;
+  const { operator, operatorKey, revoked, ...rest } = entry;
+  if (!operator) return rest;
+  const pinned = pinnedFingerprints(channel);
+  const has = Object.prototype.hasOwnProperty.call(entry, "untrusted");
+  if (typeof entry.signer !== "string" || !pinned.includes(entry.signer)) {
+    return { ...rest, ...(has ? { untrusted: true } : {}), revoked: typeof entry.signer === "string" ? entry.signer : "unknown key" };
+  }
+  return { ...rest, ...(has ? { untrusted: false } : {}), operator: true, ...(pinned.length > 1 ? { operatorKey: entry.signer } : {}) };
+}
+
+/** Inbox entries, each judged against the keys its channel pins now (one config read for all). */
+function trustedNow(p, entries) {
+  const channels = loadConfig(p).channels;
+  return entries.map((entry) => (entry && !entry.kind ? trustNow(entry, channels[entry.frequency]) : entry));
+}
+
 /** { ok: true } when the message carries a valid, fresh signature by this operator key (or one of these keys). */
 export function verifySigned(message, frequency, operatorKey) {
   const sig = message && message.sig;
@@ -1049,7 +1080,9 @@ export function mandateFor(mandate, me) {
 
 export function mandateActive(channel, now = Date.now()) {
   const mandate = channel && channel.mandate;
-  return Boolean(mandate && (mandate.scope === "talk" || mandate.scope === "tools") && Date.parse(mandate.until) > now);
+  return Boolean(mandate && (mandate.scope === "talk" || mandate.scope === "tools") && Date.parse(mandate.until) > now
+    // Signed by a key pinned now: a mandate whose signer is no longer pinned grants nothing, whatever its record says.
+    && (typeof mandate.signer !== "string" || pinnedFingerprints(channel).includes(mandate.signer)));
 }
 
 /**
@@ -1170,6 +1203,16 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     agents: previous.agents && typeof previous.agents === "object" ? previous.agents : {},
     signed: previous.signed && typeof previous.signed === "object" ? previous.signed : {},
   };
+  // A session resumed from a radio that kept no signers held words of one key only:
+  // the channel's single operator key of that time, which is the one pinned first now.
+  {
+    const channels = loadConfig(p).channels;
+    for (const [frequency, current] of Object.entries(state.agents)) {
+      if (!current || typeof current !== "object" || Array.isArray(current.signers)) continue;
+      const first = operatorKeys(channels[frequency])[0];
+      current.signers = typeof current.session === "string" && current.session !== "" && first ? [keyFingerprint(first.key)] : [];
+    }
+  }
   const running = new Map();
   const children = new Set();
   let lastActivity = Date.now();
@@ -1236,11 +1279,12 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     let current = state.agents[frequency];
     const epoch = agent.epoch || 0;
     if (!current || typeof current !== "object" || current.epoch !== epoch) {
-      current = { epoch, session: agent.session || null, briefed: false, wakes: [], pending: [], dropped: 0 };
+      current = { epoch, session: agent.session || null, briefed: false, wakes: [], pending: [], dropped: 0, signers: [] };
       state.agents[frequency] = current;
     }
     if (!Array.isArray(current.pending)) current.pending = [];
     if (!Array.isArray(current.wakes)) current.wakes = [];
+    if (!Array.isArray(current.signers)) current.signers = [];
     if (!current.day || current.day.date !== today()) current.day = { date: today(), count: 0 };
     return current;
   };
@@ -1261,9 +1305,6 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
 
   // The agent turn running on each channel, and what it was allowed when it began.
   const working = new Map();
-
-  /** Fingerprints of the operator keys pinned for a channel now. */
-  const pinnedFingerprints = (channel) => operatorKeys(channel).map((entry) => keyFingerprint(entry.key));
 
   /** A turn the operator's latest word no longer allows is stopped, and its answer never sent. */
   const recheckWork = (frequency) => {
@@ -1344,14 +1385,18 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const allowed = allowance(channel);
     // A queued line is the operator's only while the key that signed it is still pinned:
     // a key dropped since (or a line queued before signers were kept) speaks for no one.
-    const pinned = pinnedFingerprints(channel);
-    const stillOperator = (message) => {
-      if (!message.operator) return message;
-      const { operator, operatorKey, ...rest } = message;
-      if (!pinned.includes(message.signer)) return rest;
-      return { ...rest, operator, ...(pinned.length > 1 ? { operatorKey: message.signer } : {}) };
-    };
+    const stillOperator = (message) => trustNow(message, channel);
     current.pending = current.pending.map(stillOperator);
+    // A resumed conversation still holds every earlier turn's words. One that holds
+    // words of a key dropped since is not resumed: a fresh session is briefed from
+    // the inbox, judged against the keys pinned now.
+    const pinned = pinnedFingerprints(channel);
+    if (typeof current.session === "string" && current.session !== "" && current.signers.some((signer) => !pinned.includes(signer))) {
+      current.session = null;
+      current.briefed = false;
+      current.signers = [];
+      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent session started afresh: it held words of an operator key that was dropped" });
+    }
     // Without a valid mandate a governed session may still answer its operator's
     // own signed words (the page's rule), chat-only and to them alone.
     const operatorOnly = !allowed.talk;
@@ -1369,6 +1414,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     current.lastWakeAt = new Date().toISOString();
     current.pausedNotice = false;
     const resume = typeof current.session === "string" && current.session !== "";
+    if (!resume) current.signers = [];
     const session = resume ? current.session : preset.newSession ? preset.newSession() : null;
     const history = current.briefed ? [] : inboxSince(p, 0).entries
       .filter((entry) => entry.frequency === frequency && !entry.kind && Number.isSafeInteger(entry.seq) && entry.seq < messages[0].seq)
@@ -1404,7 +1450,9 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       : preset.stdinJson ? JSON.stringify({ station: channel.station, frequency, as: me, session, first: !current.briefed, prompt, messages }) + "\n"
       : "";
     log("waking " + agentLabel(agent) + " for " + frequency + " (" + messages.length + " new message" + (messages.length === 1 ? "" : "s") + "): " + commandLine(preset.binary, args, prompt));
-    const work = { tools, operatorOnly, signers: [...history, ...messages].filter((message) => message.operator).map((message) => message.signer), kill: null, stopped: null };
+    // Every operator key whose words this conversation holds: earlier turns of a resumed session, history and this batch.
+    const signers = [...new Set([...current.signers, ...[...history, ...messages].filter((message) => message.operator).map((message) => message.signer)])];
+    const work = { tools, operatorOnly, signers, kill: null, stopped: null };
     working.set(frequency, work);
     let result;
     try {
@@ -1422,6 +1470,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     } finally {
       working.delete(frequency);
     }
+    // The session has seen these words now, whatever became of the turn.
+    current.signers = signers;
     if (stopping) {
       log("receiver stopping: the agent's answer on " + frequency + " is not sent");
       return;
@@ -1445,6 +1495,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       if (resume && /no (conversation|session)|(conversation|session|thread)[^.]{0,40}not found|unknown (session|thread|conversation)/i.test(current.lastError)) {
         current.session = null;
         current.briefed = false;
+        current.signers = [];
       }
       appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent " + agentLabel(agent) + " failed: " + current.lastError });
       log("agent for " + frequency + " failed: " + current.lastError);
@@ -1912,6 +1963,7 @@ export function formatEntry(entry, mark = "\u2713 OPERATOR") {
   if (entry.mandate && entry.operator) return time + " " + entry.frequency + " " + mark + " " + from + " MANDATE for " + entry.mandate.to + ": " + describeMandate(entry.mandate);
   if (entry.operator) return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + " " + mark + " " + from + ": " + entry.text;
   if (entry.forged) return time + " " + entry.frequency + " \u26a0 SIGNATURE REJECTED (" + entry.forged + ") " + from + ": " + entry.text;
+  if (entry.revoked) return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + " " + from + " (signed by " + entry.revoked + ", no longer pinned: not your operator's now): " + entry.text;
   if (entry.signedBy) return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + " " + from + " (signed by another key " + entry.signedBy + "): " + entry.text;
   return time + " " + entry.frequency + (entry.history ? " (before you joined)" : "") + " " + from + ": " + entry.text;
 }
@@ -2221,7 +2273,8 @@ async function cmdGranted(p, args, flags, out) {
   if (args.length < 2) throw new RadioError("usage: granted <frequency> <request-id> [--use] [--json]");
   const [frequency, id] = args;
   if (!loadConfig(p).channels[frequency]) throw new RadioError("this radio is not tuned to " + frequency);
-  const found = findGrant(inboxEntries(p), frequency, id);
+  // Judged against the keys pinned now: a grant signed by a key dropped since is no grant.
+  const found = findGrant(trustedNow(p, inboxEntries(p)), frequency, id);
   // A counted grant is spent here, once per use: a copy of it cannot be spent again.
   const ledger = readJson(p.grants, {});
   const key = frequency + " " + id;
@@ -2276,7 +2329,7 @@ async function cmdInbox(p, args, flags, out) {
     let offset = start;
     for (;;) {
       const got = inboxSince(p, offset);
-      for (const entry of got.entries) {
+      for (const entry of trustedNow(p, got.entries)) {
         if (frequency === null || entry.frequency === frequency) out(redact(formatEntry(entry, mark)).replace(/\r?\n/g, " \u23ce "));
       }
       if (got.offset !== offset) {
@@ -2288,7 +2341,9 @@ async function cmdInbox(p, args, flags, out) {
   }
   const read = () => {
     const got = inboxSince(p, start);
-    return frequency ? { offset: got.offset, entries: got.entries.filter((entry) => entry.frequency === frequency) } : got;
+    // Every listing judges operator lines against the keys pinned now, not when they were heard.
+    const entries = trustedNow(p, got.entries);
+    return { offset: got.offset, entries: frequency ? entries.filter((entry) => entry.frequency === frequency) : entries };
   };
   let got = read();
   const deadline = Date.now() + waitSeconds * 1000;
@@ -2410,6 +2465,8 @@ function trustDevice(p, frequency, channel, raw, flags, out) {
         if (left.length > 1) target.devices = left.slice(1);
       }
     });
+    // Readers of the raw inbox file learn it too; every listing already judges by the keys pinned now.
+    appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "operator key " + keyFingerprint(key) + " dropped: lines it signed are no longer your operator's, and no grant or mandate it signed holds" });
     poke(p);
     const after = loadConfig(p).channels[frequency];
     out("dropped the operator key " + keyFingerprint(key) + " from " + frequency + ": its messages are no longer marked OPERATOR; mandate: " + mandateLine(after)
