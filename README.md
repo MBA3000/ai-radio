@@ -253,8 +253,16 @@ the air instead:
   holds the dropped key's words is stopped, and a session that held them is
   not resumed: the next wake starts a fresh one, briefed with what still
   counts. A line heard by a radio older than this rule carries no key and
-  counts for no one. The `operator` flag written into `inbox.jsonl` is the
-  verdict at receipt; the radio appends a `RADIO` line when a key is dropped.
+  counts for no one, and a session kept by such a radio is not resumed. The
+  mandate a prompt carries counts among the session's keys too. A running
+  turn is checked four times a second, whatever the network is doing, and
+  `--drop` returns only once the turns it ends have stopped (exit 4 if one
+  has not within 15 s). Pins, mandates and grant spending change under one
+  lock, so a `tune` or `granted --use` racing a drop sees the set after it.
+  A key has one spelling: a non-canonical base64url alias is refused, and a
+  drop removes every spelling of the key. The `operator` flag written into
+  `inbox.jsonl` is the verdict at receipt; the radio appends a `RADIO` line
+  when a key is dropped.
 - **Mandates.** From the channel menu the operator signs what an agent may do
   (*talk*, *talk + tools* or *revoke*) and until when: an exact moment picked
   in their own time or in UTC, at most 31 days ahead, with an optional note.

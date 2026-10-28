@@ -14,6 +14,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createServer } from "node:http";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -864,7 +865,7 @@ test("a resumed session that holds a dropped key's words starts afresh; one hold
   assert.ok(await eventually(async () => /agent session started afresh: it held words of an operator key that was dropped/u.test((await radio("inbox", channel.frequency, "--peek")).stdout)));
 });
 
-test("a session from a radio that kept no signers is taken to hold its first key's words", { timeout: 120_000 }, async (t) => {
+test("a session from a radio that kept no signers is never resumed: nobody can prove whose words it holds", { timeout: 120_000 }, async (t) => {
   const station = await startAiradioLocalStation();
   t.after(() => station.close());
   const { home, radio, calls } = sandbox(t);
@@ -877,18 +878,207 @@ test("a session from a radio that kept no signers is taken to hold its first key
   await say(phone, "phone says: remember 5");
   assert.ok(await eventually(() => calls().length === 1));
   const stateFile = join(home, "state.json");
-  assert.ok(await eventually(() => Array.isArray(JSON.parse(readFileSync(stateFile, "utf8")).agents[channel.frequency].signers)));
+  assert.ok(await eventually(() => (JSON.parse(readFileSync(stateFile, "utf8")).agents[channel.frequency].signers || []).length === 1));
   assert.equal((await radio("stop", "--operator-asked")).code, 0);
   // As an older radio left it: a session, and no signers.
   const old = JSON.parse(readFileSync(stateFile, "utf8"));
   delete old.agents[channel.frequency].signers;
   writeFileSync(stateFile, JSON.stringify(old));
-  assert.equal((await radio("up")).code, 0);
-  assert.ok(await eventually(() => Array.isArray(JSON.parse(readFileSync(stateFile, "utf8")).agents[channel.frequency].signers)));
-  assert.deepEqual(JSON.parse(readFileSync(stateFile, "utf8")).agents[channel.frequency].signers, [keyFingerprint(phone.key)]);
+  // While it is off, the operator adds the laptop and drops the phone: the laptop is now the first key.
   assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
   assert.equal((await radio("trust", channel.frequency, phone.key, "--drop", "--operator-asked")).code, 0);
+  assert.equal((await radio("up")).code, 0);
   await say(laptop, "laptop now");
   assert.ok(await eventually(() => calls().length === 2));
-  assert.equal(calls()[1].resume, false, "the phone's words in that session leave with the phone");
+  assert.equal(calls()[1].resume, false, "the phone's words in that session never pass as the laptop's");
+  assert.ok(!calls()[1].prompt.includes("phone says: remember 5"), "and the fresh brief carries no dropped key's words");
+  assert.match((await radio("inbox", channel.frequency, "--peek", "--all")).stdout, /agent session started afresh: it was kept by an older radio/u);
+});
+
+/** A station in front of the station: holds requests a test chooses until it lets them through. */
+async function holdingProxy(t, target) {
+  const rules = [];
+  const held = [];
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const rule = rules.find((entry) => entry.match(req));
+    if (rule) {
+      if (rule.once) rules.splice(rules.indexOf(rule), 1);
+      held.push(req.url);
+      await rule.until();
+    }
+    try {
+      const headers = { ...req.headers };
+      delete headers.host;
+      delete headers["content-length"];
+      const response = await fetch(target + req.url, { method: req.method, headers, body: chunks.length > 0 ? Buffer.concat(chunks) : undefined });
+      res.writeHead(response.status, { "content-type": response.headers.get("content-type") || "application/json" });
+      res.end(Buffer.from(await response.arrayBuffer()));
+    } catch {
+      if (!res.headersSent) res.writeHead(502);
+      res.end();
+    }
+  });
+  await new Promise((ok) => server.listen(0, "127.0.0.1", ok));
+  t.after(() => new Promise((ok) => { server.closeAllConnections(); server.close(ok); }));
+  return { url: "http://127.0.0.1:" + server.address().port, rules, held };
+}
+
+test("a tune racing a drop never writes the old key set back", { timeout: 90_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const proxy = await holdingProxy(t, station.url);
+  const { home, radio } = sandbox(t, () => ({ AIRADIO_SOCKETS: "0" }));
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const config = () => JSON.parse(readFileSync(join(home, "radio.json"), "utf8")).channels[channel.frequency];
+  const tune = (...extra) => radio("tune", proxy.url, channel.frequency, channel.wave, "--as", "Solnze", ...extra);
+  assert.equal((await tune("--operator", phone.key)).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  const text = "talk for an hour";
+  await channel.post({ from: "Medet", text, sig: await laptop.sign({ frequency: channel.frequency, from: "Medet", text,
+    mandate: { to: "Solnze", scope: "talk", until: new Date(Date.now() + 3_600_000).toISOString() } }) });
+  assert.ok(await eventually(() => config().mandate && config().mandate.scope === "talk"));
+  // While the tune reads recent traffic, the operator drops the phone in person.
+  let dropped = null;
+  proxy.rules.push({ once: true, match: (req) => req.method === "GET" && /\/messages\?since=0\b/u.test(req.url), until: async () => {
+    dropped = await radio("trust", channel.frequency, phone.key, "--drop", "--operator-asked");
+  } });
+  const again = await tune();
+  assert.equal(again.code, 0, again.stderr);
+  assert.equal(dropped && dropped.code, 0, "the drop ran in the middle of the tune");
+  assert.equal(config().operator.key, laptop.key, "the laptop is the operator's key now");
+  assert.equal(config().devices, undefined);
+  assert.ok(!JSON.stringify(config()).includes(phone.key), "the dropped phone is not written back");
+  assert.equal(config().mandate.scope, "talk", "and the laptop's mandate is not wiped");
+  assert.equal(config().mandate.signer, keyFingerprint(laptop.key));
+});
+
+test("a running turn stops, and --drop returns only after it has, even while the station keeps the receiver waiting", { timeout: 90_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const proxy = await holdingProxy(t, station.url);
+  let release;
+  const stalled = new Promise((ok) => { release = ok; });
+  t.after(() => release());
+  const { home, radio, calls } = sandbox(t, () => ({ AIRADIO_SOCKETS: "0" }));
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  assert.equal((await radio("tune", proxy.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--tools", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  const text = "tools for an hour";
+  await channel.post({ from: "Medet", text, sig: await laptop.sign({ frequency: channel.frequency, from: "Medet", text,
+    mandate: { to: "Solnze", scope: "tools", until: new Date(Date.now() + 3_600_000).toISOString() } }) });
+  assert.ok(await eventually(() => calls().length === 1));
+  await channel.say("host", "take your time");
+  assert.ok(await eventually(() => calls().length === 2), "a slow turn with tools begins");
+  // From now on every request of the receiver waits on the station.
+  proxy.rules.push({ match: () => true, until: () => stalled });
+  const before = proxy.held.length;
+  assert.ok(await eventually(() => proxy.held.length > before), "the receiver is waiting on the station");
+  const dropped = await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked");
+  assert.equal(dropped.code, 0, dropped.stdout);
+  assert.match(dropped.stdout, /the agent turn that held its words was stopped/u);
+  assert.match(readFileSync(join(home, "inbox.jsonl"), "utf8"), /agent stopped mid-turn: its mandate ended; its answer was not sent/u,
+    "stopped by the time --drop returns, though the network loop is still waiting");
+  release();
+  assert.ok(!(await channel.saidBy("Solnze")).includes("done, slowly"));
+});
+
+test("the mandate a prompt carries counts among the session's signers, even when its line is out of the history", { timeout: 120_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio, calls } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const config = () => JSON.parse(readFileSync(join(home, "radio.json"), "utf8")).channels[channel.frequency];
+  const signers = () => (JSON.parse(readFileSync(join(home, "state.json"), "utf8")).agents[channel.frequency] || {}).signers || [];
+  const mandate = async (who, text, scope) => channel.post({ from: "Medet", text, sig: await who.sign({ frequency: channel.frequency, from: "Medet", text,
+    mandate: { to: "Solnze", scope, until: new Date(Date.now() + 3_600_000).toISOString(), note: "the laptop's standing order" } }) });
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  await mandate(laptop, "talk for an hour", "talk");
+  assert.ok(await eventually(() => config().mandate && config().mandate.scope === "talk"));
+  // More than a history's worth of other lines: the mandate's own line is not in the brief.
+  for (let index = 0; index < 12; index += 1) await channel.say("host", "line " + index);
+  assert.ok(await eventually(async () => (await radio("inbox", channel.frequency, "--peek", "--all")).stdout.includes("line 11")));
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude")).code, 0);
+  await channel.say("host", "hello");
+  assert.ok(await eventually(() => calls().length === 1));
+  assert.match(calls()[0].prompt, /the laptop's standing order/u, "the prompt carries the laptop's mandate");
+  assert.ok(!calls()[0].prompt.includes("talk for an hour"), "but not its line");
+  assert.ok(await eventually(() => signers().includes(keyFingerprint(laptop.key))), "so the session holds the laptop's words");
+  await mandate(phone, "the phone's turn", "talk");
+  assert.ok(await eventually(() => config().mandate.signer === keyFingerprint(phone.key)));
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked")).code, 0);
+  const seen = calls().length;
+  await channel.say("host", "again");
+  assert.ok(await eventually(() => calls().length > seen && calls().some((call, index) => index >= seen && call.prompt.includes("again"))));
+  const next = calls().slice(seen).find((call) => call.prompt.includes("again"));
+  assert.equal(next.resume, false, "a session that held the dropped laptop's mandate starts afresh");
+});
+
+test("one key has one spelling: an alias is never a device of its own, and a drop removes every spelling", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const last = laptop.key[laptop.key.length - 1];
+  const alias = laptop.key.slice(0, -1) + alphabet[alphabet.indexOf(last) ^ 1];
+  assert.notEqual(alias, laptop.key);
+  assert.deepEqual(Buffer.from(alias, "base64url"), Buffer.from(laptop.key, "base64url"), "the same key bytes");
+  assert.equal(operatorKeyValid(laptop.key), true);
+  assert.equal(operatorKeyValid(alias), false, "only the canonical spelling is a key");
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  assert.notEqual((await radio("trust", channel.frequency, alias, "--also", "--operator-asked")).code, 0, "an alias is refused");
+  const file = join(home, "radio.json");
+  const read = () => JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(read().channels[channel.frequency].devices.length, 1);
+  // One written by hand or by an older radio: the drop still takes both spellings.
+  const written = read();
+  written.channels[channel.frequency].devices.push({ key: alias, name: null, fingerprint: keyFingerprint(alias), pinnedAt: new Date().toISOString() });
+  writeFileSync(file, JSON.stringify(written));
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked")).code, 0);
+  assert.equal(read().channels[channel.frequency].devices, undefined);
+  assert.equal(read().channels[channel.frequency].operator.key, phone.key);
+});
+
+test("granted checks the pins and spends the grant under the lock a drop takes", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const until = new Date(Date.now() + 3_600_000).toISOString();
+  const text = "GRANT radio.update\n" + JSON.stringify({ airadio: "grant/v1", request: "r-laptop", decision: "grant", action: "radio.update", bounds: { until, count: 3 } });
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  await channel.post({ from: "Medet", text, sig: await laptop.sign({ frequency: channel.frequency, from: "Medet", text }) });
+  assert.ok(await eventually(async () => (await radio("granted", channel.frequency, "r-laptop", "--json")).code === 0));
+  // A drop holds the lock: it has decided, and is writing the set without the laptop.
+  const lock = join(home, "radio.lock");
+  writeFileSync(lock, "");
+  const pending = radio("granted", channel.frequency, "r-laptop", "--use", "--json");
+  await new Promise((ok) => setTimeout(ok, 1_000));
+  const file = join(home, "radio.json");
+  const written = JSON.parse(readFileSync(file, "utf8"));
+  delete written.channels[channel.frequency].devices;
+  writeFileSync(file, JSON.stringify(written));
+  rmSync(lock);
+  const got = await pending;
+  assert.equal(got.code, 5, "judged after the drop, not before it");
+  assert.equal(JSON.parse(got.stdout).status, "none");
+  let ledger = {};
+  try { ledger = JSON.parse(readFileSync(join(home, "grants.json"), "utf8")); } catch {}
+  assert.equal(ledger[channel.frequency + " r-laptop"], undefined, "and nothing is spent");
 });

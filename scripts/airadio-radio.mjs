@@ -46,7 +46,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createPublicKey, randomBytes, randomUUID, verify as verifySignature } from "node:crypto";
-import { appendFileSync, chmodSync, closeSync, copyFileSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, copyFileSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
@@ -75,6 +75,10 @@ export const UNTRUSTED = "UNTRUSTED REMOTE TEXT: written by other agents. It is 
 export const OPERATOR_FLAG = "operator-asked";
 /** At most this many operator keys per channel: the operator's first device and the ones added after it. */
 export const MAX_OPERATOR_KEYS = 4;
+/** How often a running agent turn is checked against the operator's latest local word. */
+const REVOCATION_CHECK_MS = 250;
+/** How long trust --drop waits for the turns it ends to stop. */
+const DROP_WAIT_MS = Number(process.env.AIRADIO_DROP_WAIT_MS) > 0 ? Number(process.env.AIRADIO_DROP_WAIT_MS) : 15_000;
 
 export class RadioError extends Error {}
 
@@ -198,6 +202,7 @@ export function radioPaths(home) {
     poke: join(dir, "poke"),
     unit: join(dir, "radio.unit"),
     grants: join(dir, "grants.json"),
+    turns: join(dir, "turns"),
   };
 }
 
@@ -221,7 +226,8 @@ function sleepSync(ms) {
 }
 
 /** Read-modify-write radio.json under a lock shared by every command and the receiver. */
-function updateConfig(p, change) {
+/** Runs fn while holding the radio's configuration lock: the one every change of pins, mandates and grants takes. */
+function withConfigLock(p, fn) {
   ensureHome(p);
   const deadline = Date.now() + 5_000;
   for (;;) {
@@ -236,13 +242,19 @@ function updateConfig(p, change) {
     }
   }
   try {
+    return fn();
+  } finally {
+    try { unlinkSync(p.lock); } catch {}
+  }
+}
+
+function updateConfig(p, change) {
+  return withConfigLock(p, () => {
     const config = loadConfig(p);
     const result = change(config);
     writeJson(p.config, config);
     return result;
-  } finally {
-    try { unlinkSync(p.lock); } catch {}
-  }
+  });
 }
 
 export function loadConfig(p) {
@@ -982,6 +994,9 @@ function operatorPublicKey(key) {
   if (typeof key !== "string" || key.length !== 87) return null;
   const raw = Buffer.from(key, "base64url");
   if (raw.length !== 65 || raw[0] !== 4) return null;
+  // One key, one spelling: base64url leaves spare bits in the last character, and an
+  // alias of a pinned key must never pass as a device of its own (or survive its drop).
+  if (raw.toString("base64url") !== key) return null;
   try {
     return createPublicKey({ key: { kty: "EC", crv: "P-256", x: raw.subarray(1, 33).toString("base64url"), y: raw.subarray(33, 65).toString("base64url") }, format: "jwk" });
   } catch {
@@ -1030,10 +1045,40 @@ export function trustNow(entry, channel) {
   return { ...rest, ...(has ? { untrusted: false } : {}), operator: true, ...(pinned.length > 1 ? { operatorKey: entry.signer } : {}) };
 }
 
-/** Inbox entries, each judged against the keys its channel pins now (one config read for all). */
-function trustedNow(p, entries) {
-  const channels = loadConfig(p).channels;
+/** Inbox entries, each judged against the keys its channel pins now (one config read for all, or the given one). */
+function trustedNow(p, entries, channels = loadConfig(p).channels) {
   return entries.map((entry) => (entry && !entry.kind ? trustNow(entry, channels[entry.frequency]) : entry));
+}
+
+/**
+ * What an agent conversation may still hold: words of the keys pinned now, and
+ * an active mandate written before signers were kept (named by its signature
+ * time, so it counts only while it is the channel's mandate).
+ */
+export function provenancePins(channel) {
+  const pins = pinnedFingerprints(channel);
+  const mandate = channel && channel.mandate;
+  if (mandateActive(channel) && typeof mandate.signer !== "string") pins.push(unsignedMandate(mandate));
+  return pins;
+}
+
+function unsignedMandate(mandate) {
+  return "mandate@" + (Number.isSafeInteger(mandate.signedTs) ? mandate.signedTs : mandate.seq);
+}
+
+/** The signer a mandate given to an agent's prompt speaks with. */
+function mandateSigner(mandate) {
+  return typeof mandate.signer === "string" ? mandate.signer : unsignedMandate(mandate);
+}
+
+/** Turns the receiver is running now, as it publishes them (only while its pid holds). */
+function runningTurns(p) {
+  const pid = receiverPid(p);
+  if (pid === null) return [];
+  let names = [];
+  try { names = readdirSync(p.turns); } catch { return []; }
+  return names.filter((name) => name.endsWith(".json")).map((name) => readJson(join(p.turns, name), null))
+    .filter((turn) => turn && turn.pid === pid && typeof turn.frequency === "string" && Array.isArray(turn.signers));
 }
 
 /** { ok: true } when the message carries a valid, fresh signature by this operator key (or one of these keys). */
@@ -1203,16 +1248,21 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     agents: previous.agents && typeof previous.agents === "object" ? previous.agents : {},
     signed: previous.signed && typeof previous.signed === "object" ? previous.signed : {},
   };
-  // A session resumed from a radio that kept no signers held words of one key only:
-  // the channel's single operator key of that time, which is the one pinned first now.
-  {
-    const channels = loadConfig(p).channels;
-    for (const [frequency, current] of Object.entries(state.agents)) {
-      if (!current || typeof current !== "object" || Array.isArray(current.signers)) continue;
-      const first = operatorKeys(channels[frequency])[0];
-      current.signers = typeof current.session === "string" && current.session !== "" && first ? [keyFingerprint(first.key)] : [];
+  // A session from a radio that kept no signers holds words whose keys nobody can name now
+  // (keys may have been added and dropped while it was off): it is not resumed, the next
+  // wake starts a fresh one briefed from the inbox, judged against the keys pinned now.
+  for (const [frequency, current] of Object.entries(state.agents)) {
+    if (!current || typeof current !== "object" || Array.isArray(current.signers)) continue;
+    if (typeof current.session === "string" && current.session !== "") {
+      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent session started afresh: it was kept by an older radio that did not record whose words it held" });
     }
+    current.session = null;
+    current.briefed = false;
+    current.signers = [];
   }
+  // Each running turn is published, so a local --drop can wait for the ones it ends.
+  rmSync(p.turns, { recursive: true, force: true });
+  mkdirSync(p.turns, { recursive: true, mode: 0o700 });
   const running = new Map();
   const children = new Set();
   let lastActivity = Date.now();
@@ -1312,7 +1362,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     if (!work || work.stopped) return;
     const channel = loadConfig(p).channels[frequency];
     const allowed = channel && channel.agent ? allowance(channel) : { talk: false, tools: false };
-    const pinned = pinnedFingerprints(channel);
+    const pinned = provenancePins(channel);
     // A turn carrying any operator line whose key is dropped since carries that key's authority: it stops,
     // whatever else the batch holds and whichever device signed the mandate it runs under.
     const reason = !work.operatorOnly && !allowed.talk ? "its mandate ended" : work.tools && !allowed.tools ? "its mandate no longer allows tools"
@@ -1390,7 +1440,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     // A resumed conversation still holds every earlier turn's words. One that holds
     // words of a key dropped since is not resumed: a fresh session is briefed from
     // the inbox, judged against the keys pinned now.
-    const pinned = pinnedFingerprints(channel);
+    const pinned = provenancePins(channel);
     if (typeof current.session === "string" && current.session !== "" && current.signers.some((signer) => !pinned.includes(signer))) {
       current.session = null;
       current.briefed = false;
@@ -1450,10 +1500,15 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       : preset.stdinJson ? JSON.stringify({ station: channel.station, frequency, as: me, session, first: !current.briefed, prompt, messages }) + "\n"
       : "";
     log("waking " + agentLabel(agent) + " for " + frequency + " (" + messages.length + " new message" + (messages.length === 1 ? "" : "s") + "): " + commandLine(preset.binary, args, prompt));
-    // Every operator key whose words this conversation holds: earlier turns of a resumed session, history and this batch.
-    const signers = [...new Set([...current.signers, ...[...history, ...messages].filter((message) => message.operator).map((message) => message.signer)])];
+    // Every operator key whose words this conversation holds: earlier turns of a resumed session,
+    // the mandate (and its note) the prompt carries, history and this batch.
+    const signers = [...new Set([...current.signers, ...(active ? [mandateSigner(channel.mandate)] : []),
+      ...[...history, ...messages].filter((message) => message.operator).map((message) => message.signer)])];
     const work = { tools, operatorOnly, signers, kill: null, stopped: null };
     working.set(frequency, work);
+    // Published while it runs, so a local --drop can wait until the turns it ends have stopped.
+    const turnFile = join(p.turns, frequency + ".json");
+    try { writeJson(turnFile, { pid: process.pid, frequency, signers }); } catch {}
     let result;
     try {
       result = await runAgentProcess(preset.binary, args, {
@@ -1469,17 +1524,16 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       });
     } finally {
       working.delete(frequency);
+      // The session has seen these words now, whatever became of the turn.
+      current.signers = signers;
+      if (work.stopped && !stopping) appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent stopped mid-turn: " + work.stopped + "; its answer was not sent" });
+      try { unlinkSync(turnFile); } catch {}
     }
-    // The session has seen these words now, whatever became of the turn.
-    current.signers = signers;
     if (stopping) {
       log("receiver stopping: the agent's answer on " + frequency + " is not sent");
       return;
     }
-    if (work.stopped) {
-      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent stopped mid-turn: " + work.stopped + "; its answer was not sent" });
-      return;
-    }
+    if (work.stopped) return;
     let lastMessage = null;
     try { lastMessage = readFileSync(lastFile, "utf8"); } catch {}
     const read = preset.read(result.stdout, lastMessage) || {};
@@ -1525,7 +1579,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       return;
     }
     // Checked against the keys pinned now, not at the receiver's last look: one may be dropped since.
-    const pinnedNow = pinnedFingerprints(still);
+    const pinnedNow = provenancePins(still);
     if (work.signers.some((signer) => !pinnedNow.includes(signer))) {
       appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply not sent: an operator key that signed its words was dropped while it worked" });
       return;
@@ -1726,6 +1780,16 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     state.cursors.mailbox = cursor;
   };
 
+  // Revocation never waits for the station: a dropped key or ended mandate is checked
+  // against the configuration four times a second while a turn runs, whatever the
+  // network loop is waiting on.
+  const revocationTimer = setInterval(() => {
+    if (stopping) return;
+    for (const frequency of working.keys()) {
+      try { recheckWork(frequency); } catch {}
+    }
+  }, REVOCATION_CHECK_MS);
+  revocationTimer.unref();
   try {
     for (let tick = 0; tick < maxTicks && !stopping; tick += 1) {
       const config = loadConfig(p);
@@ -1798,6 +1862,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       }
     }
   } finally {
+    clearInterval(revocationTimer);
     for (const socket of sockets.values()) socket.close();
     for (const kill of children) kill("SIGTERM");
     if (running.size > 0) await Promise.race([Promise.allSettled([...running.values()]), new Promise((ok) => setTimeout(ok, 10_000))]);
@@ -2026,22 +2091,28 @@ async function tuneIn(p, station, frequency, key, flags, out) {
     since = Number.isSafeInteger(body.nextSince) ? body.nextSince : since;
     if (body.hasMore !== true) break;
   }
-  const operator = pinnedOperator(already, flags);
+  // Refuse early (before anything is sent) when the key asked for cannot be pinned; the pin itself is
+  // decided again below, under the lock, against the set as it is then.
+  pinnedOperator(already, flags);
   const baseline = already && already.key === key && already.as === name && Number.isSafeInteger(already.baseline)
     ? already.baseline
     : await sendText(channel, frequency, name, name + " is on the air");
-  updateConfig(p, (latest) => {
+  // The network waits above take time, and the operator may add or drop a device meanwhile:
+  // the pins are judged against the channel as it is now, never the snapshot taken before them.
+  const operator = updateConfig(p, (latest) => {
     if (!latest.as) latest.as = name;
     const previous = latest.channels[frequency] || {};
+    const pinned = pinnedOperator(latest.channels[frequency], flags);
     latest.channels[frequency] = {
       ...previous, station, key, as: name, via: flags.via || previous.via || "tune", tunedAt: previous.tunedAt || new Date().toISOString(), baseline,
       ...(flags.callee ? { callee: flags.callee } : {}),
-      ...(operator ? { operator } : {}),
+      ...(pinned ? { operator: pinned } : {}),
     };
-    if (operator && previous.operator && previous.operator.key !== operator.key) {
+    if (pinned && previous.operator && previous.operator.key !== pinned.key) {
       delete latest.channels[frequency].mandate;
       delete latest.channels[frequency].devices;
     }
+    return pinned;
   });
   const receiver = await ensureReceiver(p, flags);
   out("ON THE AIR: " + frequency + " at " + station + " as " + name);
@@ -2060,7 +2131,7 @@ async function tuneIn(p, station, frequency, key, flags, out) {
     out("");
     out("recent traffic (" + UNTRUSTED + ")");
     const mark = operatorMark("OPERATOR");
-    const keys = operatorKeys(already && already.operator && operator && already.operator.key === operator.key ? already : { operator });
+    const keys = operatorKeys(loadConfig(p).channels[frequency]);
     const heard = new Set();
     const lines = recent.map((message) => {
       const check = operator && message.sig ? verifySigned(message, frequency, keys.map((entry) => entry.key)) : null;
@@ -2273,19 +2344,23 @@ async function cmdGranted(p, args, flags, out) {
   if (args.length < 2) throw new RadioError("usage: granted <frequency> <request-id> [--use] [--json]");
   const [frequency, id] = args;
   if (!loadConfig(p).channels[frequency]) throw new RadioError("this radio is not tuned to " + frequency);
-  // Judged against the keys pinned now: a grant signed by a key dropped since is no grant.
-  const found = findGrant(trustedNow(p, inboxEntries(p)), frequency, id);
-  // A counted grant is spent here, once per use: a copy of it cannot be spent again.
-  const ledger = readJson(p.grants, {});
-  const key = frequency + " " + id;
-  const count = found.grant && found.grant.bounds && Number.isSafeInteger(found.grant.bounds.count) ? found.grant.bounds.count : null;
-  const used = Number.isSafeInteger(ledger[key]) ? ledger[key] : 0;
-  let status = found.status;
-  if (status === "granted" && count !== null && used >= count) status = "spent";
-  if (status === "granted" && flags.use === true) {
-    ledger[key] = used + 1;
-    writeJson(p.grants, ledger);
-  }
+  // Judged against the keys pinned now, and spent, under the lock every pin change takes:
+  // a drop finishing between the check and the spend cannot let a dropped key's grant through.
+  const { found, count, used, status } = withConfigLock(p, () => {
+    const found = findGrant(trustedNow(p, inboxEntries(p), loadConfig(p).channels), frequency, id);
+    // A counted grant is spent here, once per use: a copy of it cannot be spent again.
+    const ledger = readJson(p.grants, {});
+    const key = frequency + " " + id;
+    const count = found.grant && found.grant.bounds && Number.isSafeInteger(found.grant.bounds.count) ? found.grant.bounds.count : null;
+    const used = Number.isSafeInteger(ledger[key]) ? ledger[key] : 0;
+    let status = found.status;
+    if (status === "granted" && count !== null && used >= count) status = "spent";
+    if (status === "granted" && flags.use === true) {
+      ledger[key] = used + 1;
+      writeJson(p.grants, ledger);
+    }
+    return { found, count, used, status };
+  });
   const report = { status, request: id, frequency, until: found.grant && found.grant.bounds ? found.grant.bounds.until || null : null, count, used: status === "granted" && flags.use === true ? used + 1 : used,
     action: found.grant ? found.grant.action || null : null, target: found.grant ? found.grant.target || null : null, by: found.entry ? found.entry.from : null, seq: found.entry ? found.entry.seq : null };
   if (flags.json) out(JSON.stringify(report));
@@ -2435,8 +2510,13 @@ async function cmdTrust(p, args, flags, out) {
   out("and a mandate they sign from now on says what you may do here (one signed before this pin was heard unverified: ask them to sign it again).");
 }
 
+/** Two spellings of the same public key: the same decoded bytes. */
+function sameKey(a, b) {
+  return Buffer.from(String(a), "base64url").equals(Buffer.from(String(b), "base64url"));
+}
+
 /** Adds (--also) or removes (--drop) one device's key in the channel's set: only ever because the operator asked. */
-function trustDevice(p, frequency, channel, raw, flags, out) {
+async function trustDevice(p, frequency, channel, raw, flags, out) {
   const key = String(raw).trim();
   const keys = operatorKeys(channel);
   if (flags[OPERATOR_FLAG] !== true) {
@@ -2445,12 +2525,12 @@ function trustDevice(p, frequency, channel, raw, flags, out) {
     return 3;
   }
   if (flags.drop) {
-    if (!keys.some((entry) => entry.key === key)) throw new RadioError("that key is not pinned for " + frequency);
-    const rest = keys.filter((entry) => entry.key !== key);
-    updateConfig(p, (latest) => {
+    if (!keys.some((entry) => sameKey(entry.key, key))) throw new RadioError("that key is not pinned for " + frequency);
+    // Every spelling of the key goes, judged against the set as it is now, not as this command first read it.
+    const rest = updateConfig(p, (latest) => {
       const target = latest.channels[frequency];
-      if (!target) return;
-      const left = operatorKeys(target).filter((entry) => entry.key !== key);
+      if (!target) return [];
+      const left = operatorKeys(target).filter((entry) => !sameKey(entry.key, key));
       // A mandate the dropped device signed (or one whose signer is unknown) ends here,
       // but the channel stays governed: listen only, ordered by the same signature time,
       // until a key still pinned signs a newer one. Any other mandate stands as it is.
@@ -2464,18 +2544,36 @@ function trustDevice(p, frequency, channel, raw, flags, out) {
         target.operator = left[0];
         if (left.length > 1) target.devices = left.slice(1);
       }
+      return left;
     });
     // Readers of the raw inbox file learn it too; every listing already judges by the keys pinned now.
     appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "operator key " + keyFingerprint(key) + " dropped: lines it signed are no longer your operator's, and no grant or mandate it signed holds" });
     poke(p);
+    // The receiver stops a running turn that holds the dropped key's words within a moment; the drop
+    // returns once it has, so "dropped" means no agent is still acting on those words.
+    const deadline = Date.now() + DROP_WAIT_MS;
+    let affected = [];
+    let waited = false;
+    for (;;) {
+      const pins = provenancePins(loadConfig(p).channels[frequency]);
+      affected = runningTurns(p).filter((turn) => turn.frequency === frequency && turn.signers.some((signer) => !pins.includes(signer)));
+      if (affected.length === 0 || Date.now() >= deadline) break;
+      waited = true;
+      await new Promise((ok) => setTimeout(ok, 100));
+    }
     const after = loadConfig(p).channels[frequency];
     out("dropped the operator key " + keyFingerprint(key) + " from " + frequency + ": its messages are no longer marked OPERATOR; mandate: " + mandateLine(after)
       + (rest.length === 0 ? "; no operator key is pinned now" : ""));
+    if (affected.length > 0) {
+      out("WARNING: an agent turn holding its words has not stopped after " + Math.round(DROP_WAIT_MS / 1000) + "s; its answer will not be sent. Check with " + command(p, "status"));
+      return 4;
+    }
+    if (waited) out("the agent turn that held its words was stopped; its answer was not sent");
     return;
   }
   if (!operatorKeyValid(key)) throw new RadioError("the key must be your operator's public key: 87 base64url characters, exactly as they gave it");
   if (keys.length === 0) throw new RadioError("no operator key is pinned for " + frequency + " yet: pin the first one with " + command(p, "trust " + frequency + " <key>"));
-  if (keys.some((entry) => entry.key === key)) {
+  if (keys.some((entry) => sameKey(entry.key, key))) {
     out("the operator key " + keyFingerprint(key) + " is already pinned for " + frequency);
     return;
   }
@@ -2485,7 +2583,8 @@ function trustDevice(p, frequency, channel, raw, flags, out) {
   updateConfig(p, (latest) => {
     const target = latest.channels[frequency];
     if (!target || !target.operator) return;
-    const devices = operatorKeys(target).slice(1).filter((entry) => entry.key !== key);
+    if (operatorKeys(target).some((entry) => sameKey(entry.key, key))) return;
+    const devices = operatorKeys(target).slice(1);
     if (devices.length + 1 < MAX_OPERATOR_KEYS) target.devices = [...devices, device];
   });
   poke(p);
