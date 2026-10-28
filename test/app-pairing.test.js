@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { APP_SHEETS, generateOperatorPair, pairedChannels, pairingKey, pairingTrustCommands, renderApp } from "../worker/app.mjs";
+import { APP_SHEETS, generateOperatorPair, pairedChannels, pairingKey, pairingSendHandlers, pairingTrustCommands, renderApp } from "../worker/app.mjs";
 
 test("pairing sheets open and close with every other modal", () => {
   const elements = new Map(APP_SHEETS.map((id) => [id, { hidden: true }]));
@@ -30,17 +30,33 @@ test("a decrypted package cannot inject a trust command", () => {
 });
 
 test("the complete client transfer hides secrets and gives the receiver its own key", async () => {
-  const id = "1".repeat(32), secret = crypto.getRandomValues(new Uint8Array(32)), nonce = crypto.getRandomValues(new Uint8Array(12));
   const channel = { frequency: "fm-1234abcd", key: "a".repeat(32), label: "ops" };
-  const key = await pairingKey(secret, id);
-  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key,
-    new TextEncoder().encode(JSON.stringify({ expiresAt: Date.now() + 120_000, channels: [channel] }))));
-  const request = JSON.stringify({ ciphertext: Buffer.concat([nonce, sealed]).toString("base64url") });
-  const url = "/v1/pair/" + id;
-  assert.doesNotMatch(url + request, new RegExp(channel.key, "u"), "the KEY is absent from URL and request");
-  assert.doesNotMatch(url + request, new RegExp(Buffer.from(secret).toString("base64url"), "u"), "the fragment secret is absent too");
+  const requests = [], logs = [], shown = [];
+  let link = "", qrFailed = false, randomCall = 0;
+  const handlers = pairingSendHandlers({
+    channels: () => [channel], short: (value) => value, toast: (value) => logs.push(value),
+    showChannels: (value) => shown.push(value), reset() {}, showSheet() {}, disable() {},
+    randomBytes: (size) => new Uint8Array(size).fill(++randomCall), pairingKey,
+    b64url: (value) => Buffer.from(value).toString("base64url"),
+    post: async (url, body) => { requests.push({ url, body }); return { status: 201 }; },
+    origin: () => "https://airadio.example", showLink: (value) => { link = value; },
+    drawQr() { throw new Error("canvas unavailable"); }, qrFailed: () => { qrFailed = true; },
+    failed: (value) => logs.push(value),
+  });
+  handlers.open();
+  assert.deepEqual(shown, ["ops"], "opening shows the channels handled by the real UI handler");
+  assert.equal(requests.length, 0, "opening the confirmation sheet does not transfer anything");
+  await handlers.confirm();
+  assert.equal(requests.length, 1, "only Confirm starts the POST");
+  const { url, body: request } = requests[0];
+  const secret = new Uint8Array(32).fill(2);
+  assert.equal(url, "/v1/pair/" + "01".repeat(16));
+  assert.doesNotMatch(url + request + logs.join("\n"), new RegExp(channel.key, "u"), "the KEY is absent from URL, request, and logs");
+  assert.doesNotMatch(url + request + logs.join("\n"), new RegExp(Buffer.from(secret).toString("base64url"), "u"), "the pairing secret is absent too");
+  assert.match(link, new RegExp("#pair=" + "01".repeat(16), "u"));
+  assert.equal(qrFailed, true, "the link remains available when QR drawing fails");
   const packed = Buffer.from(JSON.parse(request).ciphertext, "base64url");
-  const opened = await crypto.subtle.decrypt({ name: "AES-GCM", iv: packed.subarray(0, 12) }, await pairingKey(secret, id), packed.subarray(12));
+  const opened = await crypto.subtle.decrypt({ name: "AES-GCM", iv: packed.subarray(0, 12) }, await pairingKey(secret, "01".repeat(16)), packed.subarray(12));
   assert.deepEqual(pairedChannels(JSON.parse(new TextDecoder().decode(opened)), []), [channel]);
 
   const receiver = await generateOperatorPair();
@@ -49,6 +65,15 @@ test("the complete client transfer hides secrets and gives the receiver its own 
   const publicKey = Buffer.from(await crypto.subtle.exportKey("raw", receiver.publicKey)).toString("base64url");
   assert.equal(pairingTrustCommands([channel], publicKey, "phone-2"),
     "node radio.mjs trust fm-1234abcd " + publicKey + " --also --operator-asked --operator-name phone-2");
+});
+
+test("an existing channel still gets a trust command but is not duplicated", () => {
+  const channel = { frequency: "fm-1234abcd", key: "a".repeat(32), label: "ops" };
+  const verified = pairedChannels({ expiresAt: Date.now() + 60_000, channels: [channel] }, [channel.frequency]);
+  assert.deepEqual(verified, [channel], "validation retains already stored channels for trust commands");
+  const newChannels = verified.filter((item) => !new Set([channel.frequency]).has(item.frequency));
+  assert.deepEqual(newChannels, [], "storage filtering remains separate");
+  assert.match(pairingTrustCommands(verified, "B".repeat(86), "phone-2"), /trust fm-1234abcd/u);
 });
 
 test("the QR's two format copies are independently readable as level L, mask 0", () => {
@@ -67,4 +92,15 @@ test("the QR's two format copies are independently readable as level L, mask 0",
     const format = positions.reduce((value, [row, col], i) => value | (dark.has(row + "," + col) ? 1 << (14 - i) : 0), 0);
     assert.equal(format, 0x77c4, "the format codeword is an exact, independently read BCH codeword");
   }
+});
+
+test("a long workers.dev pairing URL uses a larger QR", () => {
+  const html = renderApp({ nonce: "0".repeat(32) });
+  const source = /function drawQr\(canvas, text\) \{[\s\S]*?\n  \}\n  function fingerprintOf/u.exec(html)[0].replace(/\n  function fingerprintOf$/u, "");
+  const drawQr = Function("TextEncoder", "return (" + source + ")")(TextEncoder);
+  const canvas = { getContext: () => ({ fillStyle: "", fillRect() {} }) };
+  const url = "https://" + "staging-".repeat(6) + "account.workers.dev/app#pair=" + "1".repeat(32) + "." + "A".repeat(43);
+  assert.ok(new TextEncoder().encode(url).length > 134);
+  drawQr(canvas, url);
+  assert.equal(canvas.width, 57, "version 8-L is selected for the longer hostname");
 });
