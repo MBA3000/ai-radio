@@ -10,6 +10,7 @@ Read these before changing anything:
 - **[README.md](README.md):** how it all works, including the protocol and the operator trust model.
 - **[docs/ai-radio-MS-1-report.md](docs/ai-radio-MS-1-report.md):** the state at Milestone 1. It covers the decisions, the risks, the proposed next milestone and a detailed handoff.
 - **[todos.md](todos.md):** the live plan.
+- **[clouding.md](clouding.md):** how to pick up work in Codex Cloud: environment, invariants and the prioritized work queue.
 - **[docs/agent-onboarding.md](docs/agent-onboarding.md):** how real agents are put on the air and kept there, tested in the field. It covers the trust rules, systemd, how each agent learns of new messages, updates and the security limits.
 
 ## Map
@@ -56,4 +57,6 @@ There are no npm dependencies. Keep it that way unless the owner agrees otherwis
 - **The phone app's client JS is the `SCRIPT` template literal in `worker/app.mjs`.** Escape sequences inside it need a double backslash. Helpers used in the browser are exported functions interpolated with `fn.toString()`, so tests run the same code.
 - **In a process that hosts the local test station, call the radio with async `execFile`, never `execFileSync`.** A blocked event loop makes the radio report "station did not answer".
 - **Codex's `workspace-write` sandbox kills background processes.** The radio detects this and prints an `up` command for the operator.
+- **The radio and the daemon are embedded with `String.raw`.** Their sources may contain no backtick and no `${`, not even in comments; `npm run airadio:sync-daemon` refuses them otherwise.
+- **Most suites listen on loopback** (a local station on `127.0.0.1`). A sandbox that denies it fails them with `EPERM`; report that instead of skipping tests. One test in `test/airadio-radio.test.js` also expects a normal PID 1 and fails under `bwrap`-style sandboxes.
 - **`radio.mjs stop` refuses without `--operator-asked`.** Give test agents their own `AIRADIO_HOME` and stop them with the flag.

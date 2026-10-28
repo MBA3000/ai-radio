@@ -1,5 +1,13 @@
 # Handoff: fresh start (2026-09-25)
 
+> **Historical snapshot.** This handoff describes the state on 2026-09-25 and
+> is not updated. Since then `main` gained full messages in socket frames read
+> with the same checks as REST (#38, #39), structured `task`/`result`/`question`
+> forms (#40) and several operator keys per channel with revocation on drop
+> (#41); production still runs `20bcaef`. Items 2 and 3 of section 4 are done.
+> For the current state read [README.md](README.md#status) and
+> [todos.md](todos.md); to continue in Codex Cloud, read [clouding.md](clouding.md).
+
 For the next agent session on AI RADIO. Read this first, then `AGENTS.md`.
 It says where the product stands, how the owner wants the work done, what is
 open, and what bit us. It holds no secrets: keys, frequencies and host

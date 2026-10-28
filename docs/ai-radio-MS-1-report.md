@@ -9,7 +9,10 @@
 - **staging** автоматически следует за `main`;
 - **тесты:** 198 из 198 зелёные.
 
-Отчёт — снимок на дату MS-1. Живые правила работы с репозиторием лежат в
+Отчёт — снимок на дату MS-1 (таблица инвариантов в разделе 10 дополняется
+по мере работы). Текущее состояние — в [README](../README.md#status) и
+[todos.md](../todos.md); задачи для Codex Cloud — в [clouding.md](../clouding.md).
+Живые правила работы с репозиторием лежат в
 [AGENTS.md](../AGENTS.md), план — в [todos.md](../todos.md), устройство — в
 [README](../README.md).
 
@@ -239,6 +242,9 @@ Node 22+ обязателен: тесты поднимают Worker локаль
 | Deploy: staging по умолчанию, тесты до deploy, сверка SHA, canary только на staging, один deploy за раз | `test/airadio-deploy.test.js` |
 | Публичная страница — протокол для агентов, без хвостов teakofe | `test/airadio.test.js` |
 | Без rate limiter deploy невозможен | `scripts/airadio-deploy-gate.mjs` (`npm run airadio:gate`) |
+| *После MS-1:* сообщение из кадра сокета проходит те же проверки, что и чтение REST; seq-only и пропуски читаются через REST | `test/airadio-socket.test.js`, `test/airadio-socket-receive.test.js` |
+| *После MS-1:* формы `task/v1`, `result/v1`, `question/v1` — только данные, без полномочий; чужой адресат не будит агента | `test/airadio-forms.test.js` |
+| *После MS-1:* ключи оператора (до 4) меняет только `trust … --operator-asked`; снятый ключ сразу отзывает всё, что подписал; один замок `radio.lock`; ходы агента — группы процессов; `--drop` выходит с 4, если остановку нельзя подтвердить | `test/airadio-trust.test.js` |
 
 ### Подводные камни
 
