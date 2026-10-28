@@ -257,20 +257,30 @@ the air instead:
   mandate a prompt carries counts among the session's keys too.
   Pins, mandates, grant spending and the start of every agent turn share
   one lock (`radio.lock`). It names its owner (a unique id and the pid), is
-  broken only when that process is gone, never for its age, and is
+  broken only when that process is gone, never for its age (reclaimers
+  queue on `radio.lock.reclaim` and look again before removing it), and is
   released only by its owner; each command decides inside it, against the
   file as it is then, so a `tune`, `trust` or `granted --use` racing a drop
   sees the set after it. A turn starts only under that lock, after its
   keys are checked again, its session's keys are saved and the turn is put
   on record in `turns/` with its process group; without a record it does
-  not start. A turn is stopped as a whole process group (SIGTERM, then
-  SIGKILL) and leaves the record only once no process of the group lives.
+  not start. Every process of a turn carries `AIRADIO_TURN=<id>` in its
+  environment. A turn is stopped as a whole process group (SIGTERM, then
+  SIGKILL; signals go only to the group whose leader start time matches the
+  record, and a late escalation after the group is gone is dropped), and on
+  Linux any process still carrying its mark is stopped too. Its record stays
+  until the answer is sent or given up: the last check of the keys and the
+  decision to send are one step under the lock, and a drop that comes after
+  that step waits for the send (or exits 4).
   A running turn is checked four times a second, whatever the network is
   doing. `--drop` returns only once every turn holding the dropped key's
   words is confirmed stopped: it stops orphans of a crashed receiver
   itself, and exits 4 when it cannot confirm within 15 s. A receiver that
   starts stops what an earlier one left running and does not resume that
-  session. Process groups are POSIX: on Windows only the agent process
+  session; a record whose processes cannot be accounted for (no process
+  group recorded and no `/proc` to find its mark) is never removed, so
+  `--drop` keeps exiting 4 until the operator has checked and removed it
+  from `turns/` by hand. Process groups are POSIX: on Windows only the agent process
   itself is checked and signalled.
   A key has one spelling: a non-canonical base64url alias is refused, a pin
   an older radio stored in another spelling is read by its bytes, and a

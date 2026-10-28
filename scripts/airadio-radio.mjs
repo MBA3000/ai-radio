@@ -247,18 +247,58 @@ function lockHolder(p) {
   return "legacy";
 }
 
-/** Removes the lock only if it is still the one named by id (moved aside first, so a fresh lock is never lost). */
-function breakLock(p, id) {
-  const aside = p.lock + ".broken-" + randomUUID();
-  try { renameSync(p.lock, aside); } catch { return; }
-  let moved = null;
-  try { moved = JSON.parse(readFileSync(aside, "utf8")); } catch {}
-  const wanted = id === null ? moved === null || typeof moved !== "object" || typeof moved.id !== "string" : moved && moved.id === id;
-  if (!wanted) {
-    // Someone took the lock between our look and the move: give it back.
-    try { linkSync(aside, p.lock); } catch {}
+/**
+ * Takes the dead holder's lock away, one reclaimer at a time. Reclaimers queue
+ * on a second, owner-named mutex (radio.lock.reclaim) and look at the lock again
+ * inside it: only a lock still held by the same dead process (or an older radio's
+ * lock still old) is removed. A live holder's lock cannot vanish under them, and
+ * a new lock cannot be taken while the old one exists, so nothing is moved aside
+ * and nothing is ever put back. The mutex itself is reclaimed only when its own
+ * holder is gone, with the same look-again under a rename (it is held for
+ * microseconds, so two reclaimers of a dead reclaimer are the one case left).
+ */
+function reclaimLock(p, seen) {
+  const mutex = p.lock + ".reclaim";
+  const id = randomUUID();
+  const temporary = mutex + ".new-" + id;
+  try { writeFileSync(temporary, JSON.stringify({ id, pid: process.pid }), { mode: 0o600 }); } catch { return; }
+  try {
+    try {
+      linkSync(temporary, mutex);
+    } catch (error) {
+      if (error.code !== "EEXIST") return;
+      let holder = null;
+      try { holder = JSON.parse(readFileSync(mutex, "utf8")); } catch {}
+      if (holder && Number.isSafeInteger(holder.pid) && pidExists(holder.pid)) return;
+      const aside = mutex + ".dead-" + id;
+      try { renameSync(mutex, aside); } catch { return; }
+      let moved = null;
+      try { moved = JSON.parse(readFileSync(aside, "utf8")); } catch {}
+      // Taken by a live reclaimer between the look and the move: give it back.
+      if (moved && Number.isSafeInteger(moved.pid) && pidExists(moved.pid)) { try { linkSync(aside, mutex); } catch {} }
+      try { unlinkSync(aside); } catch {}
+      // The next attempt queues on the mutex afresh.
+      return;
+    }
+    try {
+      const pause = Number(process.env.AIRADIO_TEST_RECLAIM_PAUSE_MS);
+      if (pause > 0) sleepSync(pause);
+      const now = lockHolder(p);
+      if (seen === "legacy") {
+        if (now === "legacy" && Date.now() - statSync(p.lock).mtimeMs > 10_000) unlinkSync(p.lock);
+      } else if (now && now !== "legacy" && now.id === seen.id && !pidExists(now.pid)) {
+        unlinkSync(p.lock);
+      }
+    } catch {
+    } finally {
+      try {
+        const holder = JSON.parse(readFileSync(mutex, "utf8"));
+        if (holder && holder.id === id) unlinkSync(mutex);
+      } catch {}
+    }
+  } finally {
+    try { unlinkSync(temporary); } catch {}
   }
-  try { unlinkSync(aside); } catch {}
 }
 
 /**
@@ -269,7 +309,7 @@ function breakLock(p, id) {
  * its age, and a holder releases only its own lock. An older radio's empty lock is
  * still broken after 10 s, as that radio did.
  */
-function withConfigLock(p, fn) {
+export function withConfigLock(p, fn) {
   ensureHome(p);
   const id = randomUUID();
   const temporary = p.lock + ".new-" + id;
@@ -285,9 +325,9 @@ function withConfigLock(p, fn) {
         if (error.code !== "EEXIST") throw error;
         const holder = lockHolder(p);
         if (holder === "legacy") {
-          try { if (Date.now() - statSync(p.lock).mtimeMs > 10_000) breakLock(p, null); } catch {}
+          try { if (Date.now() - statSync(p.lock).mtimeMs > 10_000) reclaimLock(p, "legacy"); } catch {}
         } else if (holder && !pidExists(holder.pid)) {
-          breakLock(p, holder.id);
+          reclaimLock(p, holder);
         }
         if (Date.now() > deadline) {
           throw new RadioError("the radio configuration is locked by another command" + (holder && holder !== "legacy" ? " (pid " + holder.pid + ")" : "") + "; try again");
@@ -894,11 +934,31 @@ export function runAgentProcess(binary, args, { cwd, input = "", timeoutMs = AGE
     let stderr = "";
     let timedOut = false;
     let settled = false;
-    const kill = (signal) => { try { process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch {} } };
+    // The group is signalled only while it is still the one started here: once the agent has
+    // exited and no process of its group is left, a late escalation is dropped (its pid may be reused).
+    const start = processStart(child.pid);
+    let gone = false;
+    const escalations = new Set();
+    const isGone = () => {
+      if (!gone && child.exitCode === null && child.signalCode === null) return false;
+      if (!gone && !sameGroup(child.pid, start)) gone = true;
+      if (gone) for (const timer of escalations) clearTimeout(timer);
+      return gone;
+    };
+    const kill = (signal) => {
+      if (isGone()) return;
+      try { process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch {} }
+    };
+    kill.later = (signal, ms) => {
+      const timer = setTimeout(() => { escalations.delete(timer); kill(signal); }, ms);
+      timer.unref();
+      escalations.add(timer);
+    };
+    kill.gone = isGone;
     const timer = setTimeout(() => {
       timedOut = true;
       kill("SIGTERM");
-      setTimeout(() => kill("SIGKILL"), 5_000).unref();
+      kill.later("SIGKILL", 5_000);
     }, timeoutMs);
     if (onSpawn) onSpawn(child, kill);
     child.stdout.setEncoding("utf8");
@@ -909,6 +969,7 @@ export function runAgentProcess(binary, args, { cwd, input = "", timeoutMs = AGE
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      isGone();
       done({ code, stdout, stderr, timedOut });
     };
     child.on("error", (error) => { stderr += String(error && error.message); finish(-1); });
@@ -1189,33 +1250,91 @@ export function groupAlive(pgid) {
   }
 }
 
-function signalGroup(pgid, signal) {
-  if (!Number.isSafeInteger(pgid) || pgid <= 0) return;
+/**
+ * Whether pgid still names the group we started. Its leader, while it exists,
+ * must have started when we recorded (Linux /proc); a pid can be reused only
+ * after every process of its group is gone, and a reused one shows another
+ * start time. Without /proc (or a recorded start) the group's liveness decides.
+ */
+function sameGroup(pgid, start) {
+  if (!Number.isSafeInteger(pgid) || pgid <= 0) return false;
+  if (start) {
+    const now = processStart(pgid);
+    if (now !== null && now !== start) return false;
+  }
+  return groupAlive(pgid);
+}
+
+/** Signals a group only while it is still ours. */
+function signalGroup(pgid, signal, start = null) {
+  if (!sameGroup(pgid, start)) return;
   try { process.kill(process.platform === "win32" ? pgid : -pgid, signal); } catch {}
 }
 
-/** A turn's process group: alive (true), gone (false), or not recorded yet (null). */
-function turnGroupAlive(turn) {
-  if (!Number.isSafeInteger(turn.pgid)) return null;
-  // The leader still exists under that pid but started at another time: the pid was reused, ours is gone.
-  if (turn.start) {
-    const now = processStart(turn.pgid);
-    if (now !== null && now !== turn.start) return false;
+/**
+ * The processes that carry a turn's AIRADIO_TURN, by /proc/<pid>/environ (Linux):
+ * an array of pids, or null when this system cannot tell (no /proc).
+ */
+function turnProcesses(id) {
+  if (typeof id !== "string" || id === "") return null;
+  let pids;
+  try { pids = readdirSync("/proc").filter((name) => /^\d+$/.test(name)); } catch { return null; }
+  const wanted = "AIRADIO_TURN=" + id;
+  const found = [];
+  for (const pid of pids) {
+    let environ;
+    try { environ = readFileSync("/proc/" + pid + "/environ", "latin1"); } catch { continue; }
+    if (environ.split("\u0000").includes(wanted)) found.push(Number(pid));
   }
-  return groupAlive(turn.pgid);
+  return found;
+}
+
+/** Stops every process carrying the turn's mark; true once none is left, null when this system cannot tell. */
+async function stopTurnProcesses(id, { graceMs = 500, waitMs = 3_000 } = {}) {
+  let left = turnProcesses(id);
+  if (left === null) return null;
+  if (left.length === 0) return true;
+  for (const pid of left) { try { process.kill(pid, "SIGTERM"); } catch {} }
+  const term = Date.now() + graceMs;
+  while ((left = turnProcesses(id) || []).length > 0 && Date.now() < term) await new Promise((ok) => setTimeout(ok, 50));
+  for (const pid of left) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  const kill = Date.now() + waitMs;
+  while ((left = turnProcesses(id) || []).length > 0 && Date.now() < kill) await new Promise((ok) => setTimeout(ok, 50));
+  return left.length === 0;
+}
+
+/**
+ * A turn's processes: alive (true), gone (false), or unknown (null). A record
+ * with a process group asks that group (and the turn's marked processes); one
+ * without asks /proc for processes carrying its AIRADIO_TURN, and is unknown
+ * where /proc cannot tell.
+ */
+function turnGroupAlive(turn) {
+  const marked = turnProcesses(turn.id);
+  if (marked !== null && marked.length > 0) return true;
+  if (!Number.isSafeInteger(turn.pgid)) return marked === null ? null : false;
+  return sameGroup(turn.pgid, turn.start);
 }
 
 /** Stops a whole process group: SIGTERM, a short wait, then SIGKILL; true once no process of it lives. */
-async function stopGroup(pgid, { graceMs = 500, waitMs = 3_000 } = {}) {
-  if (!groupAlive(pgid)) return true;
-  signalGroup(pgid, "SIGTERM");
+async function stopGroup(pgid, { graceMs = 500, waitMs = 3_000, start = null } = {}) {
+  if (!sameGroup(pgid, start)) return true;
+  signalGroup(pgid, "SIGTERM", start);
   const term = Date.now() + graceMs;
-  while (groupAlive(pgid) && Date.now() < term) await new Promise((ok) => setTimeout(ok, 50));
-  if (!groupAlive(pgid)) return true;
-  signalGroup(pgid, "SIGKILL");
+  while (sameGroup(pgid, start) && Date.now() < term) await new Promise((ok) => setTimeout(ok, 50));
+  if (!sameGroup(pgid, start)) return true;
+  signalGroup(pgid, "SIGKILL", start);
   const kill = Date.now() + waitMs;
-  while (groupAlive(pgid) && Date.now() < kill) await new Promise((ok) => setTimeout(ok, 50));
-  return !groupAlive(pgid);
+  while (sameGroup(pgid, start) && Date.now() < kill) await new Promise((ok) => setTimeout(ok, 50));
+  return !sameGroup(pgid, start);
+}
+
+/** Stops a turn on record: its process group, then any process still carrying its mark. True, false, or null (cannot tell). */
+async function stopTurn(turn) {
+  if (Number.isSafeInteger(turn.pgid) && !(await stopGroup(turn.pgid, { start: turn.start }))) return false;
+  const marked = await stopTurnProcesses(turn.id);
+  if (marked === null) return Number.isSafeInteger(turn.pgid) ? true : null;
+  return marked;
 }
 
 /** { ok: true } when the message carries a valid, fresh signature by this operator key (or one of these keys). */
@@ -1403,9 +1522,12 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
   mkdirSync(p.turns, { recursive: true, mode: 0o700 });
   for (const turn of turnRecords(p)) {
     if (turn.receiver === process.pid) continue;
-    const alive = turnGroupAlive(turn);
-    if (alive === true && !(await stopGroup(turn.pgid))) {
-      log(turn.frequency + ": an agent turn left by an earlier receiver (process group " + turn.pgid + ") could not be stopped; it stays on record");
+    // Removed only once its processes are proven gone; one this system cannot account for stays on
+    // record, so a --drop keeps saying it cannot confirm the turn stopped (exit 4).
+    const stopped = await stopTurn(turn);
+    if (stopped !== true) {
+      log(turn.frequency + ": an agent turn left by an earlier receiver " + (stopped === null ? "cannot be accounted for" : "could not be stopped") + "; it stays on record");
+      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency: turn.frequency, text: "an agent turn left by an earlier receiver " + (stopped === null ? "cannot be accounted for on this system" : "could not be stopped") + "; it stays on record (" + turn.file + ")" });
       continue;
     }
     try { unlinkSync(turn.file); } catch {}
@@ -1525,7 +1647,8 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     work.stopped = reason;
     if (work.kill) {
       work.kill("SIGTERM");
-      setTimeout(() => work.kill("SIGKILL"), 2_000).unref();
+      if (work.kill.later) work.kill.later("SIGKILL", 2_000);
+      else setTimeout(() => work.kill("SIGKILL"), 2_000).unref();
     }
     log(frequency + ": stopping the agent mid-turn: " + reason);
   };
@@ -1658,7 +1781,7 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     // the mandate (and its note) the prompt carries, history and this batch.
     const signers = [...new Set([...current.signers, ...(active ? [mandateSigner(channel.mandate)] : []),
       ...[...history, ...messages].filter((message) => message.operator).map((message) => message.signer)])];
-    const work = { tools, operatorOnly, signers, kill: null, stopped: null, pgid: null };
+    const work = { tools, operatorOnly, signers, kill: null, stopped: null, pgid: null, start: null };
     // The turn starts only under the configuration lock, judged there against the pins and the
     // mandate as they are then: a drop either comes first (and this turn never starts) or finds
     // it on record. The session's provenance is saved before the prompt reaches the agent, so a
@@ -1693,18 +1816,22 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     }
     working.set(frequency, work);
     let result;
+    let keepRecord = false;
     try {
       result = await runAgentProcess(preset.binary, args, {
         cwd,
         input,
-        env: agentEnvironment(process.env, { ...(preset.env ? preset.env(tools) : {}), AIRADIO_FREQUENCY: frequency, AIRADIO_AS: me, AIRADIO_STATION: channel.station }),
+        // AIRADIO_TURN names the turn in every process it starts, so one that outlives its record's
+        // process group (or was spawned just before a crash) can still be found and stopped.
+        env: agentEnvironment(process.env, { ...(preset.env ? preset.env(tools) : {}), AIRADIO_FREQUENCY: frequency, AIRADIO_AS: me, AIRADIO_STATION: channel.station, AIRADIO_TURN: turnId }),
         onSpawn: (child, kill) => {
           children.add(kill);
           work.kill = kill;
           // The agent leads its own process group (detached): the record names it at once.
           work.pgid = child.pid;
+          work.start = processStart(child.pid);
           try {
-            writeJson(turnFile, { ...turn, pgid: child.pid, start: processStart(child.pid) });
+            writeJson(turnFile, { ...turn, pgid: child.pid, start: work.start });
           } catch {
             work.stopped = "its running turn could not be put on record";
           }
@@ -1717,75 +1844,91 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
       if (work.stopped && !stopping) appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent stopped mid-turn: " + work.stopped + "; its answer was not sent" });
       // A turn is over when its whole process group is: a child that outlives the agent
       // (or ignores SIGTERM) is stopped too, and the record goes only once none is left.
-      if (work.pgid === null || await stopGroup(work.pgid, { graceMs: 0 })) {
-        try { unlinkSync(turnFile); } catch {}
+      // The record stays until the answer is sent or given up: a drop waits for it either way.
+      if (work.pgid === null || (await stopTurn({ id: turnId, pgid: work.pgid, start: work.start })) !== false) {
+        try { writeJson(turnFile, { ...turn, pgid: work.pgid, start: work.start, state: "finished" }); } catch {}
       } else {
+        keepRecord = true;
         log(frequency + ": the agent's process group " + work.pgid + " outlived SIGKILL; its turn stays on record");
       }
     }
-    if (stopping) {
-      log("receiver stopping: the agent's answer on " + frequency + " is not sent");
-      return;
-    }
-    if (work.stopped) return;
-    let lastMessage = null;
-    try { lastMessage = readFileSync(lastFile, "utf8"); } catch {}
-    const read = preset.read(result.stdout, lastMessage) || {};
-    if (typeof read.session === "string" && read.session !== "") current.session = read.session;
-    const failed = result.timedOut || Boolean(read.error) || result.code !== 0;
-    if (failed) {
-      const tail = redact(String(result.stderr || "")).trim().split("\n").pop() || "";
-      current.lastError = (result.timedOut ? "timed out after " + AGENT_TIMEOUT_MS / 1000 + "s" : read.error || "exit " + result.code + (tail ? ": " + tail : "")).slice(0, 300);
-      current.failures = (current.failures || 0) + 1;
-      if (current.failures < 2) current.pending = messages.concat(current.pending).slice(-AGENT_MAX_BATCH);
-      // Only a session the CLI says it does not know is started afresh; a
-      // failure of ours (a spawn error, a timeout) must not cost the conversation.
-      if (resume && /no (conversation|session)|(conversation|session|thread)[^.]{0,40}not found|unknown (session|thread|conversation)/i.test(current.lastError)) {
-        current.session = null;
-        current.briefed = false;
-        current.signers = [];
-      }
-      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent " + agentLabel(agent) + " failed: " + current.lastError });
-      log("agent for " + frequency + " failed: " + current.lastError);
-      return;
-    }
-    current.failures = 0;
-    current.lastError = null;
-    current.briefed = true;
-    const latest = loadConfig(p);
-    const secrets = [...Object.values(latest.channels).map((other) => other.key), latest.mailbox ? latest.mailbox.key : null];
-    const reply = cleanReply(read.reply, secrets);
-    if (reply === null) {
-      appendInbox(p, { at: new Date().toISOString(), kind: "agent", frequency, from: me, text: "(" + NO_REPLY + ")" });
-      return;
-    }
-    if (leaksSecret(reply, secrets)) {
-      current.lastError = "reply withheld: it contained a key this radio holds";
-      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply withheld: it contained a key this radio holds" });
-      log("agent reply on " + frequency + " withheld: it contained a key");
-      return;
-    }
-    const still = latest.channels[frequency];
-    if (!still || !still.agent || still.agent.epoch !== agent.epoch) return;
-    // The operator's word may have changed while the agent worked.
-    if (!operatorOnly && !allowance(still).talk) {
-      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply not sent: its mandate ended while it worked" });
-      return;
-    }
-    // Checked against the keys pinned now, not at the receiver's last look: one may be dropped since.
-    const pinnedNow = provenancePins(still);
-    if (work.signers.some((signer) => !pinnedNow.includes(signer))) {
-      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply not sent: an operator key that signed its words was dropped while it worked" });
-      return;
-    }
     try {
-      await sendText(channel, frequency, me, reply);
-      current.lastReplyAt = new Date().toISOString();
-      appendInbox(p, { at: current.lastReplyAt, kind: "agent", frequency, from: me, text: reply });
-      lastActivity = Date.now();
-    } catch (error) {
-      current.lastError = error.message;
-      appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply not sent: " + error.message });
+      if (stopping) {
+        log("receiver stopping: the agent's answer on " + frequency + " is not sent");
+        return;
+      }
+      if (work.stopped) return;
+      let lastMessage = null;
+      try { lastMessage = readFileSync(lastFile, "utf8"); } catch {}
+      const read = preset.read(result.stdout, lastMessage) || {};
+      if (typeof read.session === "string" && read.session !== "") current.session = read.session;
+      const failed = result.timedOut || Boolean(read.error) || result.code !== 0;
+      if (failed) {
+        const tail = redact(String(result.stderr || "")).trim().split("\n").pop() || "";
+        current.lastError = (result.timedOut ? "timed out after " + AGENT_TIMEOUT_MS / 1000 + "s" : read.error || "exit " + result.code + (tail ? ": " + tail : "")).slice(0, 300);
+        current.failures = (current.failures || 0) + 1;
+        if (current.failures < 2) current.pending = messages.concat(current.pending).slice(-AGENT_MAX_BATCH);
+        // Only a session the CLI says it does not know is started afresh; a
+        // failure of ours (a spawn error, a timeout) must not cost the conversation.
+        if (resume && /no (conversation|session)|(conversation|session|thread)[^.]{0,40}not found|unknown (session|thread|conversation)/i.test(current.lastError)) {
+          current.session = null;
+          current.briefed = false;
+          current.signers = [];
+        }
+        appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent " + agentLabel(agent) + " failed: " + current.lastError });
+        log("agent for " + frequency + " failed: " + current.lastError);
+        return;
+      }
+      current.failures = 0;
+      current.lastError = null;
+      current.briefed = true;
+      const latest = loadConfig(p);
+      const secrets = [...Object.values(latest.channels).map((other) => other.key), latest.mailbox ? latest.mailbox.key : null];
+      const reply = cleanReply(read.reply, secrets);
+      if (reply === null) {
+        appendInbox(p, { at: new Date().toISOString(), kind: "agent", frequency, from: me, text: "(" + NO_REPLY + ")" });
+        return;
+      }
+      if (leaksSecret(reply, secrets)) {
+        current.lastError = "reply withheld: it contained a key this radio holds";
+        appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply withheld: it contained a key this radio holds" });
+        log("agent reply on " + frequency + " withheld: it contained a key");
+        return;
+      }
+      // The operator's word may have changed while the agent worked. The last check and the
+      // decision to send are one step under the lock: a drop either comes first (no answer goes
+      // out) or finds this turn "sending" on record and waits for it. The network wait is outside.
+      let withheld;
+      try {
+        withheld = withConfigLock(p, () => {
+          const still = loadConfig(p).channels[frequency];
+          if (!still || !still.agent || still.agent.epoch !== agent.epoch) return "";
+          if (!operatorOnly && !allowance(still).talk) return "its mandate ended while it worked";
+          const pinnedNow = provenancePins(still);
+          if (work.signers.some((signer) => !pinnedNow.includes(signer))) return "an operator key that signed its words was dropped while it worked";
+          writeJson(turnFile, { ...turn, pgid: work.pgid, start: work.start, state: "sending" });
+          return null;
+        });
+      } catch (error) {
+        withheld = "it could not be put on record (" + String(error && error.message) + ")";
+      }
+      if (withheld !== null) {
+        if (withheld) appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply not sent: " + withheld });
+        return;
+      }
+      try {
+        await sendText(channel, frequency, me, reply);
+        current.lastReplyAt = new Date().toISOString();
+        appendInbox(p, { at: current.lastReplyAt, kind: "agent", frequency, from: me, text: reply });
+        lastActivity = Date.now();
+      } catch (error) {
+        current.lastError = error.message;
+        appendInbox(p, { at: new Date().toISOString(), kind: "radio", frequency, text: "agent reply not sent: " + error.message });
+      }
+    } finally {
+      if (!keepRecord) {
+        try { unlinkSync(turnFile); } catch {}
+      }
     }
   };
 
@@ -2800,42 +2943,35 @@ async function trustDevice(p, frequency, channel, raw, flags, out) {
 async function stopRevokedTurns(p, frequency) {
   const deadline = Date.now() + DROP_WAIT_MS;
   const graceUntil = Date.now() + 1_000;
-  const signalled = new Map();
-  let stopped = 0;
   const seen = new Set();
+  const stopping = new Map();
   for (;;) {
     const pins = provenancePins(loadConfig(p).channels[frequency]);
     const open = [];
     for (const turn of turnRecords(p)) {
       if (turn.frequency !== frequency || turn.signers.every((signer) => pins.includes(signer))) continue;
       seen.add(turn.id);
-      const alive = turnGroupAlive(turn);
-      const receiverUp = processAlive(turn.receiver);
-      if (alive === false) {
-        // Its processes are gone; wait a moment for a live receiver to finish the record (and its note).
-        if (receiverUp && Date.now() < graceUntil + 2_000) open.push(turn);
+      if (processAlive(turn.receiver)) {
+        // A live receiver finishes its own record: it stops the turn (its timer sees the drop), or is
+        // sending an answer it decided on before the drop, or gives the answer up. Until the record
+        // is gone the turn counts as running; a group still alive after a moment is stopped from here.
+        open.push(turn);
+        if (Date.now() >= graceUntil && turnGroupAlive(turn) === true && !stopping.has(turn.id)) stopping.set(turn.id, stopTurn(turn));
         continue;
       }
-      if (alive === null) {
-        // Registered, no process group recorded yet: the receiver is starting it (or crashed before it could).
-        open.push(turn);
+      // Its receiver is gone (crashed): nothing will finish this record but us.
+      if (!stopping.has(turn.id)) stopping.set(turn.id, stopTurn(turn));
+      const outcome = await Promise.race([stopping.get(turn.id), new Promise((ok) => setTimeout(() => ok("pending"), 50))]);
+      if (outcome === true) {
+        try { unlinkSync(turn.file); } catch {}
         continue;
       }
       open.push(turn);
-      if (receiverUp && Date.now() < graceUntil) continue;
-      const first = signalled.get(turn.id);
-      if (!first) {
-        signalGroup(turn.pgid, "SIGTERM");
-        signalled.set(turn.id, Date.now());
-      } else if (Date.now() - first >= 500) {
-        signalGroup(turn.pgid, "SIGKILL");
-      }
+      // Cannot be stopped, or cannot be accounted for: it stays open until the deadline says so.
+      if (outcome === false || outcome === null) stopping.set(turn.id, Promise.resolve(outcome));
     }
     if (open.length === 0) return { stopped: seen.size, unconfirmed: 0 };
-    if (Date.now() >= deadline) {
-      const unconfirmed = open.filter((turn) => turnGroupAlive(turn) !== false).length;
-      return { stopped: seen.size - unconfirmed, unconfirmed };
-    }
+    if (Date.now() >= deadline) return { stopped: seen.size - open.length, unconfirmed: open.length };
     await new Promise((ok) => setTimeout(ok, 100));
   }
 }

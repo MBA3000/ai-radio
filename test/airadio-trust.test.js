@@ -13,7 +13,7 @@
  */
 
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1250,4 +1250,128 @@ test("pins an older radio stored in another spelling are read by their bytes", (
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("the last check before an answer goes out and the decision to send are one step under the lock", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio, calls } = sandbox(t, (home) => ({ FAKE_AGENT_LOCK_FILE: join(home, "radio.lock"), FAKE_AGENT_LOCK_PID: String(process.pid) }));
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const file = join(home, "radio.json");
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  const text = "hold the lock and answer";
+  await channel.post({ from: "Medet", text, sig: await laptop.sign({ frequency: channel.frequency, from: "Medet", text }) });
+  assert.ok(await eventually(() => calls().length === 1));
+  // The agent has answered, and a drop holds the lock: it removes the laptop, then lets go.
+  assert.ok(await eventually(() => existsSync(join(home, "radio.lock"))));
+  await sleep(500);
+  const written = JSON.parse(readFileSync(file, "utf8"));
+  delete written.channels[channel.frequency].devices;
+  writeFileSync(file, JSON.stringify(written));
+  rmSync(join(home, "radio.lock"), { force: true });
+  const inbox = () => { try { return readFileSync(join(home, "inbox.jsonl"), "utf8"); } catch { return ""; } };
+  assert.ok(await eventually(() => /agent reply not sent: an operator key that signed its words was dropped while it worked/u.test(inbox())));
+  assert.ok(!(await channel.saidBy("Solnze")).includes("answered while the drop held the lock"), "the answer never reached the air");
+});
+
+test("an answer already being sent keeps its turn on record: --drop does not report it stopped", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const proxy = await holdingProxy(t, station.url);
+  let release;
+  const held = new Promise((ok) => { release = ok; });
+  t.after(() => release());
+  const { radio, calls } = sandbox(t, () => ({ AIRADIO_SOCKETS: "0", AIRADIO_DROP_WAIT_MS: "2000" }));
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  assert.equal((await radio("tune", proxy.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  // The station holds the agent's answer in flight.
+  proxy.rules.push({ match: (req) => req.method === "POST" && /\/send$/u.test(req.url), until: () => held });
+  const text = "hello from the laptop";
+  await channel.post({ from: "Medet", text, sig: await laptop.sign({ frequency: channel.frequency, from: "Medet", text }) });
+  assert.ok(await eventually(() => calls().length === 1));
+  assert.ok(await eventually(() => proxy.held.some((url) => /\/send$/u.test(url))), "the answer is on its way");
+  const dropped = await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked");
+  assert.equal(dropped.code, 4, dropped.stdout);
+  assert.match(dropped.stdout, /could not be confirmed stopped/u);
+});
+
+test("an earlier receiver's turn with no process group on record is found by its mark, never just forgotten", { timeout: 90_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio } = sandbox(t);
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const acted = join(mkdtempSync(join(tmpdir(), "airadio-acted-")), "acted");
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  assert.equal((await radio("agent", channel.frequency, "--run", "claude", "--on-mandate")).code, 0);
+  assert.equal((await radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked")).code, 0);
+  assert.equal((await radio("stop", "--operator-asked")).code, 0);
+  // A receiver died right after spawning an agent for the laptop's words, before it could record the group.
+  const id = "orphan-" + Date.now();
+  const dead = await new Promise((ok) => { const child = execFile(process.execPath, ["-e", ""], () => ok(child.pid)); });
+  mkdirSync(join(home, "turns"), { recursive: true });
+  writeFileSync(join(home, "turns", channel.frequency + "-" + id + ".json"), JSON.stringify({ id, receiver: dead, frequency: channel.frequency, signers: [keyFingerprint(laptop.key)], pgid: null, start: null }));
+  const orphan = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => require('fs').writeFileSync(" + JSON.stringify(acted) + ", 'acted'), 6000);"],
+    { detached: true, stdio: "ignore", env: { ...process.env, AIRADIO_TURN: id } });
+  orphan.unref();
+  t.after(() => { try { process.kill(orphan.pid, "SIGKILL"); } catch {} });
+  assert.equal((await radio("up")).code, 0);
+  await sleep(1_500);
+  const dropped = await radio("trust", channel.frequency, laptop.key, "--drop", "--operator-asked");
+  assert.ok(dropped.code === 0 || dropped.code === 4, dropped.stdout);
+  await sleep(6_000);
+  assert.equal(existsSync(acted), false, "the orphan never acted: it was stopped, not forgotten");
+});
+
+test("two reclaimers of a dead holder's lock never resurrect a released lock", { timeout: 60_000 }, async (t) => {
+  const station = await startAiradioLocalStation();
+  t.after(() => station.close());
+  const { home, radio } = sandbox(t, () => ({ AIRADIO_TEST_RECLAIM_PAUSE_MS: "1000" }));
+  const channel = await openChannel(station);
+  const phone = await operator();
+  const laptop = await operator();
+  const tablet = await operator();
+  assert.equal((await radio("tune", station.url, channel.frequency, channel.wave, "--as", "Solnze", "--operator", phone.key)).code, 0);
+  const dead = await new Promise((ok) => { const child = execFile(process.execPath, ["-e", ""], () => ok(child.pid)); });
+  const lock = join(home, "radio.lock");
+  writeFileSync(lock, JSON.stringify({ id: "dead", pid: dead }));
+  // B (a command) and A (this test, in process) both find the dead holder's lock.
+  const b = radio("trust", channel.frequency, laptop.key, "--also", "--operator-asked");
+  await sleep(300);
+  radioModule.withConfigLock(radioPaths(home), () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_200));
+  const got = await b;
+  assert.equal(got.code, 0, got.stderr);
+  assert.equal(existsSync(lock), false, "no lock is left behind");
+  assert.equal((await radio("trust", channel.frequency, tablet.key, "--also", "--operator-asked")).code, 0, "and the next command is not blocked");
+});
+
+test("a late escalation never signals a group that is gone", async () => {
+  const sent = [];
+  const real = process.kill;
+  let kill;
+  let pid;
+  const result = await radioModule.runAgentProcess(process.execPath, ["-e", "process.on('SIGTERM', () => process.exit(0)); setTimeout(() => {}, 10000);"], {
+    timeoutMs: 200, onSpawn: (child, k) => { kill = k; pid = child.pid; } });
+  assert.equal(result.timedOut, true);
+  process.kill = (target, signal) => {
+    if (signal !== 0 && signal !== undefined && Math.abs(target) === pid) sent.push([target, signal]);
+    return real.call(process, target, signal);
+  };
+  try {
+    kill("SIGKILL");
+    // The timeout's own SIGKILL escalation was due 5 s after its SIGTERM.
+    await sleep(5_500);
+  } finally {
+    process.kill = real;
+  }
+  assert.deepEqual(sent, [], "no signal after the group is confirmed gone");
 });

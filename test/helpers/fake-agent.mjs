@@ -103,6 +103,10 @@ if (/fail/i.test(newest)) {
   writeFileSync(process.env.FAKE_AGENT_RADIO_JSON + ".tmp-fake", JSON.stringify(config));
   renameSync(process.env.FAKE_AGENT_RADIO_JSON + ".tmp-fake", process.env.FAKE_AGENT_RADIO_JSON);
   reply = "answered after the drop";
+} else if (/hold the lock and answer/i.test(newest) && process.env.FAKE_AGENT_LOCK_FILE) {
+  // Ends its turn while a drop holds the configuration lock (the test's own pid owns it).
+  writeFileSync(process.env.FAKE_AGENT_LOCK_FILE, JSON.stringify({ id: "drop-in-progress", pid: Number(process.env.FAKE_AGENT_LOCK_PID) }));
+  reply = "answered while the drop held the lock";
 } else if (/leak/i.test(newest)) {
   reply = "here it is: " + "c".repeat(128);
 } else {
