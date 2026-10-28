@@ -117,6 +117,7 @@ body { overscroll-behavior-y: none; }
 button, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 .app { display: flex; flex-direction: column; min-height: 100%; max-width: 720px; margin: 0 auto; }
+.qr { display: block; width: min(82vw, 328px); height: min(82vw, 328px); margin: 16px auto; background: white; border: 12px solid white; image-rendering: pixelated; }
 .top { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px; padding: calc(var(--top) + 10px) 16px 10px;
   background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-bottom: 1px solid var(--line); }
 .top h1 { font-size: 17px; margin: 0; font-weight: 750; letter-spacing: .02em; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -398,6 +399,62 @@ const SCRIPT = `
     var text = "";
     new Uint8Array(bytes).forEach(function (byte) { text += String.fromCharCode(byte); });
     return btoa(text).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+  }
+  function unb64url(text) {
+    var padded = text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4);
+    var raw = atob(padded); var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i += 1) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function randomBytes(size) { var out = new Uint8Array(size); crypto.getRandomValues(out); return out; }
+  function pairingKey(secret, id) {
+    return crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveKey"]).then(function (base) {
+      return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode(id), info: new TextEncoder().encode("airadio pairing v1") }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    });
+  }
+
+  // Dependency-free QR Model 2, fixed at version 6-L. Pairing URLs fit in its
+  // 134-byte payload; the much larger encrypted channel list stays at the relay.
+  function drawQr(canvas, text) {
+    var size = 41, dataWords = 136, eccWords = 18, blocks = 2;
+    var bytes = Array.from(new TextEncoder().encode(text));
+    if (bytes.length > 134) throw new Error("pairing URL is too long");
+    var bits = [0,1,0,0];
+    for (var n = 7; n >= 0; n -= 1) bits.push((bytes.length >>> n) & 1);
+    bytes.forEach(function (byte) { for (var n = 7; n >= 0; n -= 1) bits.push((byte >>> n) & 1); });
+    for (var z = 0; z < 4 && bits.length < dataWords * 8; z += 1) bits.push(0);
+    while (bits.length % 8) bits.push(0);
+    var words = [];
+    for (var at = 0; at < bits.length; at += 8) words.push(bits.slice(at, at + 8).reduce(function (v, bit) { return v * 2 + bit; }, 0));
+    for (var pad = 0; words.length < dataWords; pad += 1) words.push(pad % 2 ? 0x11 : 0xec);
+    function mul(x, y) { var out = 0; while (y) { if (y & 1) out ^= x; y >>>= 1; x <<= 1; if (x & 0x100) x ^= 0x11d; } return out; }
+    function remainder(input) {
+      var gen = [1];
+      for (var i = 0, root = 1; i < eccWords; i += 1, root = mul(root, 2)) { var next = new Array(gen.length + 1).fill(0); gen.forEach(function (v, j) { next[j] ^= v; next[j + 1] ^= mul(v, root); }); gen = next; }
+      var rem = new Array(eccWords).fill(0);
+      input.forEach(function (value) { var factor = value ^ rem.shift(); rem.push(0); gen.slice(1).forEach(function (coefficient, j) { rem[j] ^= mul(coefficient, factor); }); });
+      return rem;
+    }
+    var data = [words.slice(0, 68), words.slice(68)], ecc = data.map(remainder), stream = [];
+    for (var i = 0; i < 68; i += 1) for (var b = 0; b < blocks; b += 1) stream.push(data[b][i]);
+    for (var i = 0; i < eccWords; i += 1) for (var b = 0; b < blocks; b += 1) stream.push(ecc[b][i]);
+    var modules = Array.from({ length: size }, function () { return new Array(size).fill(false); });
+    var used = Array.from({ length: size }, function () { return new Array(size).fill(false); });
+    function put(row, col, dark) { if (row >= 0 && row < size && col >= 0 && col < size) { modules[row][col] = !!dark; used[row][col] = true; } }
+    function finder(row, col) { for (var y = -1; y <= 7; y += 1) for (var x = -1; x <= 7; x += 1) put(row + y, col + x, x >= 0 && x <= 6 && y >= 0 && y <= 6 && (x === 0 || x === 6 || y === 0 || y === 6 || (x >= 2 && x <= 4 && y >= 2 && y <= 4))); }
+    finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
+    [6, 34].forEach(function (row) { [6, 34].forEach(function (col) { if (used[row][col]) return; for (var y = -2; y <= 2; y += 1) for (var x = -2; x <= 2; x += 1) put(row + y, col + x, Math.max(Math.abs(x), Math.abs(y)) !== 1); }); });
+    for (var i = 8; i < size - 8; i += 1) { if (!used[6][i]) put(6, i, i % 2 === 0); if (!used[i][6]) put(i, 6, i % 2 === 0); }
+    var format = 0x77c4;
+    var a = [[8,0],[8,1],[8,2],[8,3],[8,4],[8,5],[8,7],[8,8],[7,8],[5,8],[4,8],[3,8],[2,8],[1,8],[0,8]];
+    var c = [[size-1,8],[size-2,8],[size-3,8],[size-4,8],[size-5,8],[size-6,8],[size-7,8],[8,size-8],[8,size-7],[8,size-6],[8,size-5],[8,size-4],[8,size-3],[8,size-2],[8,size-1]];
+    for (var i = 0; i < 15; i += 1) { put(a[i][0], a[i][1], (format >>> i) & 1); put(c[i][0], c[i][1], (format >>> i) & 1); }
+    put(size - 8, 8, true);
+    var payload = []; stream.forEach(function (word) { for (var n = 7; n >= 0; n -= 1) payload.push((word >>> n) & 1); });
+    var cursor = 0, upward = true;
+    for (var right = size - 1; right >= 1; right -= 2) { if (right === 6) right -= 1; for (var step = 0; step < size; step += 1) { var row = upward ? size - 1 - step : step; for (var dx = 0; dx < 2; dx += 1) { var col = right - dx; if (!used[row][col]) modules[row][col] = !!((payload[cursor++] || 0) ^ ((row + col) % 2 === 0)); } } upward = !upward; }
+    canvas.width = canvas.height = size + 8; var context = canvas.getContext("2d"); context.fillStyle = "white"; context.fillRect(0, 0, canvas.width, canvas.height); context.fillStyle = "black";
+    modules.forEach(function (row, y) { row.forEach(function (dark, x) { if (dark) context.fillRect(x + 4, y + 4, 1, 1); }); });
   }
   function fingerprintOf(key) {
     return crypto.subtle.digest("SHA-256", keyBytes(key)).then(function (hash) {
@@ -941,6 +998,56 @@ const SCRIPT = `
   $("op-copy").addEventListener("click", function () {
     navigator.clipboard.writeText(operator.key).then(function () { toast("Operator key copied."); }, function () { toast("Copy failed."); });
   });
+  $("pair-open").addEventListener("click", function () {
+    var names = store.channels.map(function (channel) { return channel.label || "Channel " + short(channel.frequency); });
+    if (!names.length) { toast("There are no channels to share."); return; }
+    $("pair-list").textContent = names.join("\\n");
+    $("pair-start").disabled = false;
+    $("pair-result").classList.add("hidden");
+    sheet("sheet-pair");
+  });
+  $("pair-start").addEventListener("click", function () {
+    // This click is the old device's explicit confirmation. The station sees
+    // only a random relay id and AES-GCM ciphertext, never this secret or a KEY.
+    var button = $("pair-start"); button.disabled = true;
+    var id = Array.prototype.map.call(randomBytes(16), function (byte) { return ("0" + byte.toString(16)).slice(-2); }).join("");
+    var secret = randomBytes(32), nonce = randomBytes(12), expiresAt = Date.now() + 120000;
+    var plain = new TextEncoder().encode(JSON.stringify({ expiresAt: expiresAt, channels: store.channels.map(function (channel) { return { frequency: channel.frequency, key: channel.key, label: channel.label || "" }; }) }));
+    pairingKey(secret, id).then(function (key) { return crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, plain); }).then(function (sealed) {
+      var packageBytes = new Uint8Array(nonce.length + sealed.byteLength); packageBytes.set(nonce); packageBytes.set(new Uint8Array(sealed), nonce.length);
+      return api("/v1/pair/" + id, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ciphertext: b64url(packageBytes) }) });
+    }).then(function (got) {
+      if (got.status !== 201) throw new Error("relay answered HTTP " + got.status);
+      var link = location.origin + "/app#pair=" + id + "." + b64url(secret);
+      drawQr($("pair-qr"), link); $("pair-link").value = link; $("pair-result").classList.remove("hidden");
+    }).catch(function (error) { toast("Could not start pairing: " + error.message); button.disabled = false; });
+  });
+  $("pair-copy").addEventListener("click", function () { navigator.clipboard.writeText($("pair-link").value).then(function () { toast("Pairing link copied."); }); });
+
+  function receivePairing() {
+    var match = /^#pair=([a-f0-9]{32})\.([-_A-Za-z0-9]+)$/u.exec(location.hash);
+    if (!match) return;
+    history.replaceState(null, "", location.pathname + location.search);
+    var id = match[1], secret = unb64url(match[2]);
+    api("/v1/pair/" + id).then(function (got) {
+      if (got.status !== 200 || !got.body) throw new Error(got.status === 410 ? "This pairing code expired." : "This pairing code was already used or is unknown.");
+      var packed = unb64url(got.body.ciphertext), nonce = packed.slice(0, 12), sealed = packed.slice(12);
+      return pairingKey(secret, id).then(function (key) { return crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, sealed); });
+    }).then(function (plain) {
+      var shared = JSON.parse(new TextDecoder().decode(plain));
+      if (!shared || !Array.isArray(shared.channels) || shared.expiresAt < Date.now()) throw new Error("This pairing code expired.");
+      shared.channels.forEach(function (channel) {
+        if (!FREQUENCY.test(channel.frequency) || !/^[a-f0-9]{16,128}$/u.test(channel.key) || find(channel.frequency)) return;
+        store.channels.push({ frequency: channel.frequency, key: channel.key, label: String(channel.label || "").slice(0, 40), lastSeq: 0, readSeq: 0, addedAt: new Date().toISOString() });
+      });
+      save(); renderList();
+      return operatorReady.then(function (op) {
+        var commands = shared.channels.map(function (channel) { return "node radio.mjs trust " + channel.frequency + " " + op.key + " --also --operator-asked --operator-name " + store.name; }).join("\\n\\n");
+        $("paired-key").textContent = op.key; $("paired-commands").textContent = commands; sheet("sheet-paired");
+      });
+    }).catch(function (error) { toast(error.message || "Pairing failed."); });
+  }
+  receivePairing();
 
   var mandateScope = "talk";
   var untilUtc = store.untilZone === "utc";
@@ -1255,8 +1362,28 @@ export function renderApp({ nonce }) {
     <h3>Your operator key</h3>
     <p class="keyline"><span class="mono" id="op-fp"></span><button class="btn small" id="op-copy" type="button">Copy key</button></p>
     <p>Made on this device and never leaves it. Agents you invite pin it, and it signs everything you send, so their radios know it is really you.</p>
+    <button class="btn wide" id="pair-open" type="button">Pair another device</button>
     <div class="row2"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="submit">Save</button></div>
   </form>
+  <div class="sheet hidden" id="sheet-pair" role="dialog" aria-label="Pair another device">
+    <div class="grab"></div>
+    <h2>Pair another device</h2>
+    <p>Confirm the channels that will be copied to the new device:</p>
+    <pre class="prompt" id="pair-list"></pre>
+    <p>The code is one-time and expires in 2 minutes. Anyone who scans it before the new device can take these channels.</p>
+    <button class="btn primary wide" id="pair-start" type="button">Confirm and show QR</button>
+    <div class="hidden" id="pair-result"><canvas class="qr" id="pair-qr" aria-label="One-time pairing QR code"></canvas><label class="field">OR OPEN THIS LINK<input id="pair-link" readonly></label><button class="btn wide" id="pair-copy" type="button">Copy pairing link</button></div>
+    <p></p><button class="btn wide" type="button" data-close>Done</button>
+  </div>
+  <div class="sheet hidden" id="sheet-paired" role="dialog" aria-label="Device paired">
+    <div class="grab"></div>
+    <h2>Device paired</h2>
+    <p>This device made its own non-extractable private key. Its public operator key is:</p>
+    <pre class="prompt" id="paired-key"></pre>
+    <p>Nothing is pinned automatically. Run each exact command on the corresponding agent machine:</p>
+    <pre class="prompt" id="paired-commands"></pre>
+    <button class="btn primary wide" type="button" data-close>Done</button>
+  </div>
   <form class="sheet hidden" id="sheet-channel" aria-label="Channel settings">
     <div class="grab"></div>
     <h2>This channel</h2>

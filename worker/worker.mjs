@@ -464,6 +464,8 @@ const MAILBOX_IDLE_PURGE_MS = 30 * 24 * 60 * 60 * 1000;
 export const INVITATION_TTL_MS = 15 * 60 * 1000;
 const RATE_LIMIT_RETRY_SECONDS = 60;
 const FREQUENCY_SHAPE = /^fm-[a-f0-9]{8,64}$/;
+const PAIR_TTL_MS = 120_000;
+const MAX_PAIR_CIPHERTEXT_BYTES = 64 * 1024;
 const STATION_SHAPE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 // Channel presence: who received on a channel recently. A listener names
 // itself with X-Callsign on a keyed read (or by sending); the station keeps
@@ -1116,6 +1118,28 @@ export default {
       return json({ publicKey: vapid.publicKey }, 200, { "cache-control": "public, max-age=300" });
     }
 
+    const pairing = /^\/v1\/pair\/([a-f0-9]{32})$/u.exec(path);
+    if (pairing && (method === "POST" || method === "GET")) {
+      const stub = env.CHANNEL.get(env.CHANNEL.idFromName(`pair:${pairing[1]}`));
+      if (method === "POST") {
+        const refused = await admitGatedRequest(request, env);
+        if (refused) return refused;
+        const parsed = await readJsonObject(request);
+        if (parsed.error) return json({ error: parsed.error }, parsed.status);
+        const { ciphertext } = parsed.body;
+        if (typeof ciphertext !== "string" || ciphertext === "" || encoder.encode(ciphertext).length > MAX_PAIR_CIPHERTEXT_BYTES) {
+          return json({ error: "ciphertext must be a non-empty string no larger than 64 KB" }, 400);
+        }
+        const stored = await stub.fetch("https://channel/pair", {
+          method: "POST",
+          body: JSON.stringify({ ciphertext, expiresAt: Date.now() + PAIR_TTL_MS }),
+        });
+        return new Response(stored.body, { status: stored.status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+      }
+      const read = await stub.fetch("https://channel/pair");
+      return new Response(read.body, { status: read.status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+    }
+
     if (method === "GET" && path === "/radio.mjs") {
       return new Response(RADIO_CODE, { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
@@ -1535,6 +1559,24 @@ export class AiRadioChannel {
 
   async fetch(request) {
     const url = new URL(request.url);
+
+    if (url.pathname === "/pair") {
+      if (request.method === "POST") {
+        const { ciphertext, expiresAt } = await request.json();
+        if (this.meta("pairCiphertext") !== null) return json({ error: "pairing already exists" }, 409);
+        if (typeof ciphertext !== "string" || ciphertext === "" || !Number.isFinite(expiresAt)
+          || expiresAt <= this.now() || expiresAt > this.now() + PAIR_TTL_MS) return json({ error: "invalid pairing" }, 400);
+        this.sql.exec("INSERT INTO meta (k, v) VALUES ('pairCiphertext', ?), ('pairExpiresAt', ?)", ciphertext, String(expiresAt));
+        await this.ctx.storage.setAlarm(expiresAt);
+        return json({ ok: true, expiresIn: Math.ceil((expiresAt - this.now()) / 1000) }, 201);
+      }
+      const ciphertext = this.meta("pairCiphertext");
+      if (ciphertext === null) return json({ error: "pairing is unknown or already used" }, 404);
+      const expiresAt = Number(this.meta("pairExpiresAt"));
+      this.sql.exec("DELETE FROM meta WHERE k IN ('pairCiphertext', 'pairExpiresAt')");
+      if (!Number.isFinite(expiresAt) || expiresAt <= this.now()) return json({ error: "pairing expired" }, 410);
+      return json({ ciphertext });
+    }
 
     if (url.pathname === "/init") {
       const { waveHash, mode } = await request.json();

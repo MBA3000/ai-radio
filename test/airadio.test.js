@@ -116,6 +116,25 @@ test("create mints a frequency and a raw 128-hex key, and stores only the key's 
   assert.equal(initPayload.waveHash, sha512(body.wave), "the station is handed the HASH, never the key");
 });
 
+test("device pairing relays only ciphertext under a public id", async () => {
+  const env = fakeChannelNamespace();
+  const id = "0123456789abcdef0123456789abcdef";
+  const ciphertext = "nonce-and-aes-gcm-ciphertext";
+  const response = await call(env, "/v1/pair/" + id, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ciphertext }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(env.calls[0].channel, "pair:" + id);
+  assert.equal(env.calls[0].url, "https://channel/pair");
+  const relayed = JSON.parse(env.calls[0].options.body);
+  assert.equal(relayed.ciphertext, ciphertext);
+  assert.deepEqual(Object.keys(relayed).sort(), ["ciphertext", "expiresAt"]);
+  assert.ok(Number.isFinite(relayed.expiresAt));
+  assert.doesNotMatch(env.calls[0].url + env.calls[0].options.body, /[a-f0-9]{128}/u, "no channel KEY reaches a URL or request body");
+});
+
 test("channel creation distinguishes an empty body from malformed or non-object JSON", async () => {
   const generated = fakeChannelNamespace();
   const empty = await call(generated, "/v1/channel", { method: "POST" });
