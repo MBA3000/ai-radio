@@ -412,6 +412,7 @@ export class ChannelSocket {
     if (frame.type === "hello") {
       this.state = "live";
       this.failures = 0;
+      this.invalidFrames = 0;
       this.lastPong = Date.now();
       clearInterval(this.pinger);
       this.pinger = setInterval(() => this.ping(), SOCKET_PING_MS);
@@ -1490,9 +1491,10 @@ export async function runReceiver({ home, maxTicks = Infinity, log = (line) => c
     const pinned = message.sig ? (loadConfig(p).channels[frequency] || {}).operator || null : null;
     let signature = message.sig ? (pinned ? verifySigned(message, frequency, pinned.key) : { ok: false, reason: "another key", fingerprint: typeof message.sig.key === "string" ? keyFingerprint(message.sig.key) : null }) : null;
     if (signature && signature.ok) signature = firstHearing(frequency, message, signature.digest);
-    // A frame must not consume a seq or reach an inbox/agent on failed trust.
-    // REST keeps rejected signatures as marked, untrusted records as before.
-    if (fromSocket && signature && !signature.ok) return false;
+    // Failed verification cannot consume a frame's seq or reach an inbox/agent.
+    // Another key is ordinary untrusted traffic with signedBy on both paths;
+    // REST also keeps rejected signatures as marked, untrusted records as before.
+    if (fromSocket && signature && !signature.ok && signature.reason !== "another key") return false;
     state.cursors[frequency] = message.seq;
     if (message.from === me) return true;
     const operator = Boolean(signature && signature.ok);

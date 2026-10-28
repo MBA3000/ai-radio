@@ -15,8 +15,11 @@ the digest replay ledger and signature-time mandate ordering. A live message
 costs no REST read. Seq-only hints, sequence gaps and rejected bodies trigger
 REST; the five-minute safety poll remains. Rejected frame bodies never change
 the inbox, agent queue or cursor; three consecutive rejections close the socket
-and use the existing polling/retry schedule. The frame buffer is bounded to
-one page; overflow is recovered by REST. Channels are still processed serially.
+and use the existing polling/retry schedule. A new connection's hello resets
+the rejection count. Signatures from unpinned keys are delivered as ordinary
+untrusted records with `signedBy`, just as REST does, without a read or a
+rejection. The frame buffer is bounded to one page; overflow is recovered by
+REST. Channels are still processed serially.
 The phone app uses only `msg.seq`. The station assigns no authority to a body.
 `test/airadio-socket.test.js` pins full-row delivery, seq-only compatibility,
 conflicting bodies at the same seq, and mailbox frames containing only seq.

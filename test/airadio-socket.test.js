@@ -122,6 +122,32 @@ test("socket addresses and the reconnect schedule", () => {
   assert.equal(socketDelay(0, () => 0.999_999), 1_250, "and 25% above");
 });
 
+test("a reconnected socket needs three new rejections before returning to polling", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  t.mock.method(Math, "random", () => 0.5);
+  const socket = new ChannelSocket({ WebSocketImpl: function () {
+    return { closed: false, close() { this.closed = true; }, send() {} };
+  } });
+  t.after(() => socket.close());
+  socket.open();
+  const first = socket.ws;
+  first.onmessage({ data: '{"type":"hello","lastSeq":0}' });
+  for (let rejected = 1; rejected <= 3; rejected += 1) socket.rejectMessage();
+  assert.equal(socket.live, false);
+  assert.equal(first.closed, true);
+
+  t.mock.timers.tick(300_000);
+  const reconnected = socket.ws;
+  assert.ok(reconnected);
+  assert.notEqual(reconnected, first);
+  reconnected.onmessage({ data: '{"type":"hello","lastSeq":0}' });
+  for (let rejected = 1; rejected <= 3; rejected += 1) {
+    socket.rejectMessage();
+    assert.equal(socket.live, rejected < 3);
+    assert.equal(reconnected.closed, rejected === 3);
+  }
+});
+
 test("the station refuses a socket without the right key, and says hello with the newest seq to one that has it", { timeout: 30_000 }, async (t) => {
   const station = await startAiradioLocalStation();
   t.after(() => station.close());

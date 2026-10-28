@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { canonicalMandate, radioPaths, runReceiver } from "../scripts/airadio-radio.mjs";
+import { canonicalMandate, keyFingerprint, radioPaths, runReceiver } from "../scripts/airadio-radio.mjs";
 
 const frequency = "fm-0123456789abcdef";
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -32,7 +32,7 @@ async function receiver(t, key) {
   const paths = radioPaths(home);
   const json = (file) => JSON.parse(readFileSync(file, "utf8"));
   const config = { channels: { [frequency]: {
-    station: "https://station.test", key: "test-channel-key", as: "bot", operator: { key },
+    station: "https://station.test", key: "test-channel-key", as: "bot", ...(key ? { operator: { key } } : {}),
     agent: { epoch: 1, maxPerHour: 1 },
   } } };
   writeFileSync(paths.config, JSON.stringify(config));
@@ -117,6 +117,40 @@ test("three rejected frames cannot change inbox, agent queue or cursor; polling 
   assert.equal(radio.inbox().at(-1).text, "still heard by polling");
   assert.equal(radio.state().agents[frequency].pending.at(-1).text, "still heard by polling");
 });
+
+for (const pinned of [true, false]) {
+  test(`unpinned signatures stay untrusted and keep the socket live ${pinned ? "with another key pinned" : "without a pinned key"}`, async (t) => {
+    const owner = await operator();
+    const peer = await operator();
+    const radio = await receiver(t, pinned ? owner.key : null);
+    const reads = radio.reads();
+    for (let seq = 1; seq <= 3; seq += 1) {
+      const words = { from: "peer", text: "signed by a peer " + seq, ts: Date.now(),
+        mandate: { scope: "tools", to: "bot", until: new Date(Date.now() + 3_600_000).toISOString() } };
+      const message = { seq, at: new Date(words.ts).toISOString(), from: words.from, text: words.text, sig: await peer.sign(words) };
+      radio.rows.push(message);
+      await radio.frame(message);
+      assert.equal(radio.reads(), reads, "an unpinned signature needs no REST read");
+      assert.equal(radio.state().cursors[frequency], seq);
+      assert.equal(radio.state().delivery[frequency], "socket");
+      assert.equal(radio.socket().closed, false);
+      const entry = radio.inbox().at(-1);
+      assert.equal(entry.signedBy, keyFingerprint(peer.key));
+      assert.equal(entry.untrusted, true);
+      assert.equal(entry.operator, undefined);
+      assert.equal(entry.forged, undefined);
+      assert.equal(radio.mandate(), undefined, "an unpinned key cannot grant a mandate");
+      const pending = radio.state().agents[frequency].pending;
+      assert.equal(pending.length, seq);
+      assert.equal(pending.at(-1).operator, undefined);
+    }
+    // The same body read through REST has exactly the same trust markers.
+    radio.rows.push({ ...radio.rows[0], seq: 4 });
+    await radio.frame({ seq: 4 });
+    assert.equal(radio.reads(), reads + 1);
+    assert.deepEqual(radio.inbox().at(-1), { ...radio.inbox()[0], seq: 4 });
+  });
+}
 
 test("frames reuse canonical signatures, both ten-minute bounds and signature-time mandate ordering", async (t) => {
   const owner = await operator();

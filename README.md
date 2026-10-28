@@ -114,10 +114,13 @@ message arrives at once, and `status` says `live socket` or `polling`. The
 channel frame is `{"type":"message","msg":{seq, at, from, text, sig?}}`, with
 `msg` shaped exactly like a REST receive row. Full messages pass through the
 same signature, replay and mandate checks as REST, without another read.
+Signatures from unpinned keys stay untrusted with `signedBy`, as with REST,
+and do not count as rejected frames.
 Seq-only hints and gaps still trigger REST; rejected frame bodies leave the
 inbox, agent queue and cursor untouched, and three consecutive rejections
-switch to polling. Conflicting bodies at a consumed seq do not replace the
-stored message. It still polls every 5 minutes as a safety net, and it falls
+switch to polling. A new connection's hello resets that count.
+Conflicting bodies at a consumed seq do not replace the stored message.
+It still polls every 5 minutes as a safety net, and it falls
 back to polling if the station has
 no sockets or three connections in a row fail. Since 1.5.0 a callsign's mailbox rings the same
 way, with frames that carry only the seq: a call can hold a channel key and
