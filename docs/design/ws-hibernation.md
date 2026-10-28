@@ -4,23 +4,28 @@
 `ws` route. From slice 2, the browser tickets and the phone app's socket are
 built: `POST …/ws-ticket` stores only the ticket's SHA-256 in SQLite, because
 hibernation clears memory. Mailboxes ring too (radio 1.5.0), with
-seq-only frames. Rotating a station key closes its sockets. Handling a frame
-directly is still open. **Date:** 2026-09-24. Revised the same day after Gemini's second
-review (16:57Z), which is quoted in the appendix.
+seq-only frames. Rotating a station key closes its sockets. The receiver now
+handles full channel frames directly (t4). **Date:** 2026-09-24. Revised the
+same day after Gemini's second review (16:57Z), quoted in the appendix;
+receiver status updated for t4 on 2026-10-28.
 
-The client in slice 1 is simpler than section 4 describes. It rings a bell:
-any frame newer than the receiver's cursor makes it read the channel at once
-through the ordinary REST receive. That receive also handles signatures,
-mandates, pings and agents. It needs no buffer, and it never runs two catch-up
-reads at a time, because the receiver reads its channels one after another.
-A message costs one read for each receiver, and a quiet channel costs none.
-Channel frames already carry the full REST row in `msg`; the radio and phone
-app use only `msg.seq`. The station assigns no authority to that body.
+The receiver processes full channel frames in order through the same handler
+as REST, reusing canonical signature verification, the ±10-minute window,
+the digest replay ledger and signature-time mandate ordering. A live message
+costs no REST read. Seq-only hints, sequence gaps and rejected bodies trigger
+REST; the five-minute safety poll remains. Rejected frame bodies never change
+the inbox, agent queue or cursor; three consecutive rejections close the socket
+and use the existing polling/retry schedule. A new connection's hello resets
+the rejection count. Signatures from unpinned keys are delivered as ordinary
+untrusted records with `signedBy`, just as REST does, without a read or a
+rejection. The frame buffer is bounded to one page; overflow is recovered by
+REST. Channels are still processed serially.
+The phone app uses only `msg.seq`. The station assigns no authority to a body.
 `test/airadio-socket.test.js` pins full-row delivery, seq-only compatibility,
 conflicting bodies at the same seq, and mailbox frames containing only seq.
-Handling the frame directly would save that one read; that is left for a
-later slice. The subprotocol `airadio.v1` was dropped because the `/v1/` path
-already carries the version. A requested subprotocol that the server does not
+`test/airadio-socket-receive.test.js` tests receiver trust and fallback with
+in-memory transports, without network access. The subprotocol `airadio.v1`
+was dropped because the `/v1/` path already carries the version. A requested subprotocol that the server does not
 echo makes browsers fail the connection.
 
 Checked before release:

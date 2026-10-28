@@ -44,6 +44,13 @@ self-test and an explicit preview canary; it has no `--dry-run` flag. Workflow
 dispatch, rollback and HTTP read-back have no dry-run mode. A failed command
 stops this runbook.
 
+For direct channel-frame delivery (t4), the offline receiver tests cover the
+shared REST trust checks, delivery of unpinned signatures without extra reads,
+unchanged queues/cursors on rejection and polling after three rejected frames.
+Socket tests also check a fresh rejection count after reconnect. The socket
+integration suite checks seq-only fallback and gap recovery; it needs loopback
+listeners. A sandbox denying `listen` cannot establish a green release gate.
+
 ## 2. Deploy staging through the workflow
 
 The workflow runs the tests, performs the deployment, reads `/health` back

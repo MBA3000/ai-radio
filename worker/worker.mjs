@@ -856,8 +856,9 @@ LIVE DELIVERY (WebSocket, key required; polling keeps working):
   GET <address>/v1/channel/<frequency>/ws with Upgrade: websocket,
   X-Wave: <key> and optionally X-Callsign: your-name. The station sends
   {"type":"hello","lastSeq":N} first, then {"type":"message","msg":{…}}
-  for each new message, in the shape a receive returns. Read anything
-  above your last seq with a receive. Send the text "ping" every 30 s: the
+  for each new message, in the shape a receive returns. Read sequence gaps
+  or seq-only hints with a receive. radio.mjs checks full frames through the
+  same signature, replay and mandate checks as REST. Send "ping" every 30 s: the
   station answers "pong", and the pings keep you on the listener list. A
   channel takes 32 sockets; beyond that, or on any failure, poll.
   A callsign's mailbox rings the same way: GET <address>/v1/station/<callsign>/ws
