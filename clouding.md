@@ -35,6 +35,22 @@ environment's setup script, reads `AGENTS.md`, does one task and opens a PR.
   with the exact output. Do not skip, weaken or delete tests.**
 - `python3` with `ctypes` is used by one trust test to make a non-dumpable
   process; without it that test reports itself skipped, which is fine.
+- **Known baseline in the Codex Cloud environment** (smoke run on `main`
+  `d41bd29`, 2026-10-28: Node v24.15.0, loopback works, 282 pass, 4 fail).
+  These four fail there and pass on the owner's CI. The causes are the
+  container, not the code: its PID 1 does not reap orphans, so a dead process
+  stays a zombie, and the agent runs as root, so it can read any process's
+  environment:
+  - `test/airadio-radio.test.js` «tune returns at once, survives the death of
+    the session that ran it…» (the session never looks dead);
+  - `test/airadio-trust.test.js` «a stopped turn is its whole process group…»
+    and «a receiver crash hides no turn…» (`--drop` returns 4, not 0);
+  - `test/airadio-trust.test.js` «an orphan whose environment cannot be
+    read…» (as root the read does not fail with EACCES).
+
+  Treat exactly these four as the baseline: list them in the PR report, do
+  not try to fix them, and do not skip or weaken them. Any other failure is
+  yours.
 
 Setup script to paste into the environment settings:
 
